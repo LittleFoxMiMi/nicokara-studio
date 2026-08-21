@@ -50,7 +50,13 @@ class Database:
         with self.connect() as c:
             current=c.execute("SELECT MAX(revision) FROM project_revisions WHERE project_id=?",(project_id,)).fetchone()[0] or 0
             if current != expected: raise ValueError(f"revision_conflict:{current}")
-            rev=current+1; c.execute("INSERT INTO project_revisions VALUES(?,?,?,?)",(project_id,rev,json.dumps(document,ensure_ascii=False),t)); c.execute("UPDATE projects SET name=?,title=?,artist=?,updated_at=? WHERE id=?",(document["project"]["name"],document["project"].get("title", ""),document["project"].get("artist", ""),t,project_id))
+            rev=current+1
+            document["project"]["revision"] = rev
+            has_lyrics = bool(document.get("lyrics", {}).get("lines"))
+            has_media = bool(document.get("media", {}).get("video_filename"))
+            status = "review" if has_lyrics else "media_ready" if has_media else "blank"
+            c.execute("INSERT INTO project_revisions VALUES(?,?,?,?)",(project_id,rev,json.dumps(document,ensure_ascii=False),t))
+            c.execute("UPDATE projects SET name=?,title=?,artist=?,status=?,updated_at=? WHERE id=?",(document["project"]["name"],document["project"].get("title", ""),document["project"].get("artist", ""),status,t,project_id))
         return {"revision":rev,"document":document}
     def delete_project(self, project_id: str) -> None:
         with self.connect() as c:

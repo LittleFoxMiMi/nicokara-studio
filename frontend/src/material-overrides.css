@@ -1,0 +1,59 @@
+:root {
+  color: #1f1f1f;
+  background: #f8fafd;
+  min-width: 1180px;
+}
+body,
+#root {
+  min-width: 1180px;
+}
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  letter-spacing: 0;
+}
+.topbar {
+  height: 64px;
+  padding: 0 28px;
+  gap: 24px;
+}
+.brand-mark {
+  border-radius: 8px;
+  background: #0b57d0;
+}
+.eyebrow,
+.page h1 {
+  letter-spacing: 0;
+}
+.button.filled,
+.fab {
+  background: #0b57d0;
+}
+.button.filled:hover {
+  background: #0842a0;
+}
+.button.tonal {
+  background: #d3e3fd;
+  color: #0842a0;
+}
+.button.text,
+.text-button {
+  color: #0b57d0;
+}
+.project-card,
+.empty-state,
+.preview-surface,
+.inspector,
+.settings-section {
+  border-radius: 8px;
+}
+.dialog {
+  border-radius: 8px;
+}
+.nav-item:hover,
+.nav-item.active {
+  background: #d3e3fd;
+  color: #0842a0;
+}

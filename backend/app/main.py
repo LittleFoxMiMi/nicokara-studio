@@ -13,6 +13,6 @@ def create_app() -> FastAPI:
     app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_methods=["*"], allow_headers=["*"])
     app.include_router(projects_router, prefix=settings.api_prefix); app.include_router(settings_router, prefix=settings.api_prefix)
     @app.get("/health")
-    def health(): return {"status": "ok", "phase": "1"}
+    def health(): return {"status": "ok", "phase": "2"}
     return app
 app = create_app()

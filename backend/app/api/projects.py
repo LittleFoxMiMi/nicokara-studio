@@ -7,8 +7,10 @@ from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from app.core.database import Database
 from app.core.config import Settings
+from app.domain.lyrics import detect_lyrics_format, parse_lyrics
 from app.media.probe import probe, thumbnail
-from app.schemas.projects import DocumentSave, ProjectCreate, ProjectPatch, ProjectResponse
+from app.media.waveform import generate_waveform
+from app.schemas.projects import DocumentSave, LyricsDetect, LyricsImport, ProjectCreate, ProjectPatch, ProjectResponse
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -63,6 +65,31 @@ def save_document(project_id: str, payload: DocumentSave, request: Request):
     except ValueError as exc:
         raise HTTPException(409, {"code": "revision_conflict"}) from exc
 
+@router.post("/{project_id}/lyrics/detect")
+def detect_lyrics(project_id: str, payload: LyricsDetect, request: Request):
+    project_or_404(services(request)[1], project_id)
+    return detect_lyrics_format(payload.content, payload.filename).as_dict()
+
+@router.post("/{project_id}/lyrics/import")
+def import_lyrics(project_id: str, payload: LyricsImport, request: Request):
+    db = services(request)[1]
+    project = project_or_404(db, project_id)
+    document = db.document(project_id) or initial_document(project_id, project["name"])
+    duration = document.get("media", {}).get("duration_ms")
+    try:
+        document["lyrics"] = parse_lyrics(
+            payload.content,
+            payload.format,
+            filename=payload.filename,
+            media_duration_ms=duration if isinstance(duration, int) else None,
+        )
+        result = db.save_document(project_id, document, payload.revision)
+    except ValueError as exc:
+        if str(exc).startswith("revision_conflict"):
+            raise HTTPException(409, {"code": "revision_conflict"}) from exc
+        raise HTTPException(422, str(exc)) from exc
+    return {"revision": result["revision"], "document": document}
+
 @router.post("/{project_id}/video")
 async def upload_video(project_id: str, request: Request, video: UploadFile = File(...)):
     settings, db = services(request); project = project_or_404(db, project_id)
@@ -77,6 +104,8 @@ async def upload_video(project_id: str, request: Request, video: UploadFile = Fi
                 output.write(chunk)
     finally: await video.close()
     metadata = probe(destination, settings.ffprobe_path); thumb = directory / "thumbnail.jpg"; metadata["thumbnail_generated"] = thumbnail(destination, thumb, settings.ffmpeg_path)
+    metadata["waveform_generated"] = generate_waveform(destination, directory / "waveform.json", settings.ffmpeg_path)
+    metadata["waveform_url"] = f"/api/projects/{project_id}/waveform" if metadata["waveform_generated"] else None
     doc = db.document(project_id) or initial_document(project_id, project["name"]); doc["media"] = {**doc.get("media", {}), **metadata, "video_filename": safe, "thumbnail_url": f"/api/projects/{project_id}/thumbnail"}
     result = db.save_document(project_id, doc, project["revision"]); return {"revision": result["revision"], "media": doc["media"]}
 
@@ -91,3 +120,17 @@ def get_thumbnail(project_id: str, request: Request):
     settings, db = services(request); project_or_404(db, project_id); path = settings.projects_dir / project_id / "thumbnail.jpg"
     if not path.is_file(): raise HTTPException(404, "缩略图不存在")
     return FileResponse(path, media_type="image/jpeg")
+
+@router.get("/{project_id}/waveform")
+def get_waveform(project_id: str, request: Request):
+    settings, db = services(request)
+    project_or_404(db, project_id)
+    directory = settings.projects_dir / project_id
+    path = directory / "waveform.json"
+    if not path.is_file():
+        video = directory / "video.mp4"
+        if not video.is_file():
+            raise HTTPException(404, "波形不存在")
+        if not generate_waveform(video, path, settings.ffmpeg_path):
+            raise HTTPException(503, "波形生成失败")
+    return FileResponse(path, media_type="application/json")
