@@ -10,3 +10,4 @@ frontend/*.tsbuildinfo
 *.pyc
 .vscode/
 nicokara-studio/
+test.json

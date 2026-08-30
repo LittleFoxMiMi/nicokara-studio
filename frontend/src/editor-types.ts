@@ -47,6 +47,23 @@ export type ProjectDocument = {
 
 export type Waveform = { version: number; sample_rate: number; duration_ms: number; peaks: [number, number][] };
 
+export type AnalysisJob = {
+  id: string;
+  project_id: string;
+  type: "VOCAL_SEPARATION" | "TRANSCRIPTION";
+  status: "QUEUED" | "PREPARING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELED";
+  progress: number;
+  stage: string;
+  message: string;
+  input_revision: number;
+  output_revision: number | null;
+  error_code: string | null;
+  error_message: string | null;
+  cancel_requested: boolean;
+  result: Record<string, unknown> | null;
+  created_at: string;
+};
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api${path}`, {
     ...init,

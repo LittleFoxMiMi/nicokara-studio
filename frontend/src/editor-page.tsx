@@ -1,5 +1,6 @@
 import {
   AlertCircle,
+  AudioLines,
   ArrowLeft,
   Check,
   Cog,
@@ -7,14 +8,17 @@ import {
   FileVideo,
   GripVertical,
   LoaderCircle,
+  RotateCcw,
   Redo2,
   Save,
   Undo2,
   Upload,
+  WandSparkles,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
+  AnalysisJob,
   LyricLine,
   LyricUnit,
   Project,
@@ -231,6 +235,7 @@ function UnitInspector({
             : unit.timing_source === "estimated"
               ? "估算时间"
               : "精确时间"}
+          {unit.ruby ? ` · Ruby ${unit.ruby_source || "manual"}` : " · 未注音"}
         </span>
       </div>
       <label className="field-label">
@@ -298,8 +303,14 @@ export function EditorPage({ id }: { id: string }) {
     [isPlaying, setIsPlaying] = useState(false);
   const [uploading, setUploading] = useState(false),
     [uploadProgress, setUploadProgress] = useState(0);
+  const [jobs, setJobs] = useState<AnalysisJob[]>([]),
+    [analysisStarting, setAnalysisStarting] = useState(false);
+  const [pronunciationRunning, setPronunciationRunning] = useState(false);
+  const [lineMenu, setLineMenu] = useState<{ lineId: string; x: number; y: number } | null>(null);
   const uploadRequest = useRef<XMLHttpRequest | null>(null),
     videoRef = useRef<HTMLVideoElement>(null);
+  const appliedJobs = useRef(new Set<string>());
+  const appliedVocalWaveforms = useRef(new Set<string>());
 
   useEffect(() => {
     void Promise.all([
@@ -316,6 +327,58 @@ export function EditorPage({ id }: { id: string }) {
       })
       .catch(() => setError("无法打开工程，请确认后端服务已启动。"));
   }, [id]);
+
+  const reloadFromServer = useCallback(async () => {
+    if (dirtyRef.current) return;
+    const [loadedProject, loaded] = await Promise.all([
+      api<Project>(`/projects/${id}`),
+      api<{ revision: number; document: ProjectDocument }>(`/projects/${id}/document`),
+    ]);
+    projectRef.current = loadedProject;
+    documentRef.current = loaded.document;
+    setProject(loadedProject);
+    setDocument(loaded.document);
+  }, [id]);
+
+  useEffect(() => {
+    let disposed = false;
+    const poll = async () => {
+      try {
+        const loaded = await api<AnalysisJob[]>(`/jobs?project_id=${encodeURIComponent(id)}&limit=12`);
+        if (disposed) return;
+        setJobs(loaded);
+        const completed = loaded.find((job) => job.status === "SUCCEEDED" && !appliedJobs.current.has(job.id));
+        const separated = loaded.find(
+          (job) =>
+            job.status === "RUNNING" &&
+            ["TRANSCRIBING", "ALIGNING"].includes(job.stage) &&
+            !appliedVocalWaveforms.current.has(job.id),
+        );
+        if (separated) {
+          appliedVocalWaveforms.current.add(separated.id);
+          await reloadFromServer();
+        }
+        if (completed) {
+          appliedJobs.current.add(completed.id);
+          await reloadFromServer();
+        }
+      } catch {
+        // Project loading already reports connectivity failures.
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 1400);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [id, reloadFromServer]);
+  useEffect(() => {
+    if (!lineMenu) return;
+    const close = () => setLineMenu(null);
+    addEventListener("pointerdown", close);
+    return () => removeEventListener("pointerdown", close);
+  }, [lineMenu]);
 
   const markDirty = useCallback((value: boolean) => {
     dirtyRef.current = value;
@@ -496,7 +559,7 @@ export function EditorPage({ id }: { id: string }) {
     const revision = await saveNow(),
       before = documentRef.current;
     if (!before) return;
-    const result = await api<{ revision: number; document: ProjectDocument }>(
+    const result = await api<{ revision: number; document: ProjectDocument; job?: AnalysisJob | null }>(
       `/projects/${id}/lyrics/import`,
       {
         method: "POST",
@@ -514,6 +577,81 @@ export function EditorPage({ id }: { id: string }) {
       const next = { ...projectRef.current, revision: result.revision };
       projectRef.current = next;
       setProject(next);
+    }
+    if (result.job) setJobs((current) => [result.job!, ...current]);
+  }
+
+  async function startTranscription(lineIds?: string[]) {
+    if (!documentRef.current?.media.video_filename) {
+      setError("请先上传视频，再运行 Whisper 识别。");
+      return;
+    }
+    setAnalysisStarting(true);
+    setError(null);
+    try {
+      const revision = await saveNow();
+      const scopedLines = lineIds?.length
+        ? documentRef.current?.lyrics.lines.filter((candidate) => lineIds.includes(candidate.id)) || []
+        : [];
+      const starts = scopedLines.map((line) => line.start_ms).filter((value): value is number => value !== null);
+      const ends = scopedLines.map((line) => line.end_ms).filter((value): value is number => value !== null);
+      const job = await api<AnalysisJob>(`/projects/${id}/transcribe`, {
+        method: "POST",
+        body: JSON.stringify({
+          revision,
+          line_ids: lineIds || [],
+          start_ms: starts.length ? Math.min(...starts) : null,
+          end_ms: ends.length ? Math.max(...ends) : null,
+          preserve_line_anchors: documentRef.current?.lyrics.source_type === "lrc",
+          overwrite_policy: "unlocked_only",
+        }),
+      });
+      setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]);
+    } catch (reason) {
+      const status = (reason as Error & { status?: number })?.status;
+      setError(status === 409 ? "工程版本已变化，请保存后重试。" : "无法启动分析任务，请检查后端能力和素材。 ");
+    } finally {
+      setAnalysisStarting(false);
+    }
+  }
+
+  async function retryJob(jobId: string) {
+    const job = await api<AnalysisJob>(`/jobs/${jobId}/retry`, { method: "POST" });
+    setJobs((current) => [job, ...current]);
+  }
+
+  async function runPronunciation(mode: "local" | "ai", lineIds?: string[]) {
+    if (!documentRef.current?.lyrics.lines.length) return;
+    setPronunciationRunning(true);
+    setError(null);
+    try {
+      const revision = await saveNow();
+      const unitIds = selectedId && !lineIds?.length ? [selectedId] : [];
+      const result = await api<{ revision: number; document: ProjectDocument; summary?: { fallback_reason?: string } }>(
+        `/projects/${id}/pronunciation/${mode}`,
+        { method: "POST", body: JSON.stringify({ revision, line_ids: lineIds || [], unit_ids: unitIds, mode, overwrite_policy: "unlocked_only" }) },
+      );
+      const before = documentRef.current;
+      if (before) {
+        historyRef.current.past.push(before);
+        historyRef.current.past = historyRef.current.past.slice(-200);
+        historyRef.current.future = [];
+        setHistoryVersion((value) => value + 1);
+      }
+      documentRef.current = result.document;
+      setDocument(result.document);
+      if (projectRef.current) {
+        const next = { ...projectRef.current, revision: result.revision };
+        projectRef.current = next;
+        setProject(next);
+      }
+      markDirty(false);
+      if (result.summary?.fallback_reason) setError(`AI 不可用，已使用本地注音：${result.summary.fallback_reason}`);
+    } catch (reason) {
+      const status = (reason as Error & { status?: number })?.status;
+      setError(status === 409 ? "工程版本已变化，请保存后重试。" : "注音失败，现有歌词和 Ruby 未被覆盖。 ");
+    } finally {
+      setPronunciationRunning(false);
     }
   }
 
@@ -544,6 +682,7 @@ export function EditorPage({ id }: { id: string }) {
         const result = JSON.parse(request.responseText) as {
           revision: number;
           media: Record<string, unknown>;
+          job?: AnalysisJob | null;
         };
         const current = documentRef.current;
         if (current) {
@@ -563,6 +702,7 @@ export function EditorPage({ id }: { id: string }) {
           setProject(nextProject);
         }
         setUploadProgress(100);
+        if (result.job) setJobs((current) => [result.job!, ...current]);
       } else setError("视频上传或媒体处理失败。");
       setUploading(false);
     };
@@ -588,6 +728,8 @@ export function EditorPage({ id }: { id: string }) {
   );
   const hasVideo = Boolean(document.media.video_filename),
     lines = document.lyrics.lines;
+  const activeJob = jobs.find((job) => ["QUEUED", "PREPARING", "RUNNING"].includes(job.status));
+  const visibleJob = activeJob || jobs[0] || null;
   const selected =
     lines
       .flatMap((line) => line.units.map((unit) => ({ line, unit })))
@@ -656,6 +798,21 @@ export function EditorPage({ id }: { id: string }) {
               <FileText size={17} />
               {lines.length ? "替换歌词" : "添加歌词"}
             </button>
+            <button className="button tonal" disabled={!lines.length || pronunciationRunning} onClick={() => void runPronunciation("local")} title="为未锁定单元生成本地日语读音">
+              <WandSparkles size={17} />
+              {pronunciationRunning ? "注音中" : "本地注音"}
+            </button>
+            <button className="button tonal" disabled={!lines.length || pronunciationRunning} onClick={() => void runPronunciation("ai")} title="使用当前 AI profile 生成读音，失败时按设置降级">
+              <WandSparkles size={17} />AI 注音
+            </button>
+            <button
+              className="button tonal"
+              disabled={!hasVideo || !lines.length || Boolean(activeJob) || analysisStarting}
+              onClick={() => void startTranscription()}
+            >
+              {analysisStarting || activeJob ? <LoaderCircle className="spin" size={17} /> : <WandSparkles size={17} />}
+              {activeJob ? "分析中" : "全曲分析"}
+            </button>
             <label className={`button tonal ${uploading ? "disabled" : ""}`}>
               <Upload size={17} />
               {hasVideo ? "替换视频" : "选择视频"}
@@ -677,6 +834,26 @@ export function EditorPage({ id }: { id: string }) {
             <AlertCircle size={17} />
             {error}
           </div>
+        )}
+        {visibleJob && (
+          <section className={`analysis-status ${visibleJob.status.toLowerCase()}`}>
+            <span className="analysis-icon">
+              {activeJob ? <LoaderCircle className="spin" size={18} /> : visibleJob.status === "FAILED" ? <AlertCircle size={18} /> : <AudioLines size={18} />}
+            </span>
+            <div className="analysis-copy">
+              <strong>{visibleJob.type === "VOCAL_SEPARATION" ? "KARA2 双 stem" : "KARA2 + Whisper 对齐"}</strong>
+              <span>{visibleJob.error_message || visibleJob.message || visibleJob.stage}</span>
+            </div>
+            <div className="analysis-progress" aria-label={`进度 ${Math.round(visibleJob.progress * 100)}%`}>
+              <i style={{ width: `${Math.max(2, visibleJob.progress * 100)}%` }} />
+            </div>
+            <b>{Math.round(visibleJob.progress * 100)}%</b>
+            {visibleJob.status === "FAILED" && (
+              <button className="icon-button compact" title="重试任务" onClick={() => void retryJob(visibleJob.id)}>
+                <RotateCcw size={16} />
+              </button>
+            )}
+          </section>
         )}
         <div className="workspace-main">
           <section
@@ -765,6 +942,11 @@ export function EditorPage({ id }: { id: string }) {
                     className={`lyric-line ${active ? "active" : ""}`}
                     draggable
                     title="拖到时间轴设置时间"
+                    onContextMenu={(event) => {
+                      event.preventDefault();
+                      if (!hasVideo || activeJob) return;
+                      setLineMenu({ lineId: line.id, x: event.clientX, y: event.clientY });
+                    }}
                     onDragStart={(event) => {
                       event.dataTransfer.effectAllowed = "move";
                       event.dataTransfer.setData(
@@ -784,6 +966,7 @@ export function EditorPage({ id }: { id: string }) {
                       <small>
                         {formatTime(line.start_ms)}
                         {line.timing_precision === "line" ? " · 行级时间" : ""}
+                        {line.units.some((unit) => unit.timing_confidence !== null && unit.timing_confidence < 0.55) ? " · 低置信度" : ""}
                       </small>
                     </span>
                     <GripVertical className="line-drag-handle" size={16} />
@@ -878,6 +1061,7 @@ export function EditorPage({ id }: { id: string }) {
         </div>
         <TimelineCanvas
           projectId={id}
+          waveformSource={String(document.media.waveform_source || "source")}
           lines={lines}
           durationMs={durationMs}
           mediaRef={videoRef}
@@ -919,6 +1103,16 @@ export function EditorPage({ id }: { id: string }) {
           }}
         />
       )}
+      {lineMenu && (() => {
+        const index = lines.findIndex((line) => line.id === lineMenu.lineId);
+        const remaining = lines.slice(index).map((line) => line.id);
+        return <div className="line-context-menu" style={{ left: lineMenu.x, top: lineMenu.y }} onPointerDown={(event) => event.stopPropagation()}>
+          <strong>Whisper 重新识别</strong>
+          <button onClick={() => { setLineMenu(null); void startTranscription([lineMenu.lineId]); }}>当前行</button>
+          <button onClick={() => { setLineMenu(null); void startTranscription(remaining); }}>从此处到结尾</button>
+          <button onClick={() => { setLineMenu(null); void startTranscription(); }}>全曲</button>
+        </div>;
+      })()}
     </>
   );
 }

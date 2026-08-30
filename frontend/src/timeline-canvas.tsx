@@ -35,6 +35,7 @@ const MAX_CANVAS_DIMENSION = 32760;
 
 export function TimelineCanvas({
   projectId,
+  waveformSource,
   lines,
   durationMs,
   mediaRef,
@@ -51,6 +52,7 @@ export function TimelineCanvas({
   onDropLine,
 }: {
   projectId: string;
+  waveformSource: string;
   lines: LyricLine[];
   durationMs: number;
   mediaRef: RefObject<HTMLVideoElement | null>;
@@ -106,7 +108,7 @@ export function TimelineCanvas({
       active = false;
       document.removeEventListener("loadedmetadata", load, true);
     };
-  }, [hasVideo, projectId]);
+  }, [hasVideo, projectId, waveformSource]);
 
   useEffect(() => {
     let frame = 0;
@@ -170,13 +172,18 @@ export function TimelineCanvas({
       const y1 = 40 + lane * 43;
       const y2 = y1 + 35;
       const selected = unit.id === selectedId;
+      const lowConfidence = unit.timing_confidence !== null && unit.timing_confidence < 0.55;
       context.fillStyle = selected
         ? "#0b57d0"
+        : lowConfidence
+          ? "#ffecb5"
         : unit.timing_source === "estimated"
           ? "#fef3c7"
           : "#d3e3fd";
       context.strokeStyle = selected
         ? "#0842a0"
+        : lowConfidence
+          ? "#c58a00"
         : unit.timing_source === "estimated"
           ? "#f9ab00"
           : "#7baaf7";

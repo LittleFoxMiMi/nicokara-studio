@@ -10,6 +10,12 @@ class Settings(BaseSettings):
     ffmpeg_path: str = "ffmpeg"
     allowed_origins: str = "http://localhost:5173,http://localhost:3200"
     max_video_bytes: int = 4 * 1024 * 1024 * 1024
+    max_background_jobs: int = 1
+    separator_model: str = "UVR_MDXNET_KARA_2.onnx"
+    separator_device: str = "auto"
+    whisper_model: str = "small"
+    whisper_device: str = "auto"
+    whisper_compute_type: str = "int8"
     @property
     def database_path(self) -> Path:
         return self.data_dir / "nicokara.sqlite3"
@@ -17,11 +23,15 @@ class Settings(BaseSettings):
     def projects_dir(self) -> Path:
         return self.data_dir / "projects"
     @property
+    def models_dir(self) -> Path:
+        return self.data_dir / "models"
+    @property
     def cors_origins(self) -> list[str]:
         return [x.strip() for x in self.allowed_origins.split(",") if x.strip()]
     def prepare(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.projects_dir.mkdir(parents=True, exist_ok=True)
+        self.models_dir.mkdir(parents=True, exist_ok=True)
 
 @lru_cache
 def get_settings() -> Settings:

@@ -10,7 +10,7 @@ from app.core.config import Settings
 from app.domain.lyrics import detect_lyrics_format, parse_lyrics
 from app.media.probe import probe, thumbnail
 from app.media.waveform import generate_waveform
-from app.schemas.projects import DocumentSave, LyricsDetect, LyricsImport, ProjectCreate, ProjectPatch, ProjectResponse
+from app.schemas.projects import AnalysisRequest, DocumentSave, LyricsDetect, LyricsImport, ProjectCreate, ProjectPatch, ProjectResponse, SeparationRequest
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -88,7 +88,7 @@ def import_lyrics(project_id: str, payload: LyricsImport, request: Request):
         if str(exc).startswith("revision_conflict"):
             raise HTTPException(409, {"code": "revision_conflict"}) from exc
         raise HTTPException(422, str(exc)) from exc
-    return {"revision": result["revision"], "document": document}
+    return {"revision": result["revision"], "document": document, "job": None}
 
 @router.post("/{project_id}/video")
 async def upload_video(project_id: str, request: Request, video: UploadFile = File(...)):
@@ -107,7 +107,36 @@ async def upload_video(project_id: str, request: Request, video: UploadFile = Fi
     metadata["waveform_generated"] = generate_waveform(destination, directory / "waveform.json", settings.ffmpeg_path)
     metadata["waveform_url"] = f"/api/projects/{project_id}/waveform" if metadata["waveform_generated"] else None
     doc = db.document(project_id) or initial_document(project_id, project["name"]); doc["media"] = {**doc.get("media", {}), **metadata, "video_filename": safe, "thumbnail_url": f"/api/projects/{project_id}/thumbnail"}
-    result = db.save_document(project_id, doc, project["revision"]); return {"revision": result["revision"], "media": doc["media"]}
+    result = db.save_document(project_id, doc, project["revision"])
+    return {"revision": result["revision"], "media": doc["media"], "job": None}
+
+@router.post("/{project_id}/separate", status_code=202)
+def separate(project_id: str, payload: SeparationRequest, request: Request):
+    db = services(request)[1]
+    project = project_or_404(db, project_id)
+    if project["revision"] != payload.revision:
+        raise HTTPException(409, {"code": "revision_conflict"})
+    document = db.document(project_id)
+    if not document or not document.get("media", {}).get("video_filename"):
+        raise HTTPException(422, "请先上传视频")
+    return request.app.state.analysis_runner.enqueue(project_id, "VOCAL_SEPARATION", payload.revision, payload.model_dump())
+
+@router.post("/{project_id}/transcribe", status_code=202)
+def transcribe(project_id: str, payload: AnalysisRequest, request: Request):
+    db = services(request)[1]
+    project = project_or_404(db, project_id)
+    if project["revision"] != payload.revision:
+        raise HTTPException(409, {"code": "revision_conflict"})
+    document = db.document(project_id)
+    if not document or not document.get("media", {}).get("video_filename"):
+        raise HTTPException(422, "请先上传视频")
+    lines = document.get("lyrics", {}).get("lines", [])
+    known = {line["id"] for line in lines}
+    if payload.line_ids and not set(payload.line_ids).issubset(known):
+        raise HTTPException(422, "识别范围包含未知歌词行")
+    if payload.start_ms is not None and payload.end_ms is not None and payload.end_ms <= payload.start_ms:
+        raise HTTPException(422, "识别结束时间必须晚于开始时间")
+    return request.app.state.analysis_runner.enqueue(project_id, "TRANSCRIPTION", payload.revision, payload.model_dump())
 
 @router.get("/{project_id}/video")
 def get_video(project_id: str, request: Request):
@@ -127,6 +156,9 @@ def get_waveform(project_id: str, request: Request):
     project_or_404(db, project_id)
     directory = settings.projects_dir / project_id
     path = directory / "waveform.json"
+    vocal_path = directory / "derived" / "vocal_waveform.json"
+    if vocal_path.is_file():
+        path = vocal_path
     if not path.is_file():
         video = directory / "video.mp4"
         if not video.is_file():
