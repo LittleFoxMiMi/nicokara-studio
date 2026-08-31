@@ -51,6 +51,32 @@ type Drag = {
 
 const MAX_CANVAS_DIMENSION = 32760;
 const CANVAS_TILE_WIDTH = 12000;
+const MIN_ZOOM = 30;
+const MAX_ZOOM = 180;
+
+type TimelinePersistence = {
+  zoom: number;
+  scrollLeft: number;
+  positionMs: number;
+};
+
+function readTimelinePersistence(key: string): TimelinePersistence | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const value = JSON.parse(window.localStorage.getItem(key) || "null") as Partial<TimelinePersistence> | null;
+    if (!value || !Number.isFinite(value.zoom) || !Number.isFinite(value.scrollLeft) || !Number.isFinite(value.positionMs)) return null;
+    const zoom = Number(value.zoom);
+    const scrollLeft = Number(value.scrollLeft);
+    const positionMs = Number(value.positionMs);
+    return {
+      zoom: Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom)),
+      scrollLeft: Math.max(0, scrollLeft),
+      positionMs: Math.max(0, positionMs),
+    };
+  } catch {
+    return null;
+  }
+}
 
 export function TimelineCanvas({
   projectId,
@@ -106,13 +132,110 @@ export function TimelineCanvas({
   const rubyGroupsRef = useRef<RubyGroup[]>([]);
   const dragRef = useRef<Drag | null>(null);
   const zoomAnchorRef = useRef<{ timeMs: number; screenX: number } | null>(null);
+  const persistenceKey = `nicokara.timeline.${projectId}`;
+  const [savedTimeline, setSavedTimeline] = useState<TimelinePersistence | null>(() => readTimelinePersistence(persistenceKey));
   const [waveform, setWaveform] = useState<Waveform | null>(null);
   const [waveformError, setWaveformError] = useState(false);
   const [rubyAdjustEnabled, setRubyAdjustEnabled] = useState(false);
-  const [zoom, setZoom] = useState(80);
+  const [zoom, setZoom] = useState(() => savedTimeline?.zoom ?? 80);
+  const zoomRef = useRef(zoom);
+  const scrollLeftRef = useRef(savedTimeline?.scrollLeft ?? 0);
+  const positionMsRef = useRef(savedTimeline?.positionMs ?? 0);
+  const restoredScrollRef = useRef(false);
+  const restoredPositionRef = useRef(false);
+  zoomRef.current = zoom;
   const width = Math.max(900, Math.ceil((durationMs / 1000) * zoom));
   const height = 260;
   const tileCount = Math.max(1, Math.ceil(width / CANVAS_TILE_WIDTH));
+
+  function saveTimelineState() {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(persistenceKey, JSON.stringify({
+        zoom: zoomRef.current,
+        scrollLeft: Math.max(0, scrollLeftRef.current || 0),
+        positionMs: Math.max(0, positionMsRef.current),
+      } satisfies TimelinePersistence));
+    } catch {
+      // Storage can be unavailable in private or restricted browsing contexts.
+    }
+  }
+
+  useEffect(() => () => saveTimelineState(), [projectId]);
+
+  useEffect(() => {
+    const next = readTimelinePersistence(persistenceKey);
+    setSavedTimeline(next);
+    setZoom(next?.zoom ?? 80);
+    zoomRef.current = next?.zoom ?? 80;
+    scrollLeftRef.current = next?.scrollLeft ?? 0;
+    positionMsRef.current = next?.positionMs ?? 0;
+    restoredScrollRef.current = false;
+    restoredPositionRef.current = false;
+  }, [persistenceKey]);
+
+  useEffect(() => {
+    if (restoredScrollRef.current) return;
+    if (!savedTimeline) {
+      restoredScrollRef.current = true;
+      return;
+    }
+    let frame = 0;
+    const restore = () => {
+      const scroller = scrollerRef.current;
+      if (!scroller || scroller.clientWidth === 0) {
+        frame = requestAnimationFrame(restore);
+        return;
+      }
+      const maxScroll = Math.max(0, width - scroller.clientWidth);
+      scrollLeftRef.current = Math.max(0, Math.min(maxScroll, savedTimeline.scrollLeft));
+      scroller.scrollLeft = scrollLeftRef.current;
+      restoredScrollRef.current = true;
+    };
+    frame = requestAnimationFrame(restore);
+    return () => cancelAnimationFrame(frame);
+  }, [savedTimeline, width]);
+
+  useEffect(() => {
+    if (restoredPositionRef.current) return;
+    if (savedTimeline?.positionMs == null || !hasVideo) {
+      restoredPositionRef.current = true;
+      return;
+    }
+    const video = mediaRef.current;
+    const restore = () => {
+      const current = mediaRef.current;
+      if (!current || current.readyState < 1) return;
+      const maximum = Number.isFinite(current.duration) ? current.duration * 1000 : durationMs;
+      positionMsRef.current = Math.max(0, Math.min(maximum, savedTimeline.positionMs));
+      current.currentTime = positionMsRef.current / 1000;
+      restoredPositionRef.current = true;
+    };
+    restore();
+    video?.addEventListener("loadedmetadata", restore);
+    return () => video?.removeEventListener("loadedmetadata", restore);
+  }, [durationMs, hasVideo, mediaRef, savedTimeline]);
+
+  useEffect(() => {
+    if (restoredScrollRef.current) saveTimelineState();
+  }, [zoom]);
+
+  useEffect(() => {
+    const video = mediaRef.current;
+    if (!video) return;
+    const save = () => {
+      positionMsRef.current = Math.max(0, video.currentTime * 1000);
+      saveTimelineState();
+    };
+    video.addEventListener("timeupdate", save);
+    video.addEventListener("seeked", save);
+    video.addEventListener("pause", save);
+    return () => {
+      video.removeEventListener("timeupdate", save);
+      video.removeEventListener("seeked", save);
+      video.removeEventListener("pause", save);
+    };
+  }, [mediaRef, projectId]);
   const timedUnits = useMemo(
     () =>
       lines
@@ -178,6 +301,7 @@ export function TimelineCanvas({
     let frame = 0;
     const update = () => {
       const currentMs = (mediaRef.current?.currentTime || 0) * 1000;
+      positionMsRef.current = Math.max(0, currentMs);
       const x = (currentMs / 1000) * zoom;
       if (playheadRef.current)
         playheadRef.current.style.transform = `translate3d(${x}px,0,0)`;
@@ -204,7 +328,7 @@ export function TimelineCanvas({
   }, [width, zoom]);
 
   function changeZoom(nextZoom: number) {
-    const next = Math.max(30, Math.min(180, nextZoom));
+    const next = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, nextZoom));
     if (next === zoom) return;
     const scroller = scrollerRef.current;
     if (scroller && scroller.clientWidth > 0) {
@@ -219,6 +343,7 @@ export function TimelineCanvas({
         : ((visibleStart + scroller.clientWidth / 2) / zoom) * 1000;
       zoomAnchorRef.current = { timeMs: anchorMs, screenX };
     }
+    zoomRef.current = next;
     setZoom(next);
   }
 
@@ -683,6 +808,10 @@ export function TimelineCanvas({
       <div
         className="timeline-scroller"
         ref={scrollerRef}
+        onScroll={(event) => {
+          scrollLeftRef.current = Math.max(0, event.currentTarget.scrollLeft);
+          saveTimelineState();
+        }}
         onDragOver={(event) => {
           if (!event.dataTransfer.types.some((type) =>
             ["application/x-nicokara-lyric-line", "text/plain"].includes(type),

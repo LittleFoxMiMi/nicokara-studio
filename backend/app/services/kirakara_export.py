@@ -35,20 +35,50 @@ def document_to_lrc(document: dict) -> str:
         units = [unit for unit in line.get("units", []) if unit.get("surface")]
         current_role = ""
         body: list[str] = []
-        for unit in units:
+        index = 0
+        while index < len(units):
+            unit = units[index]
             start = unit.get("start_ms") if unit.get("start_ms") is not None else line.get("start_ms") or 0
             end = unit.get("end_ms") if unit.get("end_ms") is not None else line.get("end_ms") or int(start) + 500
             role = "+".join(str(item) for item in unit.get("roles", []) if item)
             prefix = f"【@{role}】" if role and role != current_role else ""
             current_role = role or current_role
-            surface = _escape(unit.get("surface"))
             ruby = unit.get("ruby") or unit.get("ruby_2")
             ruby_text = f"{unit.get('ruby') or ''}>{unit.get('ruby_2')}" if unit.get("ruby_2") else str(unit.get("ruby") or "")
-            if len(str(unit.get("surface"))) == 1 or ruby:
-                body.append(f"{prefix}{_timestamp(start)}{{{surface}|{_escape(ruby_text)}}}" if ruby else f"{prefix}{_timestamp(start)}{surface}")
+            if ruby:
+                # A ruby annotation belongs to the complete surface range. Older
+                # projects may repeat the same reading on each unit, so fold both
+                # the explicit ruby_span and contiguous duplicate readings into a
+                # single KRL token. Kirakara then assigns the reading once to the
+                # first character and uses ruby_span for the remaining characters.
+                try:
+                    raw_span = unit.get("ruby_span")
+                    target_chars = max(1, int(raw_span or 1))
+                except (TypeError, ValueError):
+                    raw_span = None
+                    target_chars = 1
+                member_end = index + 1
+                char_count = len(str(unit.get("surface") or ""))
+                while target_chars > 1 and char_count < target_chars and member_end < len(units):
+                    char_count += len(str(units[member_end].get("surface") or ""))
+                    member_end += 1
+                while target_chars <= 1 and member_end < len(units):
+                    next_unit = units[member_end]
+                    if next_unit.get("ruby") != unit.get("ruby") or next_unit.get("ruby_2") != unit.get("ruby_2"):
+                        break
+                    member_end += 1
+                members = units[index:member_end]
+                grouped_surface = _escape("".join(str(member.get("surface") or "") for member in members))
+                body.append(f"{prefix}{_timestamp(start)}{{{grouped_surface}|{_escape(ruby_text)}}}")
+                index += len(members)
+                continue
+            surface = _escape(unit.get("surface"))
+            if len(str(unit.get("surface"))) == 1:
+                body.append(f"{prefix}{_timestamp(start)}{surface}")
             else:
                 chars = list(str(unit.get("surface")))
-                body.extend(f"{prefix if index == 0 else ''}{_timestamp(start + (end - start) * index / len(chars))}{_escape(char)}" for index, char in enumerate(chars))
+                body.extend(f"{prefix if char_index == 0 else ''}{_timestamp(start + (end - start) * char_index / len(chars))}{_escape(char)}" for char_index, char in enumerate(chars))
+            index += 1
         fallback_end = line.get("end_ms") if line.get("end_ms") is not None else (line.get("start_ms") or 0) + 500
         rows.append("".join(body) + _timestamp(fallback_end))
     return "\n".join(rows)
@@ -125,7 +155,7 @@ def build_worker_html(settings: Settings, project_id: str, job_id: str, document
     media = document.get("media", {})
     width = int(media.get("width") or 1920)
     height = int(media.get("height") or 1080)
-    fps = _media_number(media.get("fps"), 30)
+    fps = max(1.0, _media_number(media.get("fps"), 30))
     duration = _media_number(media.get("duration_ms"), max([line.get("end_ms") or 0 for line in document.get("lyrics", {}).get("lines", [])] + [1000])) / 1000
     config = document_to_config(document)
     entry_buf = (float(config.get("fadeDurationMs", 100)) / 1000 + 3.5) if config.get("indicatorEnabled") else 2
@@ -141,13 +171,18 @@ setInterval(async()=>{{try{{const s=await fetch(d.cancelUrl).then(r=>r.json()); 
 
 
 def _encode_with_ffmpeg(raw: Path, output: Path, audio: Path, fmt: str, ffmpeg: str, fps: float, duration_ms: int, *, progress_callback: Callable[[float, str], None] | None = None, should_cancel: Callable[[], bool] | None = None) -> None:
+    output_fps = max(1.0, float(fps or 30))
     if fmt == "webm":
-        video_args = ["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0", "-g", str(max(1, round(fps * 2)))]
+        video_args = ["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0", "-g", str(max(1, round(output_fps * 2)))]
         audio_args = ["-c:a", "libopus", "-b:a", "160k"]
     else:
-        video_args = ["-c:v", "libx264", "-preset", "medium", "-crf", "20", "-g", str(max(1, round(fps * 2))), "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+        video_args = ["-c:v", "libx264", "-preset", "medium", "-crf", "20", "-g", str(max(1, round(output_fps * 2))), "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
         audio_args = ["-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2"]
-    command = [ffmpeg, "-y", "-hide_banner", "-nostats", "-progress", "pipe:1", "-i", str(raw), "-i", str(audio), "-map", "0:v:0", "-map", "1:a:0", *video_args, *audio_args, "-shortest", str(output)]
+    # Force constant frame pacing in the final file. The browser-generated raw
+    # container can carry fractional or slightly irregular timestamps; leaving
+    # sync to the muxer makes some players present it as visibly lower FPS.
+    frame_args = ["-r", f"{output_fps:.6f}", "-fps_mode", "cfr"]
+    command = [ffmpeg, "-y", "-hide_banner", "-nostats", "-progress", "pipe:1", "-i", str(raw), "-i", str(audio), "-map", "0:v:0", "-map", "1:a:0", *frame_args, *video_args, *audio_args, "-shortest", str(output)]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
     try:
         assert process.stdout is not None
@@ -202,7 +237,8 @@ def run_kirakara_export(job_id: str, project_id: str, document: dict, payload: d
                 if not audio.is_file():
                     raise ExportError("导出音轨不存在，请先准备音频或完成人声分离")
                 duration_ms = round(_media_number(document.get("media", {}).get("duration_ms"), 1000))
-                _encode_with_ffmpeg(raw, output, audio, fmt, settings.ffmpeg_path, _media_number(document.get("media", {}).get("fps"), 30), duration_ms, progress_callback=progress_callback, should_cancel=should_cancel)
+                fps = max(1.0, _media_number(document.get("media", {}).get("fps"), 30))
+                _encode_with_ffmpeg(raw, output, audio, fmt, settings.ffmpeg_path, fps, duration_ms, progress_callback=progress_callback, should_cancel=should_cancel)
                 raw.unlink(missing_ok=True)
                 if progress_callback:
                     progress_callback(1.0, "Kirakara 服务端导出完成")

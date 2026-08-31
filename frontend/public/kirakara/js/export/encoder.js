@@ -19,6 +19,7 @@ KiraExport.Encoder = function (opts) {
     let actualCodec = null;
     let started = false;
     let _description = null;  // avcC from metadata.decoderConfig.description
+    const keyFrameInterval = Math.max(1, Math.round(fps));
 
     const dumpNAL = function(buf) {
         let i = 0;
@@ -77,7 +78,7 @@ KiraExport.Encoder = function (opts) {
             timestamp: Math.round(timeSec * 1_000_000),
             duration: Math.round(1_000_000 / fps),
         });
-        encoder.encode(vf, { keyFrame: (frameIndex % fps === 0) });
+        encoder.encode(vf, { keyFrame: (frameIndex % keyFrameInterval === 0) });
         vf.close();
     };
 

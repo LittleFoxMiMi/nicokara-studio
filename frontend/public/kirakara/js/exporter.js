@@ -91,6 +91,7 @@ async function doExportCanvas({
         const t0 = performance.now(); let lastUp = performance.now();
         const codecLabel = isPngSeq ? 'PNG序列(透明)' : (actualCodec || expCodec);
         console.log('[Export] ' + w + 'x' + h + ' @' + fps + 'fps  ' + codecLabel + '  ' + totalFrames + 'frames  ' + (hasVideo ? 'video' : ''));
+        const flushInterval = Math.max(1, Math.round(fps * 2));
 
         // ========== 渲染循环 ==========
         let firstVideoFrame = null;
@@ -135,7 +136,7 @@ async function doExportCanvas({
             } else {
                 encoder.encode(canvas, targetTime, i);
                 // 周期性 flush（避免编码器内存堆积）
-                if ((i + 1) % (fps * 2) === 0) await encoder.flush();
+                if ((i + 1) % flushInterval === 0) await encoder.flush();
             }
 
             // 进度更新
