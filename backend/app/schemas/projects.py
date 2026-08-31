@@ -26,6 +26,13 @@ class AnalysisRequest(BaseModel):
     device: Literal["auto", "cpu"] | None = None
     compute_type: str | None = None
 
+class FullAnalysisRequest(AnalysisRequest):
+    steps: list[Literal["separation", "transcription", "pronunciation", "global_alignment", "alignment"]] = Field(
+        default_factory=lambda: ["separation", "transcription", "pronunciation", "global_alignment", "alignment"],
+        max_length=5,
+    )
+    profile_id: str | None = None
+
 class SeparationRequest(BaseModel):
     revision: int = Field(ge=1)
     device: Literal["auto", "directml", "cpu"] = "auto"
@@ -38,6 +45,11 @@ class PronunciationRequest(BaseModel):
     overwrite_policy: Literal["unlocked_only", "all"] = "unlocked_only"
     mode: Literal["local", "ai"] = "local"
     profile_id: str | None = None
+
+class ExportRequest(BaseModel):
+    revision: int = Field(ge=1)
+    format: Literal["mp4", "webm"] = "mp4"
+    audio_track: Literal["on_vocal", "off_vocal"] = "on_vocal"
 
 class AIProfilePayload(BaseModel):
     name: str = Field(min_length=1, max_length=120)

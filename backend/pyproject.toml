@@ -16,6 +16,7 @@ analysis = [
   "audio-separator[cpu]>=0.44.5,<0.45",
   "faster-whisper>=1.2,<2",
   "librosa>=0.10,<0.11",
+  "stable-ts-whisperless==2.19.1",
   "onnxruntime-directml>=1.24,<2; platform_system == 'Windows'",
 ]
 dev = ["pytest>=8.0,<9", "httpx2>=2,<3"]

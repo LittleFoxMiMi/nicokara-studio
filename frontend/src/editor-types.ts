@@ -50,12 +50,14 @@ export type Waveform = { version: number; sample_rate: number; duration_ms: numb
 export type AnalysisJob = {
   id: string;
   project_id: string;
-  type: "VOCAL_SEPARATION" | "TRANSCRIPTION";
+  type: "VOCAL_SEPARATION" | "TRANSCRIPTION" | "PRONUNCIATION" | "STABLE_GLOBAL_ALIGNMENT" | "STABLE_ALIGNMENT" | "FULL_ANALYSIS" | "EXPORT";
   status: "QUEUED" | "PREPARING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELED";
   progress: number;
+  steps: { key: string; label: string; status: "pending" | "running" | "completed"; progress: number; message?: string }[];
   stage: string;
   message: string;
   input_revision: number;
+  request?: Record<string, unknown>;
   output_revision: number | null;
   error_code: string | null;
   error_message: string | null;

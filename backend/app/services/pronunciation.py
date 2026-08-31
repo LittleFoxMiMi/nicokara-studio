@@ -4,11 +4,13 @@ import json
 import re
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
+import httpx
 from uuid import uuid4
 
 from pykakasi import kakasi
 from app.services.ai_client import AIClient
+from app.services.secrets import SecretStore
 
 DEFAULT_SYSTEM_PROMPT = r'''你是日语卡拉 OK 歌词注音器。你的任务是只为歌词正文中的汉字或包含汉字的特殊表记生成日语假名读音，不得翻译、改写、纠正或删除歌词正文。
 
@@ -51,6 +53,9 @@ READING_RE = re.compile(r"^[ぁ-ゖァ-ヺー・ゔヴーA-Za-z0-9'\- ]+$")
 
 class PronunciationValidationError(ValueError):
     pass
+
+
+AI_REQUEST_ERRORS = (PronunciationValidationError, ValueError, OSError, TimeoutError, httpx.HTTPError, json.JSONDecodeError)
 
 
 @dataclass
@@ -246,6 +251,15 @@ def apply_ai(document: dict, result: list[dict], selection: PronunciationSelecti
                 chunk["surface"] = surface[left:right]
                 if chunk_index:
                     chunk["id"] = str(uuid4())
+                # A pronunciation proposal belongs to the complete surface range.
+                # Keep it on the first unit and let ruby_span mark the following
+                # units as part of the same word group; never repeat a phrase
+                # reading on every kanji.
+                if annotations:
+                    chunk["ruby"] = None
+                    chunk["ruby_source"] = "none"
+                    chunk.pop("ruby_confidence", None)
+                    chunk["ruby_span"] = 0
                 if original.get("start_ms") is not None and original.get("end_ms") is not None and surface:
                     span = original["end_ms"] - original["start_ms"]
                     chunk["start_ms"] = round(original["start_ms"] + span * left / len(surface))
@@ -255,13 +269,134 @@ def apply_ai(document: dict, result: list[dict], selection: PronunciationSelecti
                     if absolute_left >= start and absolute_right <= end:
                         if original.get("locked") and selection.overwrite_policy != "all":
                             skipped_locked += 1
-                        else:
+                        elif unit_start + left == start:
                             chunk["ruby"] = reading
                             chunk["ruby_source"] = "ai"
                             chunk["ruby_confidence"] = 0.9
+                            chunk["ruby_span"] = end - start
                             applied += 1
                         break
                 next_units.append(chunk)
         line["units"] = next_units
     updated.setdefault("pronunciation", {})["last_run"] = {"mode": "ai", "applied": applied}
     return updated, {"applied": applied, "skipped_locked": skipped_locked, "source": "ai", "text_preserved": True}
+
+
+def _complete_with_retry(
+    client: AIClient,
+    system_prompt: str,
+    user_prompt: str,
+    retry_count: int,
+    validate: Callable[[dict], tuple[list[dict], set[int], set[int]]],
+) -> tuple[dict, list[dict], set[int], set[int], int]:
+    retries = max(0, min(10, int(retry_count)))
+    for attempt in range(retries + 1):
+        try:
+            raw = client.complete(system_prompt, user_prompt)
+            valid, invalid, raw_mismatch = validate(raw)
+            if (invalid or raw_mismatch) and attempt < retries:
+                raise PronunciationValidationError(f"{len(invalid)} 行校验失败")
+            return raw, valid, invalid, raw_mismatch, attempt
+        except AI_REQUEST_ERRORS:
+            if attempt >= retries:
+                raise
+    raise RuntimeError("unreachable")
+
+
+def run_ai_pronunciation(
+    *,
+    database: Any,
+    settings: Any,
+    project_id: str,
+    document: dict,
+    selection: PronunciationSelection,
+    profile_id: str | None = None,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> tuple[dict, dict]:
+    """Run all AI batches and commit one revision, optionally reporting batch progress."""
+    profile_id = profile_id or database.settings().get("default_ai_profile_id")
+    profile = database.get_ai_profile(profile_id) if profile_id else None
+    app_settings = database.settings()
+    fallback = str(app_settings.get("ai_failure_mode", "auto_local")) == "auto_local"
+    if not profile:
+        if fallback:
+            updated, summary = apply_local(document, selection, fallback=True)
+            return updated, {**summary, "fallback_reason": "未配置 AI profile"}
+        raise PronunciationValidationError("尚未配置 AI 注音 profile")
+    key = SecretStore(settings.data_dir).decrypt(database.get_ai_profile_secret(profile["id"]))
+    if not key:
+        if fallback:
+            updated, summary = apply_local(document, selection, fallback=True)
+            return updated, {**summary, "fallback_reason": "AI profile 未配置密钥"}
+        raise PronunciationValidationError("AI profile 未配置密钥")
+    lines = document.get("lyrics", {}).get("lines", [])
+    current_lines = [{"line_index": index, "text": "".join(unit.get("surface", "") for unit in line.get("units", []))} for index, line in enumerate(lines)]
+    whisper_segments: list[dict] = []
+    transcript_path = settings.projects_dir / project_id / "derived" / "transcript.json"
+    if transcript_path.is_file():
+        try:
+            whisper_segments = [{"segment_index": index, "text": item.get("text", "")} for index, item in enumerate(json.loads(transcript_path.read_text(encoding="utf-8")).get("segments", []))]
+        except (OSError, ValueError):
+            whisper_segments = []
+    system_prompt = str(app_settings.get("pronunciation_system_prompt") or DEFAULT_SYSTEM_PROMPT)
+    user_template = str(app_settings.get("pronunciation_user_template") or DEFAULT_USER_TEMPLATE)
+    line_batches = chunk_lines(current_lines, profile.get("max_chars_per_request", 1200))
+    proxy = str(app_settings.get("proxy_url") or "") if app_settings.get("proxy_enabled", True) else None
+    try:
+        client = AIClient(profile, key, proxy)
+        raw_batches: list[dict] = []
+        result: list[dict] = []
+        invalid_line_indices: set[int] = set()
+        raw_mismatch_line_indices: set[int] = set()
+        retries_used = 0
+        total = max(1, len(line_batches))
+        for batch_index, batch in enumerate(line_batches):
+            if progress_callback:
+                progress_callback(batch_index / total, f"AI 注音：正在提交第 {batch_index + 1}/{total} 批")
+            batch_prompt = render_prompt(
+                user_template,
+                song_title=document.get("project", {}).get("title", ""),
+                artist=document.get("project", {}).get("artist", ""),
+                current_lines=batch,
+                whisper_segments=whisper_segments,
+            )
+            allowed_indices = {item["line_index"] for item in batch}
+            raw, validated, invalid_indices, raw_mismatch_indices, used = _complete_with_retry(
+                client,
+                system_prompt,
+                batch_prompt,
+                profile.get("retry_count", 2),
+                lambda value: validate_ai_result_partial(value, lines, allowed_indices),
+            )
+            raw_batches.append(raw)
+            retries_used += used
+            result.extend(validated)
+            invalid_line_indices.update(invalid_indices)
+            raw_mismatch_line_indices.update(raw_mismatch_indices)
+            if progress_callback:
+                progress_callback((batch_index + 1) / total, f"AI 注音：第 {batch_index + 1}/{total} 批完成")
+        selected_line_ids = set(selection.line_ids)
+        selected_unit_ids = set(selection.unit_ids)
+        fallback_line_ids = [
+            lines[index]["id"]
+            for index in sorted(invalid_line_indices)
+            if not (selected_line_ids or selected_unit_ids)
+            or lines[index]["id"] in selected_line_ids
+            or any(unit["id"] in selected_unit_ids for unit in lines[index].get("units", []))
+        ]
+        if fallback_line_ids:
+            updated, local_summary = apply_local(document, PronunciationSelection(fallback_line_ids, [], selection.overwrite_policy), fallback=True)
+        else:
+            updated, local_summary = document, {"applied": 0}
+        updated, summary = apply_ai(updated, result, selection)
+        updated.setdefault("pronunciation", {})["last_run"] = {"mode": "ai", "applied": summary["applied"]}
+        if progress_callback:
+            progress_callback(1.0, "AI 注音完成")
+        return updated, {**summary, "batch_count": len(line_batches), "retry_count": retries_used, "local_fallback_lines": len(fallback_line_ids), "local_fallback_applied": local_summary["applied"], "raw_mismatch_lines": len(raw_mismatch_line_indices)}
+    except AI_REQUEST_ERRORS as exc:
+        if fallback:
+            updated, summary = apply_local(document, selection, fallback=True)
+            if progress_callback:
+                progress_callback(1.0, f"AI 不可用，已降级本地注音：{str(exc)[:100]}")
+            return updated, {**summary, "fallback_reason": str(exc)[:200]}
+        raise

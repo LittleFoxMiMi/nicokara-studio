@@ -14,9 +14,9 @@ if not exist "%ROOT%frontend\node_modules" (
 )
 
 echo Starting Nicokara Studio backend and frontend...
-start "Nicokara Backend" /D "%ROOT%backend" cmd /k "..\python\python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8100"
+start "Nicokara Backend" /D "%ROOT%backend" cmd /k "..\python\python.exe -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8100"
 timeout /t 2 /nobreak >nul
-start "Nicokara Frontend" /D "%ROOT%frontend" cmd /k "npm run dev -- --host 127.0.0.1"
+start "Nicokara Frontend" /D "%ROOT%frontend" cmd /k "npm run dev -- --host 0.0.0.0"
 echo.
 echo Frontend: http://127.0.0.1:5173
 echo Backend:  http://127.0.0.1:8100

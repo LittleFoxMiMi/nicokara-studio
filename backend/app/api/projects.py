@@ -3,14 +3,16 @@ import re
 import shutil
 from pathlib import Path
 from uuid import UUID, uuid4
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse
 from app.core.database import Database
 from app.core.config import Settings
 from app.domain.lyrics import detect_lyrics_format, parse_lyrics
 from app.media.probe import probe, thumbnail
 from app.media.waveform import generate_waveform
-from app.schemas.projects import AnalysisRequest, DocumentSave, LyricsDetect, LyricsImport, ProjectCreate, ProjectPatch, ProjectResponse, SeparationRequest
+from app.services.audio import prepare_source_audio
+from app.schemas.projects import AnalysisRequest, DocumentSave, ExportRequest, FullAnalysisRequest, LyricsDetect, LyricsImport, ProjectCreate, ProjectPatch, ProjectResponse, SeparationRequest
+from app.services.kirakara_export import build_worker_html, export_output_path, export_raw_output_path
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -138,11 +140,232 @@ def transcribe(project_id: str, payload: AnalysisRequest, request: Request):
         raise HTTPException(422, "识别结束时间必须晚于开始时间")
     return request.app.state.analysis_runner.enqueue(project_id, "TRANSCRIPTION", payload.revision, payload.model_dump())
 
+
+def _analysis_completion(document: dict, project_id: str, settings: Settings) -> dict[str, bool]:
+    derived = settings.projects_dir / project_id / "derived"
+    lines = document.get("lyrics", {}).get("lines", [])
+    has_kanji = any("一" <= char <= "龯" for line in lines for unit in line.get("units", []) for char in str(unit.get("surface", "")))
+    analysis = document.get("analysis", {})
+    return {
+        "separation": (derived / "vocals_asr.wav").is_file(),
+        "transcription": (derived / "transcript.json").is_file() and analysis.get("transcription", {}).get("status") == "completed",
+        "pronunciation": (not has_kanji) or analysis.get("pronunciation", {}).get("status") == "completed" or document.get("pronunciation", {}).get("last_run", {}).get("mode") in {"local", "ai", "local_fallback"},
+        "global_alignment": (derived / "stable_global.json").is_file() and bool(lines) and all(line.get("start_ms") is not None and line.get("end_ms") is not None for line in lines) and analysis.get("global_alignment", {}).get("status") == "completed",
+        "alignment": analysis.get("alignment", {}).get("status") == "completed",
+    }
+
+
+def _validate_full_steps(project: dict, document: dict, project_id: str, payload: FullAnalysisRequest, settings: Settings) -> None:
+    if project["revision"] != payload.revision:
+        raise HTTPException(409, {"code": "revision_conflict"})
+    if not document.get("media", {}).get("video_filename"):
+        raise HTTPException(422, "请先上传视频")
+    steps = list(dict.fromkeys(payload.steps))
+    if not steps:
+        raise HTTPException(422, "至少选择一个分析流程")
+    complete = _analysis_completion(document, project_id, settings)
+    order = ["separation", "transcription", "pronunciation", "global_alignment", "alignment"]
+    for key in order:
+        if key not in steps and not complete[key]:
+            raise HTTPException(422, f"不能跳过未完成的流程：{key}")
+        if key in steps:
+            previous = order[:order.index(key)]
+            missing = [item for item in previous if item not in steps and not complete[item]]
+            if missing:
+                raise HTTPException(422, f"{key} 的前置流程尚未完成：{missing[0]}")
+
+
+@router.post("/{project_id}/analysis", status_code=202)
+def full_analysis(project_id: str, payload: FullAnalysisRequest, request: Request):
+    settings, db = services(request)
+    project = project_or_404(db, project_id)
+    document = db.document(project_id)
+    if not document:
+        raise HTTPException(404, "工程文档不存在")
+    _validate_full_steps(project, document, project_id, payload, settings)
+    body = payload.model_dump()
+    body["steps"] = list(dict.fromkeys(payload.steps))
+    return request.app.state.analysis_runner.enqueue(project_id, "FULL_ANALYSIS", payload.revision, body)
+
+
+@router.post("/{project_id}/align-global", status_code=202)
+def align_global(project_id: str, payload: AnalysisRequest, request: Request):
+    settings, db = services(request)
+    project = project_or_404(db, project_id)
+    document = db.document(project_id)
+    if not document:
+        raise HTTPException(404, "工程文档不存在")
+    if project["revision"] != payload.revision:
+        raise HTTPException(409, {"code": "revision_conflict"})
+    completion = _analysis_completion(document, project_id, settings)
+    if not completion["transcription"]:
+        raise HTTPException(422, "请先完成 Whisper 粗识别")
+    if not completion["pronunciation"]:
+        raise HTTPException(422, "请先完成 AI 注音或本地注音")
+    return request.app.state.analysis_runner.enqueue(project_id, "STABLE_GLOBAL_ALIGNMENT", payload.revision, payload.model_dump())
+
+
+@router.post("/{project_id}/align", status_code=202)
+def align(project_id: str, payload: AnalysisRequest, request: Request):
+    settings, db = services(request)
+    project = project_or_404(db, project_id)
+    document = db.document(project_id)
+    if not document:
+        raise HTTPException(404, "工程文档不存在")
+    if project["revision"] != payload.revision:
+        raise HTTPException(409, {"code": "revision_conflict"})
+    completion = _analysis_completion(document, project_id, settings)
+    if not completion["global_alignment"]:
+        raise HTTPException(422, "请先完成 stable-ts 全局对齐")
+    return request.app.state.analysis_runner.enqueue(project_id, "STABLE_ALIGNMENT", payload.revision, payload.model_dump())
+
+
+@router.post("/{project_id}/pronunciation-job", status_code=202)
+def pronunciation_job(project_id: str, payload: dict, request: Request):
+    db = services(request)[1]
+    project = project_or_404(db, project_id)
+    document = db.document(project_id)
+    if not document or not document.get("lyrics", {}).get("lines"):
+        raise HTTPException(422, "请先添加歌词")
+    if project["revision"] != payload.get("revision"):
+        raise HTTPException(409, {"code": "revision_conflict"})
+    body = {"revision": project["revision"], "line_ids": payload.get("line_ids", []), "unit_ids": payload.get("unit_ids", []), "overwrite_policy": payload.get("overwrite_policy", "unlocked_only"), "profile_id": payload.get("profile_id"), "mode": payload.get("mode", "ai"), "steps": ["pronunciation"]}
+    return request.app.state.analysis_runner.enqueue(project_id, "PRONUNCIATION", project["revision"], body)
+
+@router.post("/{project_id}/export", status_code=202)
+def export_project(project_id: str, payload: ExportRequest, request: Request):
+    db = services(request)[1]
+    project = project_or_404(db, project_id)
+    if project["revision"] != payload.revision:
+        raise HTTPException(409, {"code": "revision_conflict"})
+    document = db.document(project_id)
+    if not document or not document.get("media", {}).get("video_filename"):
+        raise HTTPException(422, "导出请先上传视频")
+    if payload.audio_track == "off_vocal" and not (services(request)[0].projects_dir / project_id / "derived" / "instrumental.wav").is_file():
+        raise HTTPException(422, "请先完成 KARA2 人声分离")
+    return request.app.state.analysis_runner.enqueue(project_id, "EXPORT", payload.revision, {**payload.model_dump(), "steps": ["export"]})
+
+@router.get("/{project_id}/exports")
+def list_exports(project_id: str, request: Request, limit: int = Query(20, ge=1, le=100)):
+    db = services(request)[1]
+    project_or_404(db, project_id)
+    return [job for job in db.list_jobs(project_id, limit) if job["type"] == "EXPORT"]
+
+@router.get("/{project_id}/exports/{job_id}/download")
+def download_export(project_id: str, job_id: str, request: Request):
+    settings, db = services(request)
+    project_or_404(db, project_id)
+    job = db.get_job(job_id)
+    if not job or job["project_id"] != project_id or job["type"] != "EXPORT" or job["status"] != "SUCCEEDED":
+        raise HTTPException(404, "导出文件不存在")
+    result = job.get("result") or {}
+    path = export_output_path(settings, project_id, job_id, str(result.get("format", job.get("request", {}).get("format", "mp4"))))
+    if not path.is_file():
+        raise HTTPException(404, "导出文件已被清理")
+    filename = result.get("filename") or f"{project_id}.{path.suffix.lstrip('.') }"
+    return FileResponse(path, media_type="video/mp4" if path.suffix == ".mp4" else "video/webm", filename=filename)
+
+@router.delete("/{project_id}/exports/{job_id}", status_code=204)
+def delete_export(project_id: str, job_id: str, request: Request):
+    settings, db = services(request)
+    project_or_404(db, project_id)
+    job = db.get_job(job_id)
+    if not job or job["project_id"] != project_id or job["type"] != "EXPORT":
+        raise HTTPException(404, "导出记录不存在")
+    if job["status"] in {"QUEUED", "PREPARING", "RUNNING"}:
+        raise HTTPException(409, "导出任务仍在运行，完成或取消后才能删除")
+    fmt = str(job.get("request", {}).get("format", "mp4"))
+    output = export_output_path(settings, project_id, job_id, fmt)
+    for path in (output, export_raw_output_path(settings, project_id, job_id, fmt), output.with_suffix(".error")):
+        path.unlink(missing_ok=True)
+    if not db.delete_job(job_id, project_id):
+        raise HTTPException(404, "导出记录不存在")
+
+@router.get("/{project_id}/export-worker/{job_id}", response_class=HTMLResponse)
+def export_worker(project_id: str, job_id: str, request: Request):
+    settings, db = services(request)
+    project_or_404(db, project_id)
+    job = db.get_job(job_id)
+    if not job or job["project_id"] != project_id or job["type"] != "EXPORT":
+        raise HTTPException(404, "导出任务不存在")
+    document = db.document(project_id, job["input_revision"])
+    if not document:
+        raise HTTPException(404, "工程文档不存在")
+    return HTMLResponse(build_worker_html(settings, project_id, job_id, document, job["request"]))
+
+@router.post("/{project_id}/export-worker/{job_id}/progress")
+async def export_worker_progress(project_id: str, job_id: str, request: Request):
+    db = services(request)[1]
+    job = db.get_job(job_id)
+    if not job or job["project_id"] != project_id or job["type"] != "EXPORT":
+        raise HTTPException(404, "导出任务不存在")
+    body = await request.json()
+    value = max(0.0, min(1.0, float(body.get("progress", 0))))
+    message = str(body.get("message") or "正在渲染 Kirakara")
+    steps = job.get("steps", [])
+    for step in steps:
+        if step.get("key") == "export":
+            step.update(progress=round(value, 4), status="completed" if value >= 1 else "running", label="Kirakara 服务端导出", message=message)
+    db.update_job(job_id, status="RUNNING", progress=value, stage="EXPORT", message=message, steps=steps)
+    return {"ok": True}
+
+@router.get("/{project_id}/export-worker/{job_id}/cancel")
+def export_worker_cancel(project_id: str, job_id: str, request: Request):
+    db = services(request)[1]
+    job = db.get_job(job_id)
+    if not job or job["project_id"] != project_id or job["type"] != "EXPORT":
+        raise HTTPException(404, "导出任务不存在")
+    return {"cancel_requested": bool(job["cancel_requested"])}
+
+@router.post("/{project_id}/export-worker/{job_id}/result")
+async def export_worker_result(project_id: str, job_id: str, request: Request):
+    settings, db = services(request)
+    job = db.get_job(job_id)
+    if not job or job["project_id"] != project_id or job["type"] != "EXPORT":
+        raise HTTPException(404, "导出任务不存在")
+    fmt = str(job["request"].get("format", "mp4"))
+    path = export_raw_output_path(settings, project_id, job_id, fmt)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".partial")
+    temporary.write_bytes(await request.body())
+    temporary.replace(path)
+    return {"ok": True, "filename": request.headers.get("x-output-filename") or path.name}
+
+@router.post("/{project_id}/export-worker/{job_id}/error")
+async def export_worker_error(project_id: str, job_id: str, request: Request):
+    settings, db = services(request)
+    job = db.get_job(job_id)
+    if not job or job["project_id"] != project_id or job["type"] != "EXPORT":
+        raise HTTPException(404, "导出任务不存在")
+    marker = export_output_path(settings, project_id, job_id, str(job["request"].get("format", "mp4"))).with_suffix(".error")
+    marker.write_text((await request.body()).decode("utf-8", "replace")[:4000], encoding="utf-8")
+    return {"ok": True}
+
 @router.get("/{project_id}/video")
 def get_video(project_id: str, request: Request):
     settings, db = services(request); project_or_404(db, project_id); path = settings.projects_dir / project_id / "video.mp4"
     if not path.is_file(): raise HTTPException(404, "视频不存在")
     return FileResponse(path, media_type="video/mp4")
+
+@router.get("/{project_id}/audio")
+def get_audio(project_id: str, request: Request, track: str = Query("on_vocal", pattern="^(on_vocal|off_vocal)$")):
+    settings, db = services(request)
+    project_or_404(db, project_id)
+    directory = settings.projects_dir / project_id
+    video = directory / "video.mp4"
+    if not video.is_file():
+        raise HTTPException(404, "视频不存在")
+    derived = directory / "derived"
+    if track == "on_vocal":
+        try:
+            path, _ = prepare_source_audio(video, derived, settings.ffmpeg_path)
+        except Exception as exc:
+            raise HTTPException(503, "无法准备原始音轨") from exc
+    else:
+        path = derived / "instrumental.wav"
+    if not path.is_file():
+        raise HTTPException(404, "指定音轨不存在，请先完成 KARA2 分离")
+    return FileResponse(path, media_type="audio/wav")
 
 @router.get("/{project_id}/thumbnail")
 def get_thumbnail(project_id: str, request: Request):

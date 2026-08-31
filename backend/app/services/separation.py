@@ -50,7 +50,7 @@ class Kara2Separator:
         except ImportError:
             return []
 
-    def separate(self, source: Path, derived_dir: Path, *, model: str = DEFAULT_MODEL, device: str = "auto") -> tuple[Path, Path, Path]:
+    def separate(self, source: Path, derived_dir: Path, *, model: str = DEFAULT_MODEL, device: str = "auto", progress_callback: Callable[[float, str], None] | None = None) -> tuple[Path, Path, Path]:
         factory = self.separator_factory
         if factory is None:
             try:
@@ -79,16 +79,22 @@ class Kara2Separator:
                 if provider == "DmlExecutionProvider":
                     separator.onnx_execution_provider = ["DmlExecutionProvider"]
                 separator.load_model(model_filename=model)
+                if progress_callback:
+                    progress_callback(0.42, "KARA2 模型已就绪，正在分离人声")
                 outputs = separator.separate(
                     str(source),
                     {"Vocals": "vocals", "Instrumental": "instrumental"},
                 )
                 self._place_outputs(outputs, derived_dir, vocals, instrumental)
+                if progress_callback:
+                    progress_callback(0.82, "KARA2 双 stem 已生成")
         except AudioProcessingError:
             raise
         except Exception as exc:
             raise AudioProcessingError("KARA2 分离失败；请检查模型、设备和可用内存") from exc
         convert_audio(vocals, asr, self.ffmpeg, channels=1, sample_rate=16000)
+        if progress_callback:
+            progress_callback(0.96, "正在生成 Whisper 16 kHz 人声音频")
         return vocals, instrumental, asr
 
     @staticmethod

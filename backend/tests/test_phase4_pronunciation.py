@@ -124,6 +124,17 @@ def test_ai_protocol_rejects_surface_mismatch_and_splits_units():
     assert summary["applied"] == 2
 
 
+def test_ai_phrase_reading_is_stored_once_with_ruby_span():
+    lines = [{"id": "line", "units": [{"id": "unit", "surface": "昨日", "start_ms": 0, "end_ms": 1000}]}]
+    result = validate_ai_result({"result": [{"line_index": 0, "raw": ["昨日"], "pronunciation": [[0, 2, "昨日", "きのう"]]}]}, lines)
+    updated, summary = apply_ai({"lyrics": {"lines": lines}}, result, PronunciationSelection([], []))
+    units = updated["lyrics"]["lines"][0]["units"]
+    assert len(units) == 1
+    assert units[0]["ruby"] == "きのう"
+    assert units[0]["ruby_span"] == 2
+    assert summary["applied"] == 1
+
+
 def test_profile_response_never_returns_api_key(tmp_path, monkeypatch):
     get_settings.cache_clear()
     monkeypatch.setenv("NICOKARA_DATA_DIR", str(tmp_path))

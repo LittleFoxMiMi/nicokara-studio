@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   type TEXT NOT NULL,
   status TEXT NOT NULL,
   progress REAL NOT NULL DEFAULT 0,
+  steps_json TEXT NOT NULL DEFAULT '[]',
   stage TEXT NOT NULL DEFAULT '',
   message TEXT NOT NULL DEFAULT '',
   input_revision INTEGER NOT NULL,
@@ -73,6 +74,9 @@ class Database:
         with self.connect() as c:
             c.execute("PRAGMA journal_mode=WAL")
             c.executescript(SCHEMA)
+            job_columns = {row[1] for row in c.execute("PRAGMA table_info(jobs)")}
+            if "steps_json" not in job_columns:
+                c.execute("ALTER TABLE jobs ADD COLUMN steps_json TEXT NOT NULL DEFAULT '[]'")
             # Existing Phase 4 databases predate the selector column.
             columns = {row[1] for row in c.execute("PRAGMA table_info(ai_profiles)")}
             if "thinking_effort" not in columns:
@@ -122,6 +126,10 @@ class Database:
             c.execute("DELETE FROM jobs WHERE project_id=?", (project_id,))
             c.execute("DELETE FROM project_revisions WHERE project_id=?", (project_id,))
             c.execute("DELETE FROM projects WHERE id=?", (project_id,))
+    def delete_job(self, job_id: str, project_id: str) -> bool:
+        with self.connect() as c:
+            result = c.execute("DELETE FROM jobs WHERE id=? AND project_id=?", (job_id, project_id))
+            return result.rowcount > 0
     def settings(self) -> dict:
         with self.connect() as c: return {r["key"]:json.loads(r["value"]) for r in c.execute("SELECT key,value FROM app_settings")}
     def save_settings(self, values: dict) -> dict:
@@ -131,10 +139,20 @@ class Database:
         return self.settings()
     def create_job(self, job_id: str, project_id: str, job_type: str, input_revision: int, payload: dict) -> dict:
         t = now()
+        steps = payload.get("steps") or {
+            "VOCAL_SEPARATION": ["separation"],
+            "TRANSCRIPTION": ["transcription"],
+            "PRONUNCIATION": ["pronunciation"],
+            "STABLE_GLOBAL_ALIGNMENT": ["global_alignment"],
+            "STABLE_ALIGNMENT": ["alignment"],
+            "EXPORT": ["export"],
+        }.get(job_type, [])
+        if isinstance(steps, list):
+            steps = [{"key": key, "label": key, "status": "pending", "progress": 0} for key in steps]
         with self.connect() as c:
             c.execute(
-                "INSERT INTO jobs(id,project_id,type,status,input_revision,request_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                (job_id, project_id, job_type, "QUEUED", input_revision, json.dumps(payload, ensure_ascii=False), t, t),
+                "INSERT INTO jobs(id,project_id,type,status,input_revision,request_json,steps_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?, ?,?)",
+                (job_id, project_id, job_type, "QUEUED", input_revision, json.dumps(payload, ensure_ascii=False), json.dumps(steps, ensure_ascii=False), t, t),
             )
         return self.get_job(job_id)  # type: ignore[return-value]
     def get_job(self, job_id: str) -> dict | None:
@@ -152,15 +170,21 @@ class Database:
     def _job_dict(row: sqlite3.Row) -> dict:
         result = dict(row)
         result["request"] = json.loads(result.pop("request_json"))
+        raw_steps = result.pop("steps_json", "[]")
+        result["steps"] = json.loads(raw_steps) if raw_steps else []
         raw_result = result.pop("result_json")
         result["result"] = json.loads(raw_result) if raw_result else None
         result["cancel_requested"] = bool(result["cancel_requested"])
         return result
     def update_job(self, job_id: str, **changes) -> dict:
-        allowed = {"status", "progress", "stage", "message", "output_revision", "result_json", "error_code", "error_message", "cancel_requested", "started_at", "completed_at"}
+        if "steps" in changes and "steps_json" not in changes:
+            changes["steps_json"] = changes.pop("steps")
+        allowed = {"status", "progress", "stage", "message", "steps_json", "output_revision", "result_json", "error_code", "error_message", "cancel_requested", "started_at", "completed_at"}
         values = {key: value for key, value in changes.items() if key in allowed}
         if "result_json" in values and not isinstance(values["result_json"], str):
             values["result_json"] = json.dumps(values["result_json"], ensure_ascii=False)
+        if "steps_json" in values and not isinstance(values["steps_json"], str):
+            values["steps_json"] = json.dumps(values["steps_json"], ensure_ascii=False)
         values["updated_at"] = now()
         with self.connect() as c:
             c.execute(

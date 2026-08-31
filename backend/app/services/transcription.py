@@ -40,13 +40,23 @@ class FasterWhisperTranscriber:
         self.model_factory = model_factory
         self.download_root = download_root
         self._models: dict[tuple[str, str, str], Any] = {}
+        self._stable_models: dict[tuple[str, str, str], Any] = {}
 
-    def transcribe(self, audio: Path, *, model_name: str, device: str, compute_type: str, start_ms: int | None = None, end_ms: int | None = None) -> Transcript:
+    def get_model(
+        self,
+        *,
+        model_name: str,
+        device: str,
+        compute_type: str,
+        progress_callback: Callable[[float, str], None] | None = None,
+    ) -> Any:
         resolved_device = "cpu"
         resolved_compute = "int8"
         key = (model_name, resolved_device, resolved_compute)
         model = self._models.get(key)
         if model is None:
+            if progress_callback:
+                progress_callback(0.0, "正在下载或加载 Whisper 模型")
             if self.model_factory:
                 model = self.model_factory(*key)
             else:
@@ -63,6 +73,27 @@ class FasterWhisperTranscriber:
                     download_root=str(self.download_root) if self.download_root else None,
                 )
             self._models[key] = model
+            if progress_callback:
+                progress_callback(1.0, "Whisper 模型已就绪")
+        return model
+
+    def transcribe(
+        self,
+        audio: Path,
+        *,
+        model_name: str,
+        device: str,
+        compute_type: str,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        progress_callback: Callable[[float, str], None] | None = None,
+    ) -> Transcript:
+        model = self.get_model(
+            model_name=model_name,
+            device=device,
+            compute_type=compute_type,
+            progress_callback=progress_callback,
+        )
         options: dict[str, Any] = {
             "language": "ja",
             "beam_size": 5,
@@ -82,4 +113,43 @@ class FasterWhisperTranscriber:
             segments.append(
                 TranscriptSegment(int(raw.id), raw.text.strip(), round(raw.start * 1000), round(raw.end * 1000), float(raw.avg_logprob), float(raw.no_speech_prob), words)
             )
+            if progress_callback:
+                duration = max(0.001, float(info.duration))
+                progress_callback(min(1.0, max(0.0, float(raw.end) / duration)), "Whisper 正在粗识别")
+        if progress_callback:
+            progress_callback(1.0, "Whisper 粗识别完成")
         return Transcript(str(info.language), float(info.language_probability), float(info.duration), segments)
+
+    def get_stable_model(
+        self,
+        *,
+        model_name: str,
+        device: str,
+        compute_type: str,
+        progress_callback: Callable[[float, str], None] | None = None,
+    ) -> Any:
+        """Load stable-ts's official faster-whisper model integration."""
+        resolved_device = "cpu"
+        resolved_compute = "int8"
+        key = (model_name, resolved_device, resolved_compute)
+        model = self._stable_models.get(key)
+        if model is not None:
+            return model
+        if progress_callback:
+            progress_callback(0.0, "正在加载 stable-ts faster-whisper 模型")
+        try:
+            import stable_whisper
+        except ImportError as exc:
+            raise RuntimeError("stable-ts 尚未安装") from exc
+        if self.download_root:
+            self.download_root.mkdir(parents=True, exist_ok=True)
+        model = stable_whisper.load_faster_whisper(
+            model_name,
+            device=resolved_device,
+            compute_type=resolved_compute,
+            download_root=str(self.download_root) if self.download_root else None,
+        )
+        self._stable_models[key] = model
+        if progress_callback:
+            progress_callback(1.0, "stable-ts faster-whisper 模型已就绪")
+        return model

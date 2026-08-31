@@ -14,6 +14,16 @@ def get_settings(request: Request):
 @router.put("")
 def save_settings(payload: SettingsPayload, request: Request):
     values = payload.values
+    token_step = values.get("stable_ts_token_step")
+    segment_padding = values.get("stable_ts_segment_padding_seconds")
+    if token_step is not None and (
+        isinstance(token_step, bool) or not isinstance(token_step, int) or token_step < 0 or token_step > 442
+    ):
+        raise HTTPException(422, "stable-ts token-step 必须是 0 到 442 的整数")
+    if segment_padding is not None and (
+        isinstance(segment_padding, bool) or not isinstance(segment_padding, (int, float)) or segment_padding < 0 or segment_padding > 30
+    ):
+        raise HTTPException(422, "词/短语精修 segment 扩展必须是 0 到 30 秒")
     separator_device = values.get("separator_device")
     whisper_device = values.get("whisper_device")
     providers: list[str] = []

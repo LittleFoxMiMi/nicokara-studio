@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     api_prefix: str = "/api"
     ffprobe_path: str = "ffprobe"
     ffmpeg_path: str = "ffmpeg"
+    chrome_path: str = ""
+    export_base_url: str = "http://127.0.0.1:8100"
     allowed_origins: str = "http://localhost:5173,http://localhost:3200"
     max_video_bytes: int = 4 * 1024 * 1024 * 1024
     max_background_jobs: int = 1

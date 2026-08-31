@@ -1,0 +1,15 @@
+.subtitle-layer { position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 2; text-shadow: var(--subtitle-shadow); }
+.subtitle-line { position: absolute; display: flex; flex-direction: column; align-items: center; max-width: 84%; font-weight: 600; line-height: 1; transition: opacity 80ms linear; }
+.subtitle-slot-left { align-items: flex-start; }
+.subtitle-slot-right { align-items: flex-end; }
+.subtitle-row { display: flex; justify-content: center; align-items: flex-end; white-space: nowrap; }
+.subtitle-unit { display: inline-flex; min-width: 0; flex-direction: column; align-items: center; position: relative; padding: 0 1px; }
+.subtitle-ruby { min-height: 0.72em; font-weight: 500; line-height: 1; white-space: nowrap; }
+.subtitle-ruby-2 { color: #bdc9e8; opacity: .92; }
+.subtitle-surface { display: inline-flex; position: relative; font-size: clamp(20px, 4vw, 64px); }
+.subtitle-char-mask { display: inline-grid; position: relative; vertical-align: bottom; margin-right: calc(var(--subtitle-letter-spacing, .14) * 1em); }
+.subtitle-char-mask:last-child { margin-right: 0; }
+.subtitle-char-layer { grid-area: 1 / 1; white-space: pre; line-height: 1; }
+.subtitle-char-active { pointer-events: none; }
+.subtitle-surface i { display: none; }
+.subtitle-progress-dots { color: #fbbc04; font-size: 10px; letter-spacing: 5px; line-height: 1; margin-top: 7px; }

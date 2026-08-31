@@ -4,6 +4,7 @@ import {
   ArrowLeft,
   Check,
   Cog,
+  Download,
   FileText,
   FileVideo,
   GripVertical,
@@ -11,6 +12,8 @@ import {
   RotateCcw,
   Redo2,
   Save,
+  Square,
+  Trash2,
   Undo2,
   Upload,
   WandSparkles,
@@ -27,6 +30,9 @@ import type {
 import { api, formatTime, parseTime } from "./editor-types";
 import { LyricsImportDialog } from "./lyrics-import-dialog";
 import { TimelineCanvas } from "./timeline-canvas";
+import { SubtitleDomRenderer } from "./subtitle/dom-renderer";
+import { DEFAULT_SUBTITLE_STYLE, normalizeSubtitleStyle, type SubtitleStyle } from "./subtitle/style-schema";
+import { SubtitleStylePanel, type StylePreset } from "./subtitle/style-panel";
 import "./editor.css";
 
 function settingsHref() {
@@ -63,6 +69,62 @@ function updateUnit(
           end_ms: timed.length
             ? Math.max(...timed.map((unit) => unit.end_ms as number))
             : null,
+        };
+      }),
+    },
+  };
+}
+
+function updateLineTiming(
+  document: ProjectDocument,
+  lineId: string,
+  startMs: number,
+  endMs: number,
+): ProjectDocument {
+  return {
+    ...document,
+    lyrics: {
+      ...document.lyrics,
+      lines: document.lyrics.lines.map((line) =>
+        line.id === lineId
+          ? {
+              ...line,
+              start_ms: startMs,
+              end_ms: endMs,
+              timing_source: "manual",
+              timing_precision: "line",
+            }
+          : line,
+      ),
+    },
+  };
+}
+
+function updateRubyGroup(
+  document: ProjectDocument,
+  lineId: string,
+  selectedIds: string[],
+  ruby: string,
+  rubySpan: number,
+  clearIds: string[],
+): ProjectDocument {
+  const selected = new Set(selectedIds);
+  const cleared = new Set(clearIds);
+  const firstId = selectedIds[0];
+  return {
+    ...document,
+    lyrics: {
+      ...document.lyrics,
+      lines: document.lyrics.lines.map((line) => {
+        if (line.id !== lineId) return line;
+        return {
+          ...line,
+          units: line.units.map((unit) => {
+            if (unit.id === firstId) return { ...unit, ruby, ruby_span: rubySpan, ruby_source: "manual" };
+            if (selected.has(unit.id)) return { ...unit, ruby: null, ruby_span: undefined, ruby_source: "manual" };
+            if (cleared.has(unit.id)) return { ...unit, ruby: null, ruby_span: undefined, ruby_source: "none" };
+            return unit;
+          }),
         };
       }),
     },
@@ -282,6 +344,42 @@ function UnitInspector({
   );
 }
 
+function ExportDialog({
+  hasVideo,
+  hasInstrumental,
+  jobs,
+  onClose,
+  onStart,
+  onCancel,
+  onDelete,
+}: {
+  hasVideo: boolean;
+  hasInstrumental: boolean;
+  jobs: AnalysisJob[];
+  onClose: () => void;
+  onStart: (payload: { format: "mp4" | "webm"; audio_track: "on_vocal" | "off_vocal" }) => void;
+  onCancel: (jobId: string) => void;
+  onDelete: (jobId: string) => void;
+}) {
+  const [format, setFormat] = useState<"mp4" | "webm">("mp4");
+  const [audioTrack, setAudioTrack] = useState<"on_vocal" | "off_vocal">("on_vocal");
+  const exportJobs = jobs.filter((job) => job.type === "EXPORT");
+  const active = exportJobs.find((job) => ["QUEUED", "PREPARING", "RUNNING"].includes(job.status));
+  return <div className="scrim">
+    <section className="dialog export-dialog" role="dialog" aria-modal="true" aria-labelledby="export-title">
+      <div className="dialog-head"><div><h2 id="export-title">导出工程</h2><p className="muted">服务端使用 Kirakara 原生渲染器导出，结果可重复下载。</p></div><button className="icon-button" title="关闭" onClick={onClose}><X size={18} /></button></div>
+      <div className="export-form">
+        <label className="field-label">视频格式<select value={format} onChange={(event) => setFormat(event.target.value as typeof format)}><option value="mp4">MP4 · H.264</option><option value="webm">WebM · VP9</option></select></label>
+        <label className="field-label">音轨<select value={audioTrack} onChange={(event) => setAudioTrack(event.target.value as typeof audioTrack)}><option value="on_vocal">ON VOCAL · 原始音轨</option><option value="off_vocal" disabled={!hasInstrumental}>OFF VOCAL · KARA2 instrumental{hasInstrumental ? "" : "（需先完成人声分离）"}</option></select></label>
+        {!hasVideo && <p className="form-hint error-text">视频导出需要先上传视频。</p>}
+      </div>
+      <div className="dialog-actions"><button className="button text" onClick={onClose}>关闭</button><button className="button filled" disabled={Boolean(active) || !hasVideo || (audioTrack === "off_vocal" && !hasInstrumental)} onClick={() => onStart({ format, audio_track: audioTrack })}><Download size={17} />开始导出</button></div>
+      {active && <div className="export-active"><LoaderCircle className="spin" size={17} /><span>{active.message || "服务端导出中"} · {Math.round(active.progress * 100)}%</span><div className="analysis-progress export-progress"><i style={{ width: `${Math.max(2, active.progress * 100)}%` }} /></div><button className="icon-button compact" title="取消导出" onClick={() => onCancel(active.id)}><Square size={15} /></button></div>}
+      <div className="export-history"><h3>导出历史</h3>{exportJobs.filter((job) => job.status === "SUCCEEDED").length === 0 ? <p className="muted">暂无可下载文件</p> : exportJobs.filter((job) => job.status === "SUCCEEDED").map((job) => <div className="export-history-row" key={job.id}><span><strong>{String(job.result?.filename || "导出文件")}</strong><small>{String(job.request?.format || "mp4").toUpperCase()} · {job.request?.audio_track === "off_vocal" ? "OFF VOCAL" : "ON VOCAL"} · {new Date(job.created_at).toLocaleString()}</small></span><a className="icon-button" title="下载" href={`/api/projects/${job.project_id}/exports/${job.id}/download`}><Download size={17} /></a><button className="icon-button" title="删除导出记录" onClick={() => onDelete(job.id)}><Trash2 size={17} /></button></div>)}</div>
+    </section>
+  </div>;
+}
+
 export function EditorPage({ id }: { id: string }) {
   const [project, setProject] = useState<Project | null>(null);
   const [document, setDocument] = useState<ProjectDocument | null>(null);
@@ -301,16 +399,27 @@ export function EditorPage({ id }: { id: string }) {
     [editingId, setEditingId] = useState<string | null>(null);
   const [importOpen, setImportOpen] = useState(false),
     [isPlaying, setIsPlaying] = useState(false);
+  const [currentMs, setCurrentMs] = useState(0);
   const [uploading, setUploading] = useState(false),
     [uploadProgress, setUploadProgress] = useState(0);
   const [jobs, setJobs] = useState<AnalysisJob[]>([]),
     [analysisStarting, setAnalysisStarting] = useState(false);
   const [pronunciationRunning, setPronunciationRunning] = useState(false);
+  const [fullAnalysisOpen, setFullAnalysisOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [workflowNotice, setWorkflowNotice] = useState<string | null>(null);
+  const [fullSteps, setFullSteps] = useState<Record<string, boolean>>({ separation: true, transcription: true, pronunciation: true, global_alignment: true, alignment: true });
   const [lineMenu, setLineMenu] = useState<{ lineId: string; x: number; y: number } | null>(null);
   const uploadRequest = useRef<XMLHttpRequest | null>(null),
     videoRef = useRef<HTMLVideoElement>(null);
   const appliedJobs = useRef(new Set<string>());
   const appliedVocalWaveforms = useRef(new Set<string>());
+
+  const subtitleStyle = useMemo(() => normalizeSubtitleStyle((document?.styles || {}) as Record<string, unknown>), [document?.styles]);
+  const stylePresets = useMemo<StylePreset[]>(() => {
+    const stored = (document?.styles as { presets?: StylePreset[] } | undefined)?.presets || [];
+    return [{ id: "default", name: "Kirakara 默认", style: DEFAULT_SUBTITLE_STYLE }, ...stored];
+  }, [document?.styles]);
 
   useEffect(() => {
     void Promise.all([
@@ -532,6 +641,18 @@ export function EditorPage({ id }: { id: string }) {
     if (current)
       replaceDocument(updateUnit(current, lineId, unitId, patch), record);
   }
+  function updateSubtitleStyle(patch: Partial<SubtitleStyle>) {
+    const current = documentRef.current;
+    if (!current) return;
+    replaceDocument({ ...current, styles: { ...(current.styles || {}), ...patch } }, true);
+  }
+  function saveStylePreset(name: string) {
+    const current = documentRef.current;
+    if (!current) return;
+    const existing = ((current.styles as { presets?: StylePreset[] } | undefined)?.presets || []).filter((preset) => preset.name !== name);
+    const preset: StylePreset = { id: crypto.randomUUID(), name, style: { ...subtitleStyle } };
+    replaceDocument({ ...current, styles: { ...(current.styles || {}), presets: [...existing, preset] } }, true);
+  }
   function seek(ms: number) {
     const video = videoRef.current;
     if (!video) return;
@@ -583,7 +704,11 @@ export function EditorPage({ id }: { id: string }) {
 
   async function startTranscription(lineIds?: string[]) {
     if (!documentRef.current?.media.video_filename) {
-      setError("请先上传视频，再运行 Whisper 识别。");
+      setWorkflowNotice("请先上传视频，再运行 Whisper 人声粗识别。");
+      return;
+    }
+    if (documentRef.current.media.waveform_source !== "vocals") {
+      setWorkflowNotice("请先完成 KARA2 人声分离，再运行 Whisper 人声粗识别。");
       return;
     }
     setAnalysisStarting(true);
@@ -620,6 +745,38 @@ export function EditorPage({ id }: { id: string }) {
     setJobs((current) => [job, ...current]);
   }
 
+  async function cancelJob(jobId: string) {
+    try {
+      const canceled = await api<AnalysisJob>(`/jobs/${jobId}/cancel`, { method: "POST" });
+      setJobs((current) => current.map((job) => job.id === canceled.id ? canceled : job));
+    } catch {
+      setError("无法取消任务，请稍后重试。");
+    }
+  }
+
+  async function deleteExport(jobId: string) {
+    if (!window.confirm("删除这条导出记录及文件？")) return;
+    try {
+      await api(`/projects/${id}/exports/${jobId}`, { method: "DELETE" });
+      setJobs((current) => current.filter((job) => job.id !== jobId));
+    } catch (reason) {
+      const status = (reason as Error & { status?: number })?.status;
+      setError(status === 409 ? "导出仍在运行，完成或取消后才能删除。" : "无法删除导出记录。");
+    }
+  }
+
+  async function startExport(payload: { format: "mp4" | "webm"; audio_track: "on_vocal" | "off_vocal" }) {
+    setError(null);
+    try {
+      const revision = await saveNow();
+      const job = await api<AnalysisJob>(`/projects/${id}/export`, { method: "POST", body: JSON.stringify({ revision, ...payload }) });
+      setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]);
+    } catch (reason) {
+      const status = (reason as Error & { status?: number })?.status;
+      setError(status === 409 ? "工程版本已变化，请保存后重试。" : "无法启动服务端导出，请确认后端已启动并安装 Chrome。 ");
+    }
+  }
+
   async function runPronunciation(mode: "local" | "ai", lineIds?: string[]) {
     if (!documentRef.current?.lyrics.lines.length) return;
     setPronunciationRunning(true);
@@ -627,31 +784,100 @@ export function EditorPage({ id }: { id: string }) {
     try {
       const revision = await saveNow();
       const unitIds = selectedId && !lineIds?.length ? [selectedId] : [];
-      const result = await api<{ revision: number; document: ProjectDocument; summary?: { fallback_reason?: string } }>(
-        `/projects/${id}/pronunciation/${mode}`,
-        { method: "POST", body: JSON.stringify({ revision, line_ids: lineIds || [], unit_ids: unitIds, mode, overwrite_policy: "unlocked_only" }) },
-      );
-      const before = documentRef.current;
-      if (before) {
-        historyRef.current.past.push(before);
-        historyRef.current.past = historyRef.current.past.slice(-200);
-        historyRef.current.future = [];
-        setHistoryVersion((value) => value + 1);
-      }
-      documentRef.current = result.document;
-      setDocument(result.document);
-      if (projectRef.current) {
-        const next = { ...projectRef.current, revision: result.revision };
-        projectRef.current = next;
-        setProject(next);
-      }
-      markDirty(false);
-      if (result.summary?.fallback_reason) setError(`AI 不可用，已使用本地注音：${result.summary.fallback_reason}`);
+      const job = await api<AnalysisJob>(`/projects/${id}/pronunciation-job`, {
+        method: "POST",
+        body: JSON.stringify({ revision, line_ids: lineIds || [], unit_ids: unitIds, mode, overwrite_policy: "unlocked_only" }),
+      });
+      setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]);
     } catch (reason) {
       const status = (reason as Error & { status?: number })?.status;
       setError(status === 409 ? "工程版本已变化，请保存后重试。" : "注音失败，现有歌词和 Ruby 未被覆盖。 ");
     } finally {
       setPronunciationRunning(false);
+    }
+  }
+
+  async function startGlobalAlignment() {
+    if (!documentRef.current?.media.video_filename) {
+      setWorkflowNotice("请先上传视频，再进行 stable-ts 全局对齐。");
+      return;
+    }
+    const analysisDocument = documentRef.current as ProjectDocument & { analysis?: Record<string, { status?: string }>; pronunciation?: { last_run?: { mode?: string } } };
+    const analysis = analysisDocument.analysis || {};
+    const pronunciationDone = analysis.pronunciation?.status === "completed" || ["local", "ai", "local_fallback"].includes(String(analysisDocument.pronunciation?.last_run?.mode || ""));
+    if (documentRef.current.media.waveform_source !== "vocals") {
+      setWorkflowNotice("请先完成 KARA2 人声分离，再进行 stable-ts 全局对齐。");
+      return;
+    }
+    if (analysis.transcription?.status !== "completed") {
+      setWorkflowNotice("请先完成 Whisper 人声粗识别，再进行 stable-ts 全局对齐。");
+      return;
+    }
+    if (!pronunciationDone) {
+      setWorkflowNotice("请先完成 AI 注音或本地注音，再进行 stable-ts 全局对齐。");
+      return;
+    }
+    setAnalysisStarting(true);
+    setError(null);
+    try {
+      const revision = await saveNow();
+      const job = await api<AnalysisJob>(`/projects/${id}/align-global`, {
+        method: "POST",
+        body: JSON.stringify({ revision, line_ids: [], overwrite_policy: "unlocked_only" }),
+      });
+      setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]);
+    } catch (reason) {
+      const status = (reason as Error & { status?: number })?.status;
+      setError(status === 409 ? "工程版本已变化，请保存后重试。" : "无法启动 stable-ts 全局对齐，请先完成 Whisper 粗识别和注音。 ");
+    } finally {
+      setAnalysisStarting(false);
+    }
+  }
+
+  async function startAlignment(lineIds?: string[]) {
+    if (!documentRef.current?.media.video_filename) {
+      setWorkflowNotice("请先上传视频，再进行 stable-ts 词/短语精修。");
+      return;
+    }
+    const analysis = (documentRef.current as ProjectDocument & { analysis?: Record<string, { status?: string }> }).analysis || {};
+    if (analysis.global_alignment?.status !== "completed") {
+      setWorkflowNotice("请先完成 stable-ts 全局对齐，再运行词/短语精修。");
+      return;
+    }
+    setAnalysisStarting(true);
+    setError(null);
+    try {
+      const revision = await saveNow();
+      const job = await api<AnalysisJob>(`/projects/${id}/align`, {
+        method: "POST",
+        body: JSON.stringify({ revision, line_ids: lineIds || [], overwrite_policy: "unlocked_only" }),
+      });
+      setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]);
+    } catch (reason) {
+      const status = (reason as Error & { status?: number })?.status;
+      setError(status === 409 ? "工程版本已变化，请保存后重试。" : "无法启动 stable-ts 词/短语精修，请先完成全局对齐。 ");
+    } finally {
+      setAnalysisStarting(false);
+    }
+  }
+
+  async function startFullAnalysis() {
+    setFullAnalysisOpen(false);
+    setAnalysisStarting(true);
+    setError(null);
+    try {
+      const revision = await saveNow();
+      const steps = ["separation", "transcription", "pronunciation", "global_alignment", "alignment"].filter((key) => fullSteps[key]);
+      const job = await api<AnalysisJob>(`/projects/${id}/analysis`, {
+        method: "POST",
+        body: JSON.stringify({ revision, steps, line_ids: [], unit_ids: [], overwrite_policy: "unlocked_only", preserve_line_anchors: documentRef.current?.lyrics.source_type === "lrc" }),
+      });
+      setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]);
+    } catch (reason) {
+      const status = (reason as Error & { status?: number })?.status;
+      setError(status === 409 ? "工程版本已变化，请保存后重试。" : (reason as Error)?.message?.includes("不能跳过") || (reason as Error)?.message?.includes("前置") ? "不能跳过未完成的流程，请保留所有未完成步骤。" : "无法启动全曲分析，请检查素材和前置流程。 ");
+    } finally {
+      setAnalysisStarting(false);
     }
   }
 
@@ -805,13 +1031,24 @@ export function EditorPage({ id }: { id: string }) {
             <button className="button tonal" disabled={!lines.length || pronunciationRunning} onClick={() => void runPronunciation("ai")} title="使用当前 AI profile 生成读音，失败时按设置降级">
               <WandSparkles size={17} />AI 注音
             </button>
+            <button className="button tonal" disabled={!hasVideo || !lines.length || Boolean(activeJob) || analysisStarting} onClick={() => void startTranscription()} title="仅运行 Whisper 人声粗识别">
+              <AudioLines size={17} />粗识别
+            </button>
+            <button className="button tonal" disabled={!hasVideo || !lines.length || Boolean(activeJob) || analysisStarting} onClick={() => void startGlobalAlignment()} title="使用 AI 注音完整歌词生成行级时间">
+              <AudioLines size={17} />全局对齐
+            </button>
+            <button className="button tonal" disabled={!hasVideo || !lines.length || Boolean(activeJob) || analysisStarting} onClick={() => void startAlignment()} title="在全局对齐行范围内生成词/短语时间">
+              <AudioLines size={17} />词/短语精修
+            </button>
             <button
               className="button tonal"
               disabled={!hasVideo || !lines.length || Boolean(activeJob) || analysisStarting}
-              onClick={() => void startTranscription()}
+              onClick={() => { setFullSteps({ separation: true, transcription: true, pronunciation: true, global_alignment: true, alignment: true }); setFullAnalysisOpen(true); }}
             >
-              {analysisStarting || activeJob ? <LoaderCircle className="spin" size={17} /> : <WandSparkles size={17} />}
-              {activeJob ? "分析中" : "全曲分析"}
+              <WandSparkles size={17} />全曲分析
+            </button>
+            <button className="button filled" disabled={!lines.length || Boolean(activeJob) || analysisStarting} onClick={() => setExportOpen(true)} title="导出 Kirakara 完整效果">
+              <Download size={17} />导出
             </button>
             <label className={`button tonal ${uploading ? "disabled" : ""}`}>
               <Upload size={17} />
@@ -841,18 +1078,24 @@ export function EditorPage({ id }: { id: string }) {
               {activeJob ? <LoaderCircle className="spin" size={18} /> : visibleJob.status === "FAILED" ? <AlertCircle size={18} /> : <AudioLines size={18} />}
             </span>
             <div className="analysis-copy">
-              <strong>{visibleJob.type === "VOCAL_SEPARATION" ? "KARA2 双 stem" : "KARA2 + Whisper 对齐"}</strong>
+              <strong>{visibleJob.type === "EXPORT" ? "Kirakara 服务端导出" : visibleJob.type === "VOCAL_SEPARATION" ? "KARA2 双 stem" : "KARA2 + Whisper 对齐"}</strong>
               <span>{visibleJob.error_message || visibleJob.message || visibleJob.stage}</span>
             </div>
-            <div className="analysis-progress" aria-label={`进度 ${Math.round(visibleJob.progress * 100)}%`}>
-              <i style={{ width: `${Math.max(2, visibleJob.progress * 100)}%` }} />
+            <div className="analysis-steps">
+              {(visibleJob.steps?.length ? visibleJob.steps : [{ key: visibleJob.stage, label: visibleJob.type, status: activeJob ? "running" : "completed", progress: visibleJob.progress }]).map((step) => (
+                <div className="analysis-step" key={step.key}>
+                  <span>{step.label}</span>
+                  <div className="analysis-progress" aria-label={`${step.label} ${Math.round(step.progress * 100)}%`}><i style={{ width: `${Math.max(step.progress ? 2 : 0, step.progress * 100)}%` }} /></div>
+                  <b>{Math.round(step.progress * 100)}%</b>
+                </div>
+              ))}
             </div>
-            <b>{Math.round(visibleJob.progress * 100)}%</b>
             {visibleJob.status === "FAILED" && (
               <button className="icon-button compact" title="重试任务" onClick={() => void retryJob(visibleJob.id)}>
                 <RotateCcw size={16} />
               </button>
             )}
+            {activeJob && <button className="icon-button compact" title="取消任务" onClick={() => void cancelJob(activeJob.id)}><Square size={16} /></button>}
           </section>
         )}
         <div className="workspace-main">
@@ -873,6 +1116,7 @@ export function EditorPage({ id }: { id: string }) {
                 onPlay={() => setIsPlaying(true)}
                 onPause={() => setIsPlaying(false)}
                 onEnded={() => setIsPlaying(false)}
+                onTimeUpdate={(event) => setCurrentMs(event.currentTarget.currentTime * 1000)}
               />
             ) : (
               <div className="drop-placeholder">
@@ -893,6 +1137,7 @@ export function EditorPage({ id }: { id: string }) {
                 </label>
               </div>
             )}
+            {hasVideo && <SubtitleDomRenderer lines={lines} currentMs={currentMs} style={subtitleStyle} mediaRef={videoRef} isPlaying={isPlaying} />}
             {uploading && (
               <div className="media-progress">
                 <LoaderCircle className="spin" size={17} />
@@ -915,6 +1160,70 @@ export function EditorPage({ id }: { id: string }) {
             )}
           </section>
           <aside className="lyrics-panel">
+            <section className="project-fields">
+              <div className="section-title">
+                <h3>工程信息</h3>
+              </div>
+              <label className="field-label">
+                项目名称
+                <input
+                  value={document.project.name}
+                  onFocus={beginEdit}
+                  onChange={(event) =>
+                    replaceDocument(
+                      {
+                        ...documentRef.current!,
+                        project: {
+                          ...documentRef.current!.project,
+                          name: event.target.value,
+                        },
+                      },
+                      false,
+                    )
+                  }
+                />
+              </label>
+              <div className="field-row">
+                <label className="field-label">
+                  歌曲名
+                  <input
+                    value={document.project.title}
+                    onFocus={beginEdit}
+                    onChange={(event) =>
+                      replaceDocument(
+                        {
+                          ...documentRef.current!,
+                          project: {
+                            ...documentRef.current!.project,
+                            title: event.target.value,
+                          },
+                        },
+                        false,
+                      )
+                    }
+                  />
+                </label>
+                <label className="field-label">
+                  歌手
+                  <input
+                    value={document.project.artist}
+                    onFocus={beginEdit}
+                    onChange={(event) =>
+                      replaceDocument(
+                        {
+                          ...documentRef.current!,
+                          project: {
+                            ...documentRef.current!.project,
+                            artist: event.target.value,
+                          },
+                        },
+                        false,
+                      )
+                    }
+                  />
+                </label>
+              </div>
+            </section>
             <div className="lyrics-head">
               <div>
                 <h2>歌词</h2>
@@ -993,70 +1302,7 @@ export function EditorPage({ id }: { id: string }) {
                 }
               />
             )}
-            <section className="project-fields">
-              <div className="section-title">
-                <h3>工程信息</h3>
-              </div>
-              <label className="field-label">
-                项目名称
-                <input
-                  value={document.project.name}
-                  onFocus={beginEdit}
-                  onChange={(event) =>
-                    replaceDocument(
-                      {
-                        ...documentRef.current!,
-                        project: {
-                          ...documentRef.current!.project,
-                          name: event.target.value,
-                        },
-                      },
-                      false,
-                    )
-                  }
-                />
-              </label>
-              <div className="field-row">
-                <label className="field-label">
-                  歌曲名
-                  <input
-                    value={document.project.title}
-                    onFocus={beginEdit}
-                    onChange={(event) =>
-                      replaceDocument(
-                        {
-                          ...documentRef.current!,
-                          project: {
-                            ...documentRef.current!.project,
-                            title: event.target.value,
-                          },
-                        },
-                        false,
-                      )
-                    }
-                  />
-                </label>
-                <label className="field-label">
-                  歌手
-                  <input
-                    value={document.project.artist}
-                    onFocus={beginEdit}
-                    onChange={(event) =>
-                      replaceDocument(
-                        {
-                          ...documentRef.current!,
-                          project: {
-                            ...documentRef.current!.project,
-                            artist: event.target.value,
-                          },
-                        },
-                        false,
-                      )
-                    }
-                  />
-                </label>
-              </div>
-            </section>
+            <SubtitleStylePanel style={subtitleStyle} presets={stylePresets} onChange={updateSubtitleStyle} onApplyPreset={(preset) => updateSubtitleStyle(preset.style)} onSavePreset={saveStylePreset} />
           </aside>
         </div>
         <TimelineCanvas
@@ -1076,6 +1322,14 @@ export function EditorPage({ id }: { id: string }) {
           onUpdateUnit={(lineId, unitId, patch) =>
             updateSelected(lineId, unitId, patch)
           }
+          onUpdateLine={(lineId, startMs, endMs) => {
+            const current = documentRef.current;
+            if (current) replaceDocument(updateLineTiming(current, lineId, startMs, endMs), false);
+          }}
+          onUpdateRubyGroup={(lineId, unitIds, ruby, rubySpan, clearUnitIds) => {
+            const current = documentRef.current;
+            if (current) replaceDocument(updateRubyGroup(current, lineId, unitIds, ruby, rubySpan, clearUnitIds), true);
+          }}
           onOpenEditor={setEditingId}
           onDropLine={placeLine}
         />
@@ -1107,12 +1361,44 @@ export function EditorPage({ id }: { id: string }) {
         const index = lines.findIndex((line) => line.id === lineMenu.lineId);
         const remaining = lines.slice(index).map((line) => line.id);
         return <div className="line-context-menu" style={{ left: lineMenu.x, top: lineMenu.y }} onPointerDown={(event) => event.stopPropagation()}>
-          <strong>Whisper 重新识别</strong>
+          <strong>分析范围</strong>
           <button onClick={() => { setLineMenu(null); void startTranscription([lineMenu.lineId]); }}>当前行</button>
           <button onClick={() => { setLineMenu(null); void startTranscription(remaining); }}>从此处到结尾</button>
           <button onClick={() => { setLineMenu(null); void startTranscription(); }}>全曲</button>
+          <button onClick={() => { setLineMenu(null); void startAlignment([lineMenu.lineId]); }}>词/短语精修当前行</button>
         </div>;
       })()}
+      {fullAnalysisOpen && (
+        <div className="scrim">
+          <section className="dialog full-analysis-dialog" role="dialog" aria-modal="true" aria-labelledby="full-analysis-title">
+            <div className="dialog-head"><div><h2 id="full-analysis-title">确认全曲分析</h2><p className="muted">将按勾选顺序执行；跳过未完成流程会被后端拒绝。</p></div><button className="icon-button" title="关闭" onClick={() => setFullAnalysisOpen(false)}><X size={18} /></button></div>
+            <div className="pipeline-preview">
+              {([
+                ["separation", "KARA2 分离人声", "提取音频并生成 vocals / instrumental"],
+                ["transcription", "Whisper 人声粗识别", "保存有序 segment 文本和粗时间"],
+                ["pronunciation", "AI 注音", "完整歌词 JSON + Whisper segment JSON"],
+                ["global_alignment", "stable-ts 全局对齐", "只写入可单独观察的行级时间"],
+                ["alignment", "stable-ts 词/短语精修", "在全局对齐行范围内写入 unit 时间"],
+              ] as const).map(([key, label, description]) => {
+                const analysis = (document as ProjectDocument & { analysis?: Record<string, { status?: string }> }).analysis || {};
+                const complete = key === "separation" ? document.media.waveform_source === "vocals" : key === "transcription" ? analysis.transcription?.status === "completed" : key === "pronunciation" ? Boolean(analysis.pronunciation?.status === "completed" || document.lyrics.lines.every((line) => line.units.every((unit) => !unit.surface.match(/[一-龯]/) || unit.ruby))) : key === "global_alignment" ? analysis.global_alignment?.status === "completed" : analysis.alignment?.status === "completed";
+                return <label className="pipeline-step" key={key}><input type="checkbox" checked={Boolean(fullSteps[key])} onChange={(event) => setFullSteps((current) => ({ ...current, [key]: event.target.checked }))} /><span><strong>{label}</strong><small>{complete ? "已完成，可跳过" : description}</small></span><em className={complete ? "complete" : "pending"}>{complete ? "已完成" : "待执行"}</em></label>;
+              })}
+            </div>
+            <div className="dialog-actions"><button className="button text" onClick={() => setFullAnalysisOpen(false)}>取消</button><button className="button filled" disabled={!Object.values(fullSteps).some(Boolean)} onClick={() => void startFullAnalysis()}><WandSparkles size={17} />开始分析</button></div>
+          </section>
+        </div>
+      )}
+      {exportOpen && <ExportDialog hasVideo={hasVideo} hasInstrumental={String(document.media.waveform_source || "") === "vocals"} jobs={jobs} onClose={() => setExportOpen(false)} onStart={(payload) => void startExport(payload)} onCancel={(jobId) => void cancelJob(jobId)} onDelete={(jobId) => void deleteExport(jobId)} />}
+      {workflowNotice && (
+        <div className="scrim">
+          <section className="dialog workflow-notice" role="alertdialog" aria-modal="true" aria-labelledby="workflow-notice-title">
+            <div className="dialog-head"><h2 id="workflow-notice-title">暂时无法开始</h2><button className="icon-button" title="关闭" onClick={() => setWorkflowNotice(null)}><X size={18} /></button></div>
+            <p className="workflow-notice-copy">{workflowNotice}</p>
+            <div className="dialog-actions"><button className="button filled" onClick={() => setWorkflowNotice(null)}>知道了</button></div>
+          </section>
+        </div>
+      )}
     </>
   );
 }
