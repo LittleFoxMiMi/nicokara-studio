@@ -408,6 +408,8 @@ export function EditorPage({ id }: { id: string }) {
   const [fullAnalysisOpen, setFullAnalysisOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [workflowNotice, setWorkflowNotice] = useState<string | null>(null);
+  const [alignmentBackend, setAlignmentBackend] = useState<"fa_kara" | "stable_ts">("fa_kara");
+  const [faKaraModel, setFaKaraModel] = useState<"mms" | "yohane">("mms");
   const [fullSteps, setFullSteps] = useState<Record<string, boolean>>({ separation: true, transcription: true, pronunciation: true, global_alignment: true, alignment: true });
   const [lineMenu, setLineMenu] = useState<{ lineId: string; x: number; y: number } | null>(null);
   const uploadRequest = useRef<XMLHttpRequest | null>(null),
@@ -427,12 +429,15 @@ export function EditorPage({ id }: { id: string }) {
       api<{ revision: number; document: ProjectDocument }>(
         `/projects/${id}/document`,
       ),
+      api<Record<string, unknown>>("/settings"),
     ])
-      .then(([loadedProject, loaded]) => {
+      .then(([loadedProject, loaded, settings]) => {
         projectRef.current = loadedProject;
         documentRef.current = loaded.document;
         setProject(loadedProject);
         setDocument(loaded.document);
+        setAlignmentBackend(settings.alignment_backend === "stable_ts" ? "stable_ts" : "fa_kara");
+        setFaKaraModel(settings.fa_kara_model === "yohane" ? "yohane" : "mms");
       })
       .catch(() => setError("无法打开工程，请确认后端服务已启动。"));
   }, [id]);
@@ -804,7 +809,9 @@ export function EditorPage({ id }: { id: string }) {
     }
     const analysisDocument = documentRef.current as ProjectDocument & { analysis?: Record<string, { status?: string }>; pronunciation?: { last_run?: { mode?: string } } };
     const analysis = analysisDocument.analysis || {};
-    const pronunciationDone = analysis.pronunciation?.status === "completed" || ["local", "ai", "local_fallback"].includes(String(analysisDocument.pronunciation?.last_run?.mode || ""));
+    const pronunciationDone = analysis.pronunciation?.status === "completed"
+      || ["local", "ai", "local_fallback"].includes(String(analysisDocument.pronunciation?.last_run?.mode || ""))
+      || analysisDocument.lyrics.lines.every((line) => line.units.every((unit) => !unit.surface.match(/[一-龯]/) || unit.ruby));
     if (documentRef.current.media.waveform_source !== "vocals") {
       setWorkflowNotice("请先完成 KARA2 人声分离，再进行 stable-ts 全局对齐。");
       return;
@@ -861,16 +868,58 @@ export function EditorPage({ id }: { id: string }) {
     }
   }
 
+  async function startFaKara(lineIds?: string[]) {
+    if (!documentRef.current?.media.video_filename) {
+      setWorkflowNotice("请先上传视频，再进行 FA-Kara 对齐。");
+      return;
+    }
+    if (documentRef.current.media.waveform_source !== "vocals") {
+      setWorkflowNotice("请先完成 KARA2 人声分离，再进行 FA-Kara 对齐。");
+      return;
+    }
+    const analysisDocument = documentRef.current as ProjectDocument & { analysis?: Record<string, { status?: string }>; pronunciation?: { last_run?: { mode?: string } } };
+    const analysis = analysisDocument.analysis || {};
+    if (analysis.transcription?.status !== "completed") {
+      setWorkflowNotice("请先完成 Whisper 人声粗识别，再进行 FA-Kara 对齐。");
+      return;
+    }
+    const pronunciationDone = analysis.pronunciation?.status === "completed"
+      || ["local", "ai", "local_fallback"].includes(String(analysisDocument.pronunciation?.last_run?.mode || ""))
+      || analysisDocument.lyrics.lines.every((line) => line.units.every((unit) => !unit.surface.match(/[一-龯]/) || unit.ruby));
+    if (!pronunciationDone) {
+      setWorkflowNotice("请先完成 AI 注音或本地注音，再进行 FA-Kara 对齐。");
+      return;
+    }
+    setAnalysisStarting(true);
+    setError(null);
+    try {
+      const revision = await saveNow();
+      const job = await api<AnalysisJob>(`/projects/${id}/fa-kara`, {
+        method: "POST",
+        body: JSON.stringify({ revision, line_ids: lineIds || [], overwrite_policy: "unlocked_only", model: faKaraModel }),
+      });
+      setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]);
+    } catch (reason) {
+      const status = (reason as Error & { status?: number })?.status;
+      setError(status === 409 ? "工程版本已变化，请保存后重试。" : "无法启动 FA-Kara 对齐，请先完成粗识别和 AI 注音。 ");
+    } finally {
+      setAnalysisStarting(false);
+    }
+  }
+
   async function startFullAnalysis() {
     setFullAnalysisOpen(false);
     setAnalysisStarting(true);
     setError(null);
     try {
       const revision = await saveNow();
-      const steps = ["separation", "transcription", "pronunciation", "global_alignment", "alignment"].filter((key) => fullSteps[key]);
+      const stepOrder = alignmentBackend === "fa_kara"
+        ? ["separation", "transcription", "pronunciation", "fa_kara"]
+        : ["separation", "transcription", "pronunciation", "global_alignment", "alignment"];
+      const steps = stepOrder.filter((key) => fullSteps[key]);
       const job = await api<AnalysisJob>(`/projects/${id}/analysis`, {
         method: "POST",
-        body: JSON.stringify({ revision, steps, line_ids: [], unit_ids: [], overwrite_policy: "unlocked_only", preserve_line_anchors: documentRef.current?.lyrics.source_type === "lrc" }),
+        body: JSON.stringify({ revision, steps, alignment_backend: alignmentBackend, fa_kara_model: faKaraModel, line_ids: [], unit_ids: [], overwrite_policy: "unlocked_only", preserve_line_anchors: documentRef.current?.lyrics.source_type === "lrc" }),
       });
       setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]);
     } catch (reason) {
@@ -1034,16 +1083,20 @@ export function EditorPage({ id }: { id: string }) {
             <button className="button tonal" disabled={!hasVideo || !lines.length || Boolean(activeJob) || analysisStarting} onClick={() => void startTranscription()} title="仅运行 Whisper 人声粗识别">
               <AudioLines size={17} />粗识别
             </button>
-            <button className="button tonal" disabled={!hasVideo || !lines.length || Boolean(activeJob) || analysisStarting} onClick={() => void startGlobalAlignment()} title="使用 AI 注音完整歌词生成行级时间">
-              <AudioLines size={17} />全局对齐
-            </button>
-            <button className="button tonal" disabled={!hasVideo || !lines.length || Boolean(activeJob) || analysisStarting} onClick={() => void startAlignment()} title="在全局对齐行范围内生成词/短语时间">
-              <AudioLines size={17} />词/短语精修
-            </button>
+            {alignmentBackend === "stable_ts" ? <>
+              <button className="button tonal" disabled={!hasVideo || !lines.length || Boolean(activeJob) || analysisStarting} onClick={() => void startGlobalAlignment()} title="使用 AI 注音完整歌词生成行级时间">
+                <AudioLines size={17} />全局对齐
+              </button>
+              <button className="button tonal" disabled={!hasVideo || !lines.length || Boolean(activeJob) || analysisStarting} onClick={() => void startAlignment()} title="在全局对齐行范围内生成词/短语时间">
+                <AudioLines size={17} />词/短语精修
+              </button>
+            </> : <button className="button tonal" disabled={!hasVideo || !lines.length || Boolean(activeJob) || analysisStarting} onClick={() => void startFaKara()} title={`使用 FA-Kara ${faKaraModel === "yohane" ? "YoHane 微调模型" : "MMS_FA 基座模型"}对齐`}>
+              <AudioLines size={17} />FA-Kara 对齐
+            </button>}
             <button
               className="button tonal"
               disabled={!hasVideo || !lines.length || Boolean(activeJob) || analysisStarting}
-              onClick={() => { setFullSteps({ separation: true, transcription: true, pronunciation: true, global_alignment: true, alignment: true }); setFullAnalysisOpen(true); }}
+              onClick={() => { setFullSteps(alignmentBackend === "fa_kara" ? { separation: true, transcription: true, pronunciation: true, fa_kara: true } : { separation: true, transcription: true, pronunciation: true, global_alignment: true, alignment: true }); setFullAnalysisOpen(true); }}
             >
               <WandSparkles size={17} />全曲分析
             </button>
@@ -1078,7 +1131,7 @@ export function EditorPage({ id }: { id: string }) {
               {activeJob ? <LoaderCircle className="spin" size={18} /> : visibleJob.status === "FAILED" ? <AlertCircle size={18} /> : <AudioLines size={18} />}
             </span>
             <div className="analysis-copy">
-              <strong>{visibleJob.type === "EXPORT" ? "Kirakara 服务端导出" : visibleJob.type === "VOCAL_SEPARATION" ? "KARA2 双 stem" : "KARA2 + Whisper 对齐"}</strong>
+              <strong>{visibleJob.type === "EXPORT" ? "Kirakara 服务端导出" : visibleJob.type === "VOCAL_SEPARATION" ? "KARA2 双 stem" : visibleJob.type === "FA_KARA_ALIGNMENT" ? "FA-Kara 对齐" : visibleJob.type === "FULL_ANALYSIS" && visibleJob.request?.alignment_backend === "fa_kara" ? "KARA2 + Whisper + FA-Kara" : "KARA2 + Whisper 对齐"}</strong>
               <span>{visibleJob.error_message || visibleJob.message || visibleJob.stage}</span>
             </div>
             <div className="analysis-steps">
@@ -1365,7 +1418,9 @@ export function EditorPage({ id }: { id: string }) {
           <button onClick={() => { setLineMenu(null); void startTranscription([lineMenu.lineId]); }}>当前行</button>
           <button onClick={() => { setLineMenu(null); void startTranscription(remaining); }}>从此处到结尾</button>
           <button onClick={() => { setLineMenu(null); void startTranscription(); }}>全曲</button>
-          <button onClick={() => { setLineMenu(null); void startAlignment([lineMenu.lineId]); }}>词/短语精修当前行</button>
+          {alignmentBackend === "fa_kara"
+            ? <button onClick={() => { setLineMenu(null); void startFaKara([lineMenu.lineId]); }}>FA-Kara 对齐当前行</button>
+            : <button onClick={() => { setLineMenu(null); void startAlignment([lineMenu.lineId]); }}>词/短语精修当前行</button>}
         </div>;
       })()}
       {fullAnalysisOpen && (
@@ -1373,15 +1428,20 @@ export function EditorPage({ id }: { id: string }) {
           <section className="dialog full-analysis-dialog" role="dialog" aria-modal="true" aria-labelledby="full-analysis-title">
             <div className="dialog-head"><div><h2 id="full-analysis-title">确认全曲分析</h2><p className="muted">将按勾选顺序执行；跳过未完成流程会被后端拒绝。</p></div><button className="icon-button" title="关闭" onClick={() => setFullAnalysisOpen(false)}><X size={18} /></button></div>
             <div className="pipeline-preview">
-              {([
+              {(alignmentBackend === "fa_kara" ? [
                 ["separation", "KARA2 分离人声", "提取音频并生成 vocals / instrumental"],
-                ["transcription", "Whisper 人声粗识别", "保存有序 segment 文本和粗时间"],
-                ["pronunciation", "AI 注音", "完整歌词 JSON + Whisper segment JSON"],
+                ["transcription", "Whisper 人声粗识别", "保存实际演唱的 segment 文本和粗时间"],
+                ["pronunciation", "AI 注音", "结合完整歌词与 Whisper segment 生成 Ruby"],
+                ["fa_kara", `FA-Kara 对齐 · ${faKaraModel === "yohane" ? "YoHane" : "MMS_FA"}`, "一次生成行级与词/短语时间"],
+              ] : [
+                ["separation", "KARA2 分离人声", "提取音频并生成 vocals / instrumental"],
+                ["transcription", "Whisper 人声粗识别", "保存实际演唱的 segment 文本和粗时间"],
+                ["pronunciation", "AI 注音", "结合完整歌词与 Whisper segment 生成 Ruby"],
                 ["global_alignment", "stable-ts 全局对齐", "只写入可单独观察的行级时间"],
                 ["alignment", "stable-ts 词/短语精修", "在全局对齐行范围内写入 unit 时间"],
-              ] as const).map(([key, label, description]) => {
+              ]).map(([key, label, description]) => {
                 const analysis = (document as ProjectDocument & { analysis?: Record<string, { status?: string }> }).analysis || {};
-                const complete = key === "separation" ? document.media.waveform_source === "vocals" : key === "transcription" ? analysis.transcription?.status === "completed" : key === "pronunciation" ? Boolean(analysis.pronunciation?.status === "completed" || document.lyrics.lines.every((line) => line.units.every((unit) => !unit.surface.match(/[一-龯]/) || unit.ruby))) : key === "global_alignment" ? analysis.global_alignment?.status === "completed" : analysis.alignment?.status === "completed";
+                const complete = key === "separation" ? document.media.waveform_source === "vocals" : key === "transcription" ? analysis.transcription?.status === "completed" : key === "pronunciation" ? Boolean(analysis.pronunciation?.status === "completed" || document.lyrics.lines.every((line) => line.units.every((unit) => !unit.surface.match(/[一-龯]/) || unit.ruby))) : key === "global_alignment" ? analysis.global_alignment?.status === "completed" : key === "alignment" ? analysis.alignment?.status === "completed" : analysis.fa_kara?.status === "completed";
                 return <label className="pipeline-step" key={key}><input type="checkbox" checked={Boolean(fullSteps[key])} onChange={(event) => setFullSteps((current) => ({ ...current, [key]: event.target.checked }))} /><span><strong>{label}</strong><small>{complete ? "已完成，可跳过" : description}</small></span><em className={complete ? "complete" : "pending"}>{complete ? "已完成" : "待执行"}</em></label>;
               })}
             </div>

@@ -92,6 +92,10 @@ class Database:
             c.execute("INSERT INTO projects(id,name,created_at,updated_at) VALUES(?,?,?,?)", (project_id,name,t,t))
             c.execute("INSERT INTO project_revisions VALUES(?,?,?,?)", (project_id,1,json.dumps(document,ensure_ascii=False),t))
         return self.get_project(project_id)  # type: ignore[return-value]
+
+    def clone_project_record(self, project_id: str, name: str, document: dict) -> dict:
+        """Create the database half of a project copy without copying jobs."""
+        return self.create_project(project_id, name, document)
     def get_project(self, project_id: str, include_deleted: bool=False) -> dict|None:
         with self.connect() as c:
             row=c.execute("SELECT * FROM projects WHERE id=?" + ("" if include_deleted else " AND deleted_at IS NULL"),(project_id,)).fetchone()
@@ -145,6 +149,7 @@ class Database:
             "PRONUNCIATION": ["pronunciation"],
             "STABLE_GLOBAL_ALIGNMENT": ["global_alignment"],
             "STABLE_ALIGNMENT": ["alignment"],
+            "FA_KARA_ALIGNMENT": ["fa_kara"],
             "EXPORT": ["export"],
         }.get(job_type, [])
         if isinstance(steps, list):

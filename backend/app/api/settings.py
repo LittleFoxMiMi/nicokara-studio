@@ -10,10 +10,20 @@ from app.services.secrets import SecretStore
 router = APIRouter(prefix="/settings", tags=["settings"])
 @router.get("")
 def get_settings(request: Request):
-    return request.app.state.database.settings()
+    return {
+        "alignment_backend": "fa_kara",
+        "fa_kara_model": "mms",
+        **request.app.state.database.settings(),
+    }
 @router.put("")
 def save_settings(payload: SettingsPayload, request: Request):
     values = payload.values
+    alignment_backend = values.get("alignment_backend")
+    fa_kara_model = values.get("fa_kara_model")
+    if alignment_backend not in {None, "fa_kara", "stable_ts"}:
+        raise HTTPException(422, "对齐后端必须是 FA-Kara 或 stable-ts")
+    if fa_kara_model not in {None, "mms", "yohane"}:
+        raise HTTPException(422, "FA-Kara 模型必须是 MMS_FA 或 YoHane")
     token_step = values.get("stable_ts_token_step")
     segment_padding = values.get("stable_ts_segment_padding_seconds")
     if token_step is not None and (

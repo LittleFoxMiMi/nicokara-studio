@@ -21,3 +21,14 @@ The server-side full-effect export loads the corresponding upstream modules from
 `frontend/public/kirakara/`. Nicokara adds only a small callback hook in
 `js/exporter.js` so the backend worker can receive the generated Blob instead of
 triggering a browser download; rendering and encoding logic remains upstream.
+
+## FA-Kara and YoHane model
+
+Nicokara's optional FA-Kara alignment backend is adapted from the MIT-licensed
+`FA-Kara-main/` reference implementation. It uses existing project Ruby data and
+does not include the reference project's pronunciation dictionaries or fallback
+logic.
+
+The optional `NextFire/mms-300m-ForcedAligner-karaoke-ja-Latn` YoHane model is
+not bundled with Nicokara. When selected, it is downloaded on demand from
+Hugging Face and remains subject to its `CC BY-NC-SA 4.0` license.

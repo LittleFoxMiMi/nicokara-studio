@@ -361,7 +361,7 @@ def test_full_analysis_rejects_skipping_incomplete_steps(tmp_path, monkeypatch) 
         imported = client.post(f"/api/projects/{project['id']}/lyrics/import", json={"revision": 2, "format": "text", "content": "春風"}).json()
         calls = []
         client.app.state.analysis_runner = SimpleNamespace(enqueue=lambda *args: calls.append(args) or {"id": "full-job", "status": "QUEUED"})
-        rejected = client.post(f"/api/projects/{project['id']}/analysis", json={"revision": imported["revision"], "steps": ["alignment"]})
+        rejected = client.post(f"/api/projects/{project['id']}/analysis", json={"revision": imported["revision"], "alignment_backend": "stable_ts", "steps": ["alignment"]})
         assert rejected.status_code == 422
         assert "不能跳过未完成" in rejected.text
         assert calls == []

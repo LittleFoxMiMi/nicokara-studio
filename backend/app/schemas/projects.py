@@ -26,11 +26,19 @@ class AnalysisRequest(BaseModel):
     device: Literal["auto", "cpu"] | None = None
     compute_type: str | None = None
 
+class FAKaraRequest(BaseModel):
+    revision: int = Field(ge=1)
+    line_ids: list[str] = Field(default_factory=list, max_length=5000)
+    overwrite_policy: Literal["unlocked_only", "all"] = "unlocked_only"
+    model: Literal["mms", "yohane"] | None = None
+
 class FullAnalysisRequest(AnalysisRequest):
-    steps: list[Literal["separation", "transcription", "pronunciation", "global_alignment", "alignment"]] = Field(
-        default_factory=lambda: ["separation", "transcription", "pronunciation", "global_alignment", "alignment"],
+    steps: list[Literal["separation", "transcription", "pronunciation", "global_alignment", "alignment", "fa_kara"]] = Field(
+        default_factory=lambda: ["separation", "transcription", "pronunciation", "fa_kara"],
         max_length=5,
     )
+    alignment_backend: Literal["fa_kara", "stable_ts"] | None = None
+    fa_kara_model: Literal["mms", "yohane"] | None = None
     profile_id: str | None = None
 
 class SeparationRequest(BaseModel):

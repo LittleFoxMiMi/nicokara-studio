@@ -16,6 +16,7 @@ from app.services.audio import AudioProcessingError, prepare_source_audio
 from app.services.pronunciation import PronunciationSelection, PronunciationValidationError, apply_local, run_ai_pronunciation
 from app.services.separation import Kara2Separator
 from app.services.stable_ts import StableTSAligner, StableTSAlignmentError, rough_line_ranges
+from app.services.fa_kara import FAKaraAligner
 from app.services.transcription import FasterWhisperTranscriber, Transcript, TranscriptSegment, TranscriptWord
 from app.services.kirakara_export import ExportCanceled, ExportError, run_kirakara_export
 
@@ -37,6 +38,7 @@ STEP_LABELS = {
     "pronunciation": "AI 注音",
     "global_alignment": "stable-ts 全局对齐",
     "alignment": "stable-ts 词/短语精修",
+    "fa_kara": "FA-Kara 对齐",
     "export": "Kirakara 服务端导出",
 }
 
@@ -205,6 +207,34 @@ class AnalysisPipeline:
         self._step(job_id, "alignment", 1.0, "stable-ts 词/短语精修完成")
         return updated, revision, summary | {"output_revision": revision}
 
+    def _fa_kara(self, job_id: str, project_id: str, document: dict, revision: int, payload: dict, values: dict) -> tuple[dict, int, dict]:
+        _, derived, _ = self._paths(project_id)
+        audio = derived / "vocals_asr.wav"
+        if not audio.is_file():
+            raise AudioProcessingError("请先完成 KARA2 人声分离，再运行 FA-Kara 对齐")
+        model_name = str(payload.get("fa_kara_model") or payload.get("model") or values.get("fa_kara_model") or "mms")
+        aligner = FAKaraAligner(
+            lambda: self.transcriber.get_fa_kara_model(
+                model_name=model_name,
+                device=values.get("whisper_device") or self.settings.whisper_device,
+                progress_callback=lambda value, message: self._step(job_id, "fa_kara", 0.02 + value * 0.08, message),
+            ),
+            model_name=model_name,
+        )
+        result_path = derived / "fa_kara.json"
+        updated, summary = aligner.align(
+            document,
+            audio,
+            line_ids=payload.get("line_ids") or None,
+            overwrite_locked=payload.get("overwrite_policy") == "all",
+            result_path=result_path,
+            progress_callback=lambda value, message: self._step(job_id, "fa_kara", 0.1 + value * 0.88, message),
+        )
+        updated.setdefault("analysis", {})["fa_kara"] = {"status": "completed", "job_id": job_id, **summary}
+        updated, revision = self._save(project_id, updated, revision)
+        self._step(job_id, "fa_kara", 1.0, "FA-Kara 对齐完成")
+        return updated, revision, summary | {"output_revision": revision}
+
     def _export(self, job_id: str, project_id: str, document: dict, payload: dict) -> dict:
         return run_kirakara_export(
             job_id,
@@ -236,12 +266,15 @@ class AnalysisPipeline:
             return self._global_align(job_id, project_id, document, revision, payload, values)[2]
         if job["type"] == "STABLE_ALIGNMENT":
             return self._align(job_id, project_id, document, revision, payload, values)[2]
+        if job["type"] == "FA_KARA_ALIGNMENT":
+            return self._fa_kara(job_id, project_id, document, revision, payload, values)[2]
         if job["type"] == "EXPORT":
             return self._export(job_id, project_id, document, payload)
         if job["type"] != "FULL_ANALYSIS":
             raise ValueError("unknown_job_type")
         result: dict = {}
-        for step in payload.get("steps", ["separation", "transcription", "pronunciation", "global_alignment", "alignment"]):
+        default_steps = ["separation", "transcription", "pronunciation", "fa_kara"]
+        for step in payload.get("steps", default_steps):
             if step == "separation":
                 document, revision, step_result = self._separate(job_id, project_id, document, revision, payload, values)
             elif step == "transcription":
@@ -252,6 +285,8 @@ class AnalysisPipeline:
                 document, revision, step_result = self._global_align(job_id, project_id, document, revision, payload, values)
             elif step == "alignment":
                 document, revision, step_result = self._align(job_id, project_id, document, revision, payload, values)
+            elif step == "fa_kara":
+                document, revision, step_result = self._fa_kara(job_id, project_id, document, revision, payload, values)
             else:
                 raise ValueError("unknown_analysis_step")
             result[step] = step_result

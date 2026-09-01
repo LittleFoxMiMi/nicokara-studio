@@ -1,4 +1,5 @@
 from __future__ import annotations
+import copy
 import re
 import shutil
 from pathlib import Path
@@ -11,7 +12,7 @@ from app.domain.lyrics import detect_lyrics_format, parse_lyrics
 from app.media.probe import probe, thumbnail
 from app.media.waveform import generate_waveform
 from app.services.audio import prepare_source_audio
-from app.schemas.projects import AnalysisRequest, DocumentSave, ExportRequest, FullAnalysisRequest, LyricsDetect, LyricsImport, ProjectCreate, ProjectPatch, ProjectResponse, SeparationRequest
+from app.schemas.projects import AnalysisRequest, DocumentSave, ExportRequest, FAKaraRequest, FullAnalysisRequest, LyricsDetect, LyricsImport, ProjectCreate, ProjectPatch, ProjectResponse, SeparationRequest
 from app.services.kirakara_export import build_worker_html, export_output_path, export_raw_output_path
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -39,6 +40,38 @@ def create_project(payload: ProjectCreate, request: Request):
 
 @router.get("/{project_id}", response_model=ProjectResponse)
 def get_project(project_id: str, request: Request): return project_or_404(services(request)[1], project_id)
+
+@router.post("/{project_id}/copy", response_model=ProjectResponse, status_code=201)
+def copy_project(project_id: str, request: Request, payload: ProjectCreate | None = None):
+    settings, db = services(request)
+    source = project_or_404(db, project_id)
+    source_document = db.document(project_id)
+    if not source_document:
+        raise HTTPException(404, "工程文档不存在")
+    copied_id = str(uuid4())
+    copied_name = (payload.name.strip() if payload and payload.name else f"{source['name']} (副本)")
+    if not copied_name:
+        raise HTTPException(422, "复制工程名称不能为空")
+    document = copy.deepcopy(source_document)
+    document.setdefault("project", {}).update({"id": copied_id, "name": copied_name, "revision": 1})
+    media = document.setdefault("media", {})
+    media["thumbnail_url"] = f"/api/projects/{copied_id}/thumbnail" if media.get("video_filename") else None
+    media["waveform_url"] = f"/api/projects/{copied_id}/waveform" if media.get("waveform_url") or media.get("waveform_source") or media.get("waveform_generated") else None
+    if isinstance(document.get("analysis"), dict):
+        for result in document["analysis"].values():
+            if isinstance(result, dict):
+                result.pop("job_id", None)
+    source_dir = settings.projects_dir / project_id
+    target_dir = settings.projects_dir / copied_id
+    try:
+        db.clone_project_record(copied_id, copied_name, document)
+        if source_dir.is_dir():
+            shutil.copytree(source_dir, target_dir, ignore=shutil.ignore_patterns("exports"))
+    except Exception:
+        db.delete_project(copied_id)
+        shutil.rmtree(target_dir, ignore_errors=True)
+        raise HTTPException(500, "复制工程失败")
+    return db.get_project(copied_id)
 
 @router.patch("/{project_id}", response_model=ProjectResponse)
 def patch_project(project_id: str, payload: ProjectPatch, request: Request):
@@ -140,6 +173,32 @@ def transcribe(project_id: str, payload: AnalysisRequest, request: Request):
         raise HTTPException(422, "识别结束时间必须晚于开始时间")
     return request.app.state.analysis_runner.enqueue(project_id, "TRANSCRIPTION", payload.revision, payload.model_dump())
 
+@router.post("/{project_id}/fa-kara", status_code=202)
+def fa_kara(project_id: str, payload: FAKaraRequest, request: Request):
+    settings, db = services(request)
+    project = project_or_404(db, project_id)
+    if project["revision"] != payload.revision:
+        raise HTTPException(409, {"code": "revision_conflict"})
+    document = db.document(project_id)
+    if not document or not document.get("media", {}).get("video_filename"):
+        raise HTTPException(422, "请先上传视频")
+    if not document.get("lyrics", {}).get("lines"):
+        raise HTTPException(422, "请先添加歌词")
+    if not (settings.projects_dir / project_id / "derived" / "vocals_asr.wav").is_file():
+        raise HTTPException(422, "请先完成 KARA2 人声分离")
+    completion = _analysis_completion(document, project_id, settings)
+    if not completion["transcription"]:
+        raise HTTPException(422, "请先完成 Whisper 粗识别")
+    if not completion["pronunciation"]:
+        raise HTTPException(422, "请先完成 AI 注音或本地注音")
+    model = payload.model or str(db.settings().get("fa_kara_model") or "mms")
+    return request.app.state.analysis_runner.enqueue(
+        project_id,
+        "FA_KARA_ALIGNMENT",
+        payload.revision,
+        {**payload.model_dump(), "model": model, "steps": ["fa_kara"]},
+    )
+
 
 def _analysis_completion(document: dict, project_id: str, settings: Settings) -> dict[str, bool]:
     derived = settings.projects_dir / project_id / "derived"
@@ -152,10 +211,18 @@ def _analysis_completion(document: dict, project_id: str, settings: Settings) ->
         "pronunciation": (not has_kanji) or analysis.get("pronunciation", {}).get("status") == "completed" or document.get("pronunciation", {}).get("last_run", {}).get("mode") in {"local", "ai", "local_fallback"},
         "global_alignment": (derived / "stable_global.json").is_file() and bool(lines) and all(line.get("start_ms") is not None and line.get("end_ms") is not None for line in lines) and analysis.get("global_alignment", {}).get("status") == "completed",
         "alignment": analysis.get("alignment", {}).get("status") == "completed",
+        "fa_kara": (derived / "fa_kara.json").is_file() and analysis.get("fa_kara", {}).get("status") == "completed",
     }
 
 
-def _validate_full_steps(project: dict, document: dict, project_id: str, payload: FullAnalysisRequest, settings: Settings) -> None:
+def _validate_full_steps(
+    project: dict,
+    document: dict,
+    project_id: str,
+    payload: FullAnalysisRequest,
+    settings: Settings,
+    alignment_backend: str,
+) -> None:
     if project["revision"] != payload.revision:
         raise HTTPException(409, {"code": "revision_conflict"})
     if not document.get("media", {}).get("video_filename"):
@@ -164,7 +231,14 @@ def _validate_full_steps(project: dict, document: dict, project_id: str, payload
     if not steps:
         raise HTTPException(422, "至少选择一个分析流程")
     complete = _analysis_completion(document, project_id, settings)
-    order = ["separation", "transcription", "pronunciation", "global_alignment", "alignment"]
+    order = (
+        ["separation", "transcription", "pronunciation", "fa_kara"]
+        if alignment_backend == "fa_kara"
+        else ["separation", "transcription", "pronunciation", "global_alignment", "alignment"]
+    )
+    unexpected = [key for key in steps if key not in order]
+    if unexpected:
+        raise HTTPException(422, f"当前对齐后端不支持流程：{unexpected[0]}")
     for key in order:
         if key not in steps and not complete[key]:
             raise HTTPException(422, f"不能跳过未完成的流程：{key}")
@@ -182,9 +256,13 @@ def full_analysis(project_id: str, payload: FullAnalysisRequest, request: Reques
     document = db.document(project_id)
     if not document:
         raise HTTPException(404, "工程文档不存在")
-    _validate_full_steps(project, document, project_id, payload, settings)
+    configured = db.settings()
+    alignment_backend = payload.alignment_backend or str(configured.get("alignment_backend") or "fa_kara")
+    _validate_full_steps(project, document, project_id, payload, settings, alignment_backend)
     body = payload.model_dump()
     body["steps"] = list(dict.fromkeys(payload.steps))
+    body["alignment_backend"] = alignment_backend
+    body["fa_kara_model"] = payload.fa_kara_model or str(configured.get("fa_kara_model") or "mms")
     return request.app.state.analysis_runner.enqueue(project_id, "FULL_ANALYSIS", payload.revision, body)
 
 
