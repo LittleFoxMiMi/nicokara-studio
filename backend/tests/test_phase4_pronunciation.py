@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from fastapi.testclient import TestClient
 import httpx
 
@@ -60,14 +62,13 @@ def test_ai_pronunciation_keeps_reading_when_raw_tokenization_is_wrong(tmp_path,
         response = client.post(f"/api/projects/{project['id']}/pronunciation/ai", json={"revision": imported["revision"], "mode": "ai", "profile_id": profile["id"]})
         assert response.status_code == 200
         body = response.json()
-        assert body["summary"]["local_fallback_lines"] == 0
         assert body["summary"]["raw_mismatch_lines"] == 1
         units = body["document"]["lyrics"]["lines"]
         assert units[0]["units"][0]["ruby_source"] == "ai"
         assert units[1]["units"][0]["ruby_source"] == "ai"
 
 
-def test_ai_pronunciation_uses_local_reading_after_retries_are_exhausted(tmp_path, monkeypatch):
+def test_ai_pronunciation_validation_failure_does_not_write_local_fallback(tmp_path, monkeypatch):
     get_settings.cache_clear()
     monkeypatch.setenv("NICOKARA_DATA_DIR", str(tmp_path))
     with TestClient(create_app()) as client:
@@ -83,12 +84,10 @@ def test_ai_pronunciation_uses_local_reading_after_retries_are_exhausted(tmp_pat
 
         monkeypatch.setattr("app.api.pronunciation.AIClient.complete", fake_complete)
         response = client.post(f"/api/projects/{project['id']}/pronunciation/ai", json={"revision": imported["revision"], "mode": "ai", "profile_id": profile["id"]})
-        assert response.status_code == 200
-        body = response.json()
-        assert body["summary"]["local_fallback_lines"] == 1
-        units = body["document"]["lyrics"]["lines"]
-        assert units[0]["units"][0]["ruby_source"] == "ai"
-        assert units[1]["units"][0]["ruby_source"] == "local_fallback"
+        assert response.status_code == 502
+        stored = client.get(f"/api/projects/{project['id']}/document").json()
+        assert stored["revision"] == imported["revision"]
+        assert all(unit["ruby"] is None for line in stored["document"]["lyrics"]["lines"] for unit in line["units"])
 
 
 def test_local_pronunciation_updates_only_selected_units_and_preserves_text(tmp_path, monkeypatch):
@@ -149,7 +148,7 @@ def test_profile_response_never_returns_api_key(tmp_path, monkeypatch):
         assert "super-secret-key" not in str(listed)
 
 
-def test_remote_protocol_disconnect_uses_local_fallback_instead_of_500(tmp_path, monkeypatch):
+def test_remote_protocol_disconnect_returns_error_without_local_fallback(tmp_path, monkeypatch):
     get_settings.cache_clear()
     monkeypatch.setenv("NICOKARA_DATA_DIR", str(tmp_path))
     with TestClient(create_app()) as client:
@@ -162,5 +161,61 @@ def test_remote_protocol_disconnect_uses_local_fallback_instead_of_500(tmp_path,
 
         monkeypatch.setattr("app.api.pronunciation.AIClient.complete", disconnect)
         response = client.post(f"/api/projects/{project['id']}/pronunciation/ai", json={"revision": imported["revision"], "mode": "ai", "profile_id": profile["id"]})
-        assert response.status_code == 200
-        assert response.json()["summary"]["source"] == "local_fallback"
+        assert response.status_code == 502
+        stored = client.get(f"/api/projects/{project['id']}/document").json()
+        assert stored["revision"] == imported["revision"]
+        assert stored["document"]["lyrics"]["lines"][0]["units"][0]["ruby"] is None
+
+
+def test_full_analysis_stops_when_ai_pronunciation_fails(tmp_path, monkeypatch):
+    get_settings.cache_clear()
+    monkeypatch.setenv("NICOKARA_DATA_DIR", str(tmp_path))
+    with TestClient(create_app()) as client:
+        profile = client.post(
+            "/api/settings/ai-profiles",
+            json={"name": "Broken full analysis", "base_url": "http://127.0.0.1:9/v1", "model": "demo", "api_key": "secret", "retry_count": 0},
+        ).json()
+        client.put("/api/settings", json={"values": {"default_ai_profile_id": profile["id"]}})
+        project = client.post("/api/projects", json={"name": "Stop after AI"}).json()
+        imported = client.post(
+            f"/api/projects/{project['id']}/lyrics/import",
+            json={"revision": 1, "format": "text", "content": "雨"},
+        ).json()
+        document = imported["document"]
+        document["media"]["video_filename"] = "video.mp4"
+        saved = client.put(
+            f"/api/projects/{project['id']}/document",
+            json={"revision": imported["revision"], "document": document},
+        ).json()
+
+        def disconnect(self, system_prompt, user_prompt):
+            raise httpx.RemoteProtocolError("AI disconnected")
+
+        monkeypatch.setattr("app.services.pronunciation.AIClient.complete", disconnect)
+        pipeline = client.app.state.analysis_runner.pipeline
+        pipeline._separate = lambda job_id, project_id, current, revision, payload, values: (current, revision, {})
+        pipeline._transcribe = lambda job_id, project_id, current, revision, payload, values: (current, revision, {})
+        alignment_started = []
+        pipeline._fa_kara = lambda *args: alignment_started.append(True)
+
+        queued = client.post(
+            f"/api/projects/{project['id']}/analysis",
+            json={
+                "revision": saved["revision"],
+                "alignment_backend": "fa_kara",
+                "steps": ["separation", "transcription", "pronunciation", "fa_kara"],
+            },
+        )
+        assert queued.status_code == 202
+        for _ in range(100):
+            job = client.get(f"/api/jobs/{queued.json()['id']}").json()
+            if job["status"] == "FAILED":
+                break
+            time.sleep(0.01)
+
+        assert job["status"] == "FAILED"
+        assert "AI 注音请求失败" in job["error_message"]
+        assert alignment_started == []
+        stored = client.get(f"/api/projects/{project['id']}/document").json()
+        assert stored["revision"] == saved["revision"]
+        assert stored["document"]["lyrics"]["lines"][0]["units"][0]["ruby"] is None

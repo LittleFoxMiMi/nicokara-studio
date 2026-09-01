@@ -84,19 +84,10 @@ def ai_pronunciation(project_id: str, payload: PronunciationRequest, request: Re
     profile_id = payload.profile_id or db.settings().get("default_ai_profile_id")
     profile = db.get_ai_profile(profile_id) if profile_id else None
     settings = db.settings()
-    fallback = str(settings.get("ai_failure_mode", "auto_local")) == "auto_local"
     if not profile:
-        if fallback:
-            updated, summary = apply_local(document, selection, fallback=True)
-            saved = db.save_document(project_id, updated, payload.revision)
-            return {"revision": saved["revision"], "document": updated, "summary": {**summary, "fallback_reason": "未配置 AI profile"}}
         raise HTTPException(422, "尚未配置 AI 注音 profile")
     key = SecretStore(request.app.state.settings.data_dir).decrypt(db.get_ai_profile_secret(profile["id"]))
     if not key:
-        if fallback:
-            updated, summary = apply_local(document, selection, fallback=True)
-            saved = db.save_document(project_id, updated, payload.revision)
-            return {"revision": saved["revision"], "document": updated, "summary": {**summary, "fallback_reason": "AI profile 未配置密钥"}}
         raise HTTPException(422, "AI profile 未配置密钥")
     lines = document.get("lyrics", {}).get("lines", [])
     current_lines = [{"line_index": index, "text": "".join(unit.get("surface", "") for unit in line.get("units", []))} for index, line in enumerate(lines)]
@@ -132,24 +123,20 @@ def ai_pronunciation(project_id: str, payload: PronunciationRequest, request: Re
             raw_mismatch_line_indices.update(raw_mismatch_indices)
         selected_line_ids = set(selection.line_ids)
         selected_unit_ids = set(selection.unit_ids)
-        fallback_line_ids = [
+        failed_line_ids = [
             lines[index]["id"]
             for index in sorted(invalid_line_indices)
             if not (selected_line_ids or selected_unit_ids)
             or lines[index]["id"] in selected_line_ids
             or any(unit["id"] in selected_unit_ids for unit in lines[index].get("units", []))
         ]
-        if fallback_line_ids:
-            updated, local_summary = apply_local(document, PronunciationSelection(fallback_line_ids, [], selection.overwrite_policy), fallback=True)
-        else:
-            updated, local_summary = document, {"applied": 0}
-        updated, summary = apply_ai(updated, result, selection)
+        if failed_line_ids:
+            raise PronunciationValidationError(
+                f"AI 注音有 {len(failed_line_ids)} 行校验失败，未写入任何结果"
+            )
+        updated, summary = apply_ai(document, result, selection)
         saved = db.save_document(project_id, updated, payload.revision)
         combined_raw = raw_batches[0] if len(raw_batches) == 1 else {"result": [item for raw in raw_batches for item in raw.get("result", [])]}
-        return {"revision": saved["revision"], "document": updated, "summary": {**summary, "batch_count": len(line_batches), "retry_count": retries_used, "local_fallback_lines": len(fallback_line_ids), "local_fallback_applied": local_summary["applied"], "raw_mismatch_lines": len(raw_mismatch_line_indices)}, "prompt": {"system": system_prompt, "user": batch_prompts[0] if len(line_batches) == 1 else batch_prompts}, "raw_result": combined_raw}
+        return {"revision": saved["revision"], "document": updated, "summary": {**summary, "batch_count": len(line_batches), "retry_count": retries_used, "raw_mismatch_lines": len(raw_mismatch_line_indices)}, "prompt": {"system": system_prompt, "user": batch_prompts[0] if len(line_batches) == 1 else batch_prompts}, "raw_result": combined_raw}
     except AI_REQUEST_ERRORS as exc:
-        if fallback:
-            updated, summary = apply_local(document, selection, fallback=True)
-            saved = db.save_document(project_id, updated, payload.revision)
-            return {"revision": saved["revision"], "document": updated, "summary": {**summary, "fallback_reason": str(exc)[:200]}}
         raise HTTPException(502, "AI 注音失败，未覆盖现有注音") from exc

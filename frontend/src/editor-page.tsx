@@ -442,8 +442,8 @@ export function EditorPage({ id }: { id: string }) {
       .catch(() => setError("无法打开工程，请确认后端服务已启动。"));
   }, [id]);
 
-  const reloadFromServer = useCallback(async () => {
-    if (dirtyRef.current) return;
+  const reloadFromServer = useCallback(async (): Promise<boolean> => {
+    if (dirtyRef.current) return false;
     const [loadedProject, loaded] = await Promise.all([
       api<Project>(`/projects/${id}`),
       api<{ revision: number; document: ProjectDocument }>(`/projects/${id}/document`),
@@ -452,6 +452,7 @@ export function EditorPage({ id }: { id: string }) {
     documentRef.current = loaded.document;
     setProject(loadedProject);
     setDocument(loaded.document);
+    return true;
   }, [id]);
 
   useEffect(() => {
@@ -461,7 +462,9 @@ export function EditorPage({ id }: { id: string }) {
         const loaded = await api<AnalysisJob[]>(`/jobs?project_id=${encodeURIComponent(id)}&limit=12`);
         if (disposed) return;
         setJobs(loaded);
-        const completed = loaded.find((job) => job.status === "SUCCEEDED" && !appliedJobs.current.has(job.id));
+        const terminal = loaded.find(
+          (job) => ["SUCCEEDED", "FAILED", "CANCELED"].includes(job.status) && !appliedJobs.current.has(job.id),
+        );
         const separated = loaded.find(
           (job) =>
             job.status === "RUNNING" &&
@@ -472,9 +475,8 @@ export function EditorPage({ id }: { id: string }) {
           appliedVocalWaveforms.current.add(separated.id);
           await reloadFromServer();
         }
-        if (completed) {
-          appliedJobs.current.add(completed.id);
-          await reloadFromServer();
+        if (terminal && await reloadFromServer()) {
+          appliedJobs.current.add(terminal.id);
         }
       } catch {
         // Project loading already reports connectivity failures.
@@ -930,6 +932,26 @@ export function EditorPage({ id }: { id: string }) {
     }
   }
 
+  async function openFullAnalysis() {
+    setAnalysisStarting(true);
+    setError(null);
+    try {
+      if (dirtyRef.current) await saveNow();
+      const loadedJobs = await api<AnalysisJob[]>(`/jobs?project_id=${encodeURIComponent(id)}&limit=12`);
+      await reloadFromServer();
+      setJobs(loadedJobs);
+      setFullSteps(alignmentBackend === "fa_kara"
+        ? { separation: true, transcription: true, pronunciation: true, fa_kara: true }
+        : { separation: true, transcription: true, pronunciation: true, global_alignment: true, alignment: true });
+      setFullAnalysisOpen(true);
+    } catch (reason) {
+      const status = (reason as Error & { status?: number })?.status;
+      setError(status === 409 ? "工程版本已变化，请保存或刷新后重试。" : "无法同步全曲分析状态，请确认后端已启动。 ");
+    } finally {
+      setAnalysisStarting(false);
+    }
+  }
+
   async function uploadVideo(file: File) {
     if (!file.name.toLowerCase().endsWith(".mp4")) {
       setError("当前仅支持 MP4 视频。");
@@ -1077,7 +1099,7 @@ export function EditorPage({ id }: { id: string }) {
               <WandSparkles size={17} />
               {pronunciationRunning ? "注音中" : "本地注音"}
             </button>
-            <button className="button tonal" disabled={!lines.length || pronunciationRunning} onClick={() => void runPronunciation("ai")} title="使用当前 AI profile 生成读音，失败时按设置降级">
+            <button className="button tonal" disabled={!lines.length || pronunciationRunning} onClick={() => void runPronunciation("ai")} title="使用当前 AI profile 生成读音，失败时保留现有歌词和 Ruby">
               <WandSparkles size={17} />AI 注音
             </button>
             <button className="button tonal" disabled={!hasVideo || !lines.length || Boolean(activeJob) || analysisStarting} onClick={() => void startTranscription()} title="仅运行 Whisper 人声粗识别">
@@ -1096,7 +1118,7 @@ export function EditorPage({ id }: { id: string }) {
             <button
               className="button tonal"
               disabled={!hasVideo || !lines.length || Boolean(activeJob) || analysisStarting}
-              onClick={() => { setFullSteps(alignmentBackend === "fa_kara" ? { separation: true, transcription: true, pronunciation: true, fa_kara: true } : { separation: true, transcription: true, pronunciation: true, global_alignment: true, alignment: true }); setFullAnalysisOpen(true); }}
+              onClick={() => void openFullAnalysis()}
             >
               <WandSparkles size={17} />全曲分析
             </button>

@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from app.services.cancellation import run_cancelable
+
 
 @dataclass(frozen=True)
 class TranscriptWord:
@@ -50,6 +52,7 @@ class FasterWhisperTranscriber:
         device: str,
         compute_type: str,
         progress_callback: Callable[[float, str], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> Any:
         resolved_device = "cpu"
         resolved_compute = "int8"
@@ -59,7 +62,10 @@ class FasterWhisperTranscriber:
             if progress_callback:
                 progress_callback(0.0, "正在下载或加载 Whisper 模型")
             if self.model_factory:
-                model = self.model_factory(*key)
+                model = run_cancelable(
+                    lambda: self.model_factory(*key),
+                    should_cancel,
+                )
             else:
                 try:
                     from faster_whisper import WhisperModel
@@ -67,11 +73,14 @@ class FasterWhisperTranscriber:
                     raise RuntimeError("faster-whisper 尚未安装") from exc
                 if self.download_root:
                     self.download_root.mkdir(parents=True, exist_ok=True)
-                model = WhisperModel(
-                    model_name,
-                    device=resolved_device,
-                    compute_type=resolved_compute,
-                    download_root=str(self.download_root) if self.download_root else None,
+                model = run_cancelable(
+                    lambda: WhisperModel(
+                        model_name,
+                        device=resolved_device,
+                        compute_type=resolved_compute,
+                        download_root=str(self.download_root) if self.download_root else None,
+                    ),
+                    should_cancel,
                 )
             self._models[key] = model
             if progress_callback:
@@ -88,12 +97,14 @@ class FasterWhisperTranscriber:
         start_ms: int | None = None,
         end_ms: int | None = None,
         progress_callback: Callable[[float, str], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> Transcript:
         model = self.get_model(
             model_name=model_name,
             device=device,
             compute_type=compute_type,
             progress_callback=progress_callback,
+            should_cancel=should_cancel,
         )
         options: dict[str, Any] = {
             "language": "ja",
@@ -128,6 +139,7 @@ class FasterWhisperTranscriber:
         device: str,
         compute_type: str,
         progress_callback: Callable[[float, str], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> Any:
         """Load stable-ts's official faster-whisper model integration."""
         resolved_device = "cpu"
@@ -144,11 +156,14 @@ class FasterWhisperTranscriber:
             raise RuntimeError("stable-ts 尚未安装") from exc
         if self.download_root:
             self.download_root.mkdir(parents=True, exist_ok=True)
-        model = stable_whisper.load_faster_whisper(
-            model_name,
-            device=resolved_device,
-            compute_type=resolved_compute,
-            download_root=str(self.download_root) if self.download_root else None,
+        model = run_cancelable(
+            lambda: stable_whisper.load_faster_whisper(
+                model_name,
+                device=resolved_device,
+                compute_type=resolved_compute,
+                download_root=str(self.download_root) if self.download_root else None,
+            ),
+            should_cancel,
         )
         self._stable_models[key] = model
         if progress_callback:
@@ -161,6 +176,7 @@ class FasterWhisperTranscriber:
         model_name: str = "mms",
         device: str = "cpu",
         progress_callback: Callable[[float, str], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> tuple[Any, Any]:
         """Load either FA-Kara CTC backend without pronunciation fallbacks."""
         if model_name not in {"mms", "yohane"}:
@@ -179,7 +195,10 @@ class FasterWhisperTranscriber:
             if progress_callback:
                 progress_callback(0.0, "正在下载或加载 FA-Kara MMS_FA 模型")
             bundle = torchaudio.pipelines.MMS_FA
-            model = bundle.get_model().to(resolved_device)
+            model = run_cancelable(
+                lambda: bundle.get_model().to(resolved_device),
+                should_cancel,
+            )
             ready_message = "FA-Kara MMS_FA 模型已就绪"
         else:
             if progress_callback:
@@ -195,8 +214,14 @@ class FasterWhisperTranscriber:
             cache_dir = self.download_root.parent / "fa-kara" if self.download_root else None
             if cache_dir:
                 cache_dir.mkdir(parents=True, exist_ok=True)
-            processor = Wav2Vec2Processor.from_pretrained(model_id, cache_dir=str(cache_dir) if cache_dir else None)
-            hf_model = Wav2Vec2ForCTC.from_pretrained(model_id, cache_dir=str(cache_dir) if cache_dir else None)
+            processor = run_cancelable(
+                lambda: Wav2Vec2Processor.from_pretrained(model_id, cache_dir=str(cache_dir) if cache_dir else None),
+                should_cancel,
+            )
+            hf_model = run_cancelable(
+                lambda: Wav2Vec2ForCTC.from_pretrained(model_id, cache_dir=str(cache_dir) if cache_dir else None),
+                should_cancel,
+            )
             blank = hf_model.config.pad_token_id
             if blank is None:
                 raise RuntimeError("YoHane 模型没有配置 CTC blank token")

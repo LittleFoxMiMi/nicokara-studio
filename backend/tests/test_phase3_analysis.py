@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ from app.core.database import Database
 from app.domain.lyrics import parse_lyrics
 from app.main import create_app
 from app.services.alignment import align_document, normalize_reading, split_moras
+from app.services.cancellation import OperationCanceled
 from app.services.pipeline import AnalysisRunner
 from app.services.separation import Kara2Separator, provider_for
 from app.services.transcription import FasterWhisperTranscriber, Transcript, TranscriptSegment, TranscriptWord
@@ -129,6 +131,38 @@ def test_whisper_auto_falls_back_to_cpu_int8_and_keeps_clip_scope(tmp_path, monk
 
     assert created == [("small", "cpu", "int8")]
     assert calls[0][1]["clip_timestamps"] == [1.0, 2.5]
+
+
+def test_whisper_model_loading_can_be_canceled_without_waiting_for_loader() -> None:
+    started = Event()
+    release = Event()
+    canceled = Event()
+
+    def slow_factory(model, device, compute):
+        started.set()
+        release.wait(2)
+        return object()
+
+    transcriber = FasterWhisperTranscriber(model_factory=slow_factory)
+
+    def request_cancel() -> None:
+        assert started.wait(1)
+        canceled.set()
+
+    Thread(target=request_cancel).start()
+    begin = time.monotonic()
+    try:
+        with pytest.raises(OperationCanceled):
+            transcriber.get_model(
+                model_name="small",
+                device="cpu",
+                compute_type="int8",
+                should_cancel=canceled.is_set,
+            )
+    finally:
+        release.set()
+
+    assert time.monotonic() - begin < 1
 
 
 def test_stable_model_uses_stable_ts_official_faster_whisper_loader(tmp_path, monkeypatch) -> None:

@@ -13,6 +13,7 @@ from app.core.database import Database
 from app.media.waveform import generate_waveform
 from app.services.alignment import AlignmentQualityError
 from app.services.audio import AudioProcessingError, prepare_source_audio
+from app.services.cancellation import OperationCanceled
 from app.services.pronunciation import PronunciationSelection, PronunciationValidationError, apply_local, run_ai_pronunciation
 from app.services.separation import Kara2Separator
 from app.services.stable_ts import StableTSAligner, StableTSAlignmentError, rough_line_ranges
@@ -65,6 +66,10 @@ class AnalysisPipeline:
         overall = sum(float(item.get("progress", 0)) for item in steps) / max(1, len(steps))
         self.database.update_job(job_id, status="RUNNING", progress=overall, stage=key.upper(), message=message, steps=steps)
 
+    def _should_cancel(self, job_id: str) -> bool:
+        job = self.database.get_job(job_id)
+        return not job or bool(job["cancel_requested"])
+
     def _paths(self, project_id: str) -> tuple[Path, Path, Path]:
         directory = self.settings.projects_dir / project_id
         return directory / "video.mp4", directory / "derived", directory / "derived" / "transcript.json"
@@ -103,6 +108,7 @@ class AnalysisPipeline:
             model=payload.get("separator_model") or payload.get("model") or values.get("separator_model") or self.settings.separator_model,
             device=payload.get("separator_device") or payload.get("device") or values.get("separator_device") or self.settings.separator_device,
             progress_callback=lambda value, message: self._step(job_id, "separation", value, message),
+            should_cancel=lambda: self._should_cancel(job_id),
         )
         self._step(job_id, "separation", 0.78, "KARA2 分离完成，正在生成 vocals 波形")
         vocal_waveform = derived / "vocal_waveform.json"
@@ -139,6 +145,7 @@ class AnalysisPipeline:
             start_ms=max(0, start_ms - 3000) if isinstance(start_ms, int) else None,
             end_ms=end_ms + 3000 if isinstance(end_ms, int) else None,
             progress_callback=lambda value, message: self._step(job_id, "transcription", 0.08 + value * 0.84, message),
+            should_cancel=lambda: self._should_cancel(job_id),
         )
         derived.mkdir(parents=True, exist_ok=True)
         transcript_path.write_text(json.dumps(transcript.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -173,6 +180,7 @@ class AnalysisPipeline:
                 device=values.get("whisper_device") or self.settings.whisper_device,
                 compute_type=values.get("whisper_compute_type") or self.settings.whisper_compute_type,
                 progress_callback=lambda value, message: self._step(job_id, step, 0.02 + value * 0.06, message),
+                should_cancel=lambda: self._should_cancel(job_id),
             )
         )
 
@@ -218,6 +226,7 @@ class AnalysisPipeline:
                 model_name=model_name,
                 device=values.get("whisper_device") or self.settings.whisper_device,
                 progress_callback=lambda value, message: self._step(job_id, "fa_kara", 0.02 + value * 0.08, message),
+                should_cancel=lambda: self._should_cancel(job_id),
             ),
             model_name=model_name,
         )
@@ -309,7 +318,7 @@ class AnalysisRunner:
         try:
             result = self.pipeline.process(job_id)
             self.database.update_job(job_id, status="SUCCEEDED", progress=1.0, stage="COMPLETED", message="处理完成", result_json=result, output_revision=result.get("output_revision"), completed_at=timestamp())
-        except JobCanceled:
+        except (JobCanceled, OperationCanceled):
             self.database.update_job(job_id, status="CANCELED", message="任务已取消", completed_at=timestamp())
         except ExportCanceled:
             self.database.update_job(job_id, status="CANCELED", message="导出已取消", completed_at=timestamp())

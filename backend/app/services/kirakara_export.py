@@ -36,9 +36,14 @@ def document_to_lrc(document: dict) -> str:
         current_role = ""
         body: list[str] = []
         index = 0
+        timeline_cursor = line.get("start_ms") or 0
         while index < len(units):
             unit = units[index]
-            start = unit.get("start_ms") if unit.get("start_ms") is not None else line.get("start_ms") or 0
+            raw_start = unit.get("start_ms")
+            if raw_start is None and str(unit.get("surface") or "").isspace():
+                start = timeline_cursor
+            else:
+                start = raw_start if raw_start is not None else line.get("start_ms") or 0
             end = unit.get("end_ms") if unit.get("end_ms") is not None else line.get("end_ms") or int(start) + 500
             role = "+".join(str(item) for item in unit.get("roles", []) if item)
             prefix = f"【@{role}】" if role and role != current_role else ""
@@ -70,6 +75,8 @@ def document_to_lrc(document: dict) -> str:
                 members = units[index:member_end]
                 grouped_surface = _escape("".join(str(member.get("surface") or "") for member in members))
                 body.append(f"{prefix}{_timestamp(start)}{{{grouped_surface}|{_escape(ruby_text)}}}")
+                member_ends = [member.get("end_ms") for member in members if member.get("end_ms") is not None]
+                timeline_cursor = max(timeline_cursor, max(member_ends) if member_ends else start)
                 index += len(members)
                 continue
             surface = _escape(unit.get("surface"))
@@ -78,6 +85,7 @@ def document_to_lrc(document: dict) -> str:
             else:
                 chars = list(str(unit.get("surface")))
                 body.extend(f"{prefix if char_index == 0 else ''}{_timestamp(start + (end - start) * char_index / len(chars))}{_escape(char)}" for char_index, char in enumerate(chars))
+            timeline_cursor = max(timeline_cursor, unit.get("end_ms") if unit.get("end_ms") is not None else start)
             index += 1
         fallback_end = line.get("end_ms") if line.get("end_ms") is not None else (line.get("start_ms") or 0) + 500
         rows.append("".join(body) + _timestamp(fallback_end))

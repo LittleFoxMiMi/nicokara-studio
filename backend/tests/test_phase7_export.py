@@ -73,3 +73,23 @@ def test_document_to_lrc_treats_ruby_span_as_surface_characters() -> None:
         },
     }
     assert document_to_lrc(document) == "[00:00.00]{日本|にほん}[00:00.30]語[00:00.60]"
+
+
+def test_document_to_lrc_places_untimed_spaces_after_previous_unit_end() -> None:
+    document = {
+        "lyrics": {
+            "lines": [{
+                "start_ms": 116780,
+                "end_ms": 120000,
+                "units": [
+                    {"surface": "日常", "ruby": "にちじょう", "start_ms": 117960, "end_ms": 118760, "roles": []},
+                    {"surface": " ", "ruby": None, "start_ms": None, "end_ms": None, "roles": []},
+                    {"surface": "留", "ruby": "とど", "start_ms": 119540, "end_ms": 119880, "roles": []},
+                ],
+            }],
+        },
+    }
+
+    assert document_to_lrc(document) == (
+        "[01:57.96]{日常|にちじょう}[01:58.76] [01:59.54]{留|とど}[02:00.00]"
+    )

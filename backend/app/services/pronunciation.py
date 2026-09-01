@@ -317,17 +317,10 @@ def run_ai_pronunciation(
     profile_id = profile_id or database.settings().get("default_ai_profile_id")
     profile = database.get_ai_profile(profile_id) if profile_id else None
     app_settings = database.settings()
-    fallback = str(app_settings.get("ai_failure_mode", "auto_local")) == "auto_local"
     if not profile:
-        if fallback:
-            updated, summary = apply_local(document, selection, fallback=True)
-            return updated, {**summary, "fallback_reason": "未配置 AI profile"}
         raise PronunciationValidationError("尚未配置 AI 注音 profile")
     key = SecretStore(settings.data_dir).decrypt(database.get_ai_profile_secret(profile["id"]))
     if not key:
-        if fallback:
-            updated, summary = apply_local(document, selection, fallback=True)
-            return updated, {**summary, "fallback_reason": "AI profile 未配置密钥"}
         raise PronunciationValidationError("AI profile 未配置密钥")
     lines = document.get("lyrics", {}).get("lines", [])
     current_lines = [{"line_index": index, "text": "".join(unit.get("surface", "") for unit in line.get("units", []))} for index, line in enumerate(lines)]
@@ -377,26 +370,23 @@ def run_ai_pronunciation(
                 progress_callback((batch_index + 1) / total, f"AI 注音：第 {batch_index + 1}/{total} 批完成")
         selected_line_ids = set(selection.line_ids)
         selected_unit_ids = set(selection.unit_ids)
-        fallback_line_ids = [
+        failed_line_ids = [
             lines[index]["id"]
             for index in sorted(invalid_line_indices)
             if not (selected_line_ids or selected_unit_ids)
             or lines[index]["id"] in selected_line_ids
             or any(unit["id"] in selected_unit_ids for unit in lines[index].get("units", []))
         ]
-        if fallback_line_ids:
-            updated, local_summary = apply_local(document, PronunciationSelection(fallback_line_ids, [], selection.overwrite_policy), fallback=True)
-        else:
-            updated, local_summary = document, {"applied": 0}
-        updated, summary = apply_ai(updated, result, selection)
+        if failed_line_ids:
+            raise PronunciationValidationError(
+                f"AI 注音有 {len(failed_line_ids)} 行校验失败，未写入任何结果"
+            )
+        updated, summary = apply_ai(document, result, selection)
         updated.setdefault("pronunciation", {})["last_run"] = {"mode": "ai", "applied": summary["applied"]}
         if progress_callback:
             progress_callback(1.0, "AI 注音完成")
-        return updated, {**summary, "batch_count": len(line_batches), "retry_count": retries_used, "local_fallback_lines": len(fallback_line_ids), "local_fallback_applied": local_summary["applied"], "raw_mismatch_lines": len(raw_mismatch_line_indices)}
+        return updated, {**summary, "batch_count": len(line_batches), "retry_count": retries_used, "raw_mismatch_lines": len(raw_mismatch_line_indices)}
     except AI_REQUEST_ERRORS as exc:
-        if fallback:
-            updated, summary = apply_local(document, selection, fallback=True)
-            if progress_callback:
-                progress_callback(1.0, f"AI 不可用，已降级本地注音：{str(exc)[:100]}")
-            return updated, {**summary, "fallback_reason": str(exc)[:200]}
-        raise
+        if isinstance(exc, PronunciationValidationError):
+            raise
+        raise PronunciationValidationError(f"AI 注音请求失败：{str(exc)[:200]}") from exc
