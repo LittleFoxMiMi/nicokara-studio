@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { ArrowLeft, Cpu, KeyRound, Save, Send } from "lucide-react";
+import { ArrowLeft, Cpu, KeyRound, MemoryStick, Save, Send } from "lucide-react";
 import { api } from "./editor-types";
 import { EditorPage } from "./editor-page";
 import { ProjectList } from "./project-list";
@@ -139,10 +139,37 @@ function App() {
   const [hash, setHash] = useState(location.hash);
   useEffect(() => { const update = () => setHash(location.hash); addEventListener("hashchange", update); return () => removeEventListener("hashchange", update); }, []);
   const path = hash.replace(/^#/, "") || "/projects";
-  if (path.startsWith("/settings")) return <SettingsPage />;
   const match = path.match(/^\/projects\/([^/]+)\/editor/);
-  if (match) return <EditorPage id={match[1]} />;
-  return <ProjectList />;
+  const page = path.startsWith("/settings") ? <SettingsPage /> : match ? <EditorPage id={match[1]} /> : <ProjectList />;
+  return <>{page}<ModelReleaseFab /></>;
+}
+
+type ResidentModel = { loaded: boolean; key: string | null; label: string | null; loaded_at: string | null };
+
+function ModelReleaseFab() {
+  const [model, setModel] = useState<ResidentModel>({ loaded: false, key: null, label: null, loaded_at: null });
+  const [releasing, setReleasing] = useState(false);
+  useEffect(() => {
+    let active = true;
+    const refresh = () => void api<ResidentModel>("/models/resident").then((value) => active && setModel(value)).catch(() => active && setModel({ loaded: false, key: null, label: null, loaded_at: null }));
+    refresh();
+    const timer = window.setInterval(refresh, 2500);
+    return () => { active = false; window.clearInterval(timer); };
+  }, []);
+  async function release() {
+    if (!model.loaded || releasing) return;
+    setReleasing(true);
+    try {
+      const next = await api<ResidentModel>("/models/resident", { method: "DELETE" });
+      setModel(next);
+    } catch {
+      // A running analysis owns the model; polling will keep the button current.
+    } finally {
+      setReleasing(false);
+    }
+  }
+  const title = model.loaded ? `释放内存中的 ${model.label || "模型"}` : "当前没有驻留模型";
+  return <button className={`fab model-fab ${model.loaded ? "loaded" : ""}`} type="button" title={title} aria-label={title} disabled={!model.loaded || releasing} onClick={() => void release()}><MemoryStick size={22} /></button>;
 }
 
 createRoot(document.getElementById("root")!).render(<React.StrictMode><App /></React.StrictMode>);

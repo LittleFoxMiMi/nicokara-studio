@@ -276,6 +276,18 @@ def test_stable_global_and_word_alignment_are_separate_and_use_ai_reading(tmp_pa
     assert refine_summary["segment_padding_seconds"] == 2.0
     assert refined["lyrics"]["lines"][0]["units"][0]["timing_source"] == "stable_ts"
 
+    local_refined, local_summary = aligner.align_words(
+        global_aligned,
+        tmp_path / "line.wav",
+        line_ids=["line-1"],
+        segment_padding_seconds=0,
+        time_offset_ms=1000,
+    )
+    assert calls[2][1][0]["start"] == 0.0
+    assert calls[2][1][0]["end"] == 0.2
+    assert local_refined["lyrics"]["lines"][0]["units"][0]["start_ms"] == 2000
+    assert local_summary["time_offset_ms"] == 1000
+
 
 def test_stable_word_alignment_requires_global_ranges(tmp_path, monkeypatch) -> None:
     monkeypatch.setitem(__import__("sys").modules, "stable_whisper", SimpleNamespace(alignment=SimpleNamespace()))

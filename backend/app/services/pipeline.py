@@ -12,7 +12,7 @@ from app.core.config import Settings
 from app.core.database import Database
 from app.media.waveform import generate_waveform
 from app.services.alignment import AlignmentQualityError
-from app.services.audio import AudioProcessingError, prepare_source_audio
+from app.services.audio import AudioProcessingError, extract_audio_clip, prepare_source_audio
 from app.services.cancellation import OperationCanceled
 from app.services.pronunciation import PronunciationSelection, PronunciationValidationError, apply_local, run_ai_pronunciation
 from app.services.separation import Kara2Separator
@@ -20,6 +20,7 @@ from app.services.stable_ts import StableTSAligner, StableTSAlignmentError, roug
 from app.services.fa_kara import FAKaraAligner
 from app.services.transcription import FasterWhisperTranscriber, Transcript, TranscriptSegment, TranscriptWord
 from app.services.kirakara_export import ExportCanceled, ExportError, run_kirakara_export
+from app.services.model_runtime import ResidentModelStore
 
 
 logger = logging.getLogger(__name__)
@@ -45,11 +46,12 @@ STEP_LABELS = {
 
 
 class AnalysisPipeline:
-    def __init__(self, settings: Settings, database: Database) -> None:
+    def __init__(self, settings: Settings, database: Database, model_store: ResidentModelStore | None = None) -> None:
         self.settings = settings
         self.database = database
-        self.separator = Kara2Separator(settings.models_dir / "separator", settings.ffmpeg_path)
-        self.transcriber = FasterWhisperTranscriber(download_root=settings.models_dir / "whisper")
+        self.model_store = model_store or ResidentModelStore()
+        self.separator = Kara2Separator(settings.models_dir / "separator", settings.ffmpeg_path, model_store=self.model_store)
+        self.transcriber = FasterWhisperTranscriber(download_root=settings.models_dir / "whisper", model_store=self.model_store)
 
     def _step(self, job_id: str, key: str, progress: float, message: str, *, status: str | None = None) -> None:
         job = self.database.get_job(job_id)
@@ -208,8 +210,22 @@ class AnalysisPipeline:
             raise AudioProcessingError("请先完成 KARA2 人声分离")
         model_name = payload.get("whisper_model") or payload.get("model") or values.get("whisper_model") or self.settings.whisper_model
         stable = self._stable_aligner(job_id, "alignment", model_name, values)
+        line_ids = payload.get("line_ids") or None
         segment_padding = float(values.get("stable_ts_segment_padding_seconds", 2.0))
-        updated, summary = stable.align_words(document, audio, line_ids=payload.get("line_ids") or None, overwrite_locked=payload.get("overwrite_policy") == "all", segment_padding_seconds=segment_padding, progress_callback=lambda value, message: self._step(job_id, "alignment", value, message))
+        clip_path, time_offset = self._single_line_clip(job_id, document, derived, audio, line_ids)
+        try:
+            updated, summary = stable.align_words(
+                document,
+                clip_path or audio,
+                line_ids=line_ids,
+                overwrite_locked=payload.get("overwrite_policy") == "all",
+                segment_padding_seconds=0.0 if clip_path else segment_padding,
+                time_offset_ms=time_offset,
+                progress_callback=lambda value, message: self._step(job_id, "alignment", value, message),
+            )
+        finally:
+            if clip_path:
+                clip_path.unlink(missing_ok=True)
         updated.setdefault("analysis", {})["alignment"] = {"status": "completed", "job_id": job_id, **summary}
         updated, revision = self._save(project_id, updated, revision)
         self._step(job_id, "alignment", 1.0, "stable-ts 词/短语精修完成")
@@ -231,18 +247,47 @@ class AnalysisPipeline:
             model_name=model_name,
         )
         result_path = derived / "fa_kara.json"
-        updated, summary = aligner.align(
-            document,
-            audio,
-            line_ids=payload.get("line_ids") or None,
-            overwrite_locked=payload.get("overwrite_policy") == "all",
-            result_path=result_path,
-            progress_callback=lambda value, message: self._step(job_id, "fa_kara", 0.1 + value * 0.88, message),
-        )
+        line_ids = payload.get("line_ids") or None
+        clip_path, time_offset = self._single_line_clip(job_id, document, derived, audio, line_ids)
+        try:
+            updated, summary = aligner.align(
+                document,
+                clip_path or audio,
+                line_ids=line_ids,
+                overwrite_locked=payload.get("overwrite_policy") == "all",
+                result_path=result_path,
+                time_offset_ms=time_offset,
+                progress_callback=lambda value, message: self._step(job_id, "fa_kara", 0.1 + value * 0.88, message),
+            )
+        finally:
+            if clip_path:
+                clip_path.unlink(missing_ok=True)
         updated.setdefault("analysis", {})["fa_kara"] = {"status": "completed", "job_id": job_id, **summary}
         updated, revision = self._save(project_id, updated, revision)
         self._step(job_id, "fa_kara", 1.0, "FA-Kara 对齐完成")
         return updated, revision, summary | {"output_revision": revision}
+
+    def _single_line_clip(
+        self,
+        job_id: str,
+        document: dict,
+        derived: Path,
+        audio: Path,
+        line_ids: list[str] | None,
+    ) -> tuple[Path | None, int]:
+        if not line_ids or len(line_ids) != 1:
+            return None, 0
+        line = next((item for item in document.get("lyrics", {}).get("lines", []) if item.get("id") == line_ids[0]), None)
+        if not line:
+            raise AudioProcessingError("局部识别范围包含未知歌词行")
+        start_ms, end_ms = line.get("start_ms"), line.get("end_ms")
+        if start_ms is None or end_ms is None or int(end_ms) <= int(start_ms):
+            raise AudioProcessingError("请先调整整句歌词的开始和结束时间")
+        start_ms, end_ms = int(start_ms), int(end_ms)
+        clip_path = derived / f"line_alignment_{job_id}.wav"
+        self._step(job_id, "alignment" if "STABLE" in str(self.database.get_job(job_id).get("type", "")) else "fa_kara", 0.01, "正在截取单句人声音频")
+        extract_audio_clip(audio, clip_path, self.settings.ffmpeg_path, start_ms, end_ms)
+        return clip_path, start_ms
 
     def _export(self, job_id: str, project_id: str, document: dict, payload: dict) -> dict:
         return run_kirakara_export(

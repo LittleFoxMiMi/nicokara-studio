@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.services.cancellation import run_cancelable
+from app.services.model_runtime import ResidentModelStore
 
 
 @dataclass(frozen=True)
@@ -38,12 +39,10 @@ class Transcript:
 
 
 class FasterWhisperTranscriber:
-    def __init__(self, model_factory: Callable[[str, str, str], Any] | None = None, download_root: Path | None = None) -> None:
+    def __init__(self, model_factory: Callable[[str, str, str], Any] | None = None, download_root: Path | None = None, model_store: ResidentModelStore | None = None) -> None:
         self.model_factory = model_factory
         self.download_root = download_root
-        self._models: dict[tuple[str, str, str], Any] = {}
-        self._stable_models: dict[tuple[str, str, str], Any] = {}
-        self._fa_kara_models: dict[tuple[str, str], tuple[Any, Any]] = {}
+        self.model_store = model_store or ResidentModelStore()
 
     def get_model(
         self,
@@ -57,34 +56,32 @@ class FasterWhisperTranscriber:
         resolved_device = "cpu"
         resolved_compute = "int8"
         key = (model_name, resolved_device, resolved_compute)
-        model = self._models.get(key)
-        if model is None:
+        def load_model() -> Any:
             if progress_callback:
                 progress_callback(0.0, "正在下载或加载 Whisper 模型")
             if self.model_factory:
-                model = run_cancelable(
+                return run_cancelable(
                     lambda: self.model_factory(*key),
                     should_cancel,
                 )
-            else:
-                try:
-                    from faster_whisper import WhisperModel
-                except ImportError as exc:
-                    raise RuntimeError("faster-whisper 尚未安装") from exc
-                if self.download_root:
-                    self.download_root.mkdir(parents=True, exist_ok=True)
-                model = run_cancelable(
-                    lambda: WhisperModel(
-                        model_name,
-                        device=resolved_device,
-                        compute_type=resolved_compute,
-                        download_root=str(self.download_root) if self.download_root else None,
-                    ),
-                    should_cancel,
-                )
-            self._models[key] = model
-            if progress_callback:
-                progress_callback(1.0, "Whisper 模型已就绪")
+            try:
+                from faster_whisper import WhisperModel
+            except ImportError as exc:
+                raise RuntimeError("faster-whisper 尚未安装") from exc
+            if self.download_root:
+                self.download_root.mkdir(parents=True, exist_ok=True)
+            return run_cancelable(
+                lambda: WhisperModel(
+                    model_name,
+                    device=resolved_device,
+                    compute_type=resolved_compute,
+                    download_root=str(self.download_root) if self.download_root else None,
+                ),
+                should_cancel,
+            )
+        model = self.model_store.get_or_load(f"whisper:{':'.join(key)}", f"Whisper {model_name}", load_model)
+        if progress_callback:
+            progress_callback(1.0, "Whisper 模型已就绪")
         return model
 
     def transcribe(
@@ -145,27 +142,25 @@ class FasterWhisperTranscriber:
         resolved_device = "cpu"
         resolved_compute = "int8"
         key = (model_name, resolved_device, resolved_compute)
-        model = self._stable_models.get(key)
-        if model is not None:
-            return model
-        if progress_callback:
-            progress_callback(0.0, "正在加载 stable-ts faster-whisper 模型")
-        try:
-            import stable_whisper
-        except ImportError as exc:
-            raise RuntimeError("stable-ts 尚未安装") from exc
-        if self.download_root:
-            self.download_root.mkdir(parents=True, exist_ok=True)
-        model = run_cancelable(
-            lambda: stable_whisper.load_faster_whisper(
-                model_name,
-                device=resolved_device,
-                compute_type=resolved_compute,
-                download_root=str(self.download_root) if self.download_root else None,
-            ),
-            should_cancel,
-        )
-        self._stable_models[key] = model
+        def load_model() -> Any:
+            if progress_callback:
+                progress_callback(0.0, "正在加载 stable-ts faster-whisper 模型")
+            try:
+                import stable_whisper
+            except ImportError as exc:
+                raise RuntimeError("stable-ts 尚未安装") from exc
+            if self.download_root:
+                self.download_root.mkdir(parents=True, exist_ok=True)
+            return run_cancelable(
+                lambda: stable_whisper.load_faster_whisper(
+                    model_name,
+                    device=resolved_device,
+                    compute_type=resolved_compute,
+                    download_root=str(self.download_root) if self.download_root else None,
+                ),
+                should_cancel,
+            )
+        model = self.model_store.get_or_load(f"stable-ts:{':'.join(key)}", f"stable-ts {model_name}", load_model)
         if progress_callback:
             progress_callback(1.0, "stable-ts faster-whisper 模型已就绪")
         return model
@@ -187,10 +182,13 @@ class FasterWhisperTranscriber:
         except ImportError as exc:
             raise RuntimeError("FA-Kara 需要 torch 和 torchaudio") from exc
         resolved_device = "cuda" if device in {"auto", "cuda"} and torch.cuda.is_available() else "cpu"
-        key = (model_name, resolved_device)
-        cached = self._fa_kara_models.get(key)
-        if cached is not None:
-            return cached
+        cached_key = f"fa-kara:{model_name}:{resolved_device}"
+        current = self.model_store.status()
+        if current.get("key") == cached_key:
+            return self.model_store.get_or_load(cached_key, f"FA-Kara {model_name}", lambda: None)
+        # FA-Kara's loaders allocate their weights before returning a model, so
+        # explicitly clear the previous backend before starting the new load.
+        self.model_store.release()
         if model_name == "mms":
             if progress_callback:
                 progress_callback(0.0, "正在下载或加载 FA-Kara MMS_FA 模型")
@@ -269,7 +267,7 @@ class FasterWhisperTranscriber:
 
             model = YoHaneModel().to(resolved_device).eval()
             ready_message = "FA-Kara YoHane 微调模型已就绪"
-        self._fa_kara_models[key] = (model, bundle)
+        cached = self.model_store.get_or_load(cached_key, f"FA-Kara {model_name}", lambda: (model, bundle))
         if progress_callback:
             progress_callback(1.0, ready_message)
-        return model, bundle
+        return cached

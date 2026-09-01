@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from app.services.audio import AudioProcessingError, convert_audio
 from app.services.cancellation import OperationCanceled, run_cancelable
+from app.services.model_runtime import ResidentModelStore
 
 DEFAULT_MODEL = "UVR_MDXNET_KARA_2.onnx"
 
@@ -35,11 +36,13 @@ class Kara2Separator:
         *,
         separator_factory: Callable[..., Any] | None = None,
         providers_factory: Callable[[], list[str]] | None = None,
+        model_store: ResidentModelStore | None = None,
     ) -> None:
         self.model_dir = model_dir
         self.ffmpeg = ffmpeg
         self.separator_factory = separator_factory
         self.providers_factory = providers_factory
+        self.model_store = model_store or ResidentModelStore()
         self._lock = threading.Lock()
 
     def _available_providers(self) -> list[str]:
@@ -78,20 +81,22 @@ class Kara2Separator:
             path.unlink(missing_ok=True)
         try:
             with self._lock:
-                separator = factory(
-                    model_file_dir=str(self.model_dir),
-                    output_dir=str(derived_dir),
-                    output_format="WAV",
-                    use_directml=provider == "DmlExecutionProvider",
-                )
-                # audio-separator 0.44 requires torch-directml before it selects the
-                # ONNX DML provider, although MDX/KARA2 inference itself is ONNX.
-                if provider == "DmlExecutionProvider":
-                    separator.onnx_execution_provider = ["DmlExecutionProvider"]
-                run_cancelable(
-                    lambda: separator.load_model(model_filename=model),
-                    should_cancel,
-                )
+                def load_separator() -> Any:
+                    loaded = factory(
+                        model_file_dir=str(self.model_dir),
+                        output_dir=str(derived_dir),
+                        output_format="WAV",
+                        use_directml=provider == "DmlExecutionProvider",
+                    )
+                    # audio-separator 0.44 requires torch-directml before it selects
+                    # the ONNX DML provider, although MDX inference itself is ONNX.
+                    if provider == "DmlExecutionProvider":
+                        loaded.onnx_execution_provider = ["DmlExecutionProvider"]
+                    run_cancelable(lambda: loaded.load_model(model_filename=model), should_cancel)
+                    return loaded
+
+                runtime_key = f"kara2:{model}:{provider}:{derived_dir.resolve()}"
+                separator = self.model_store.get_or_load(runtime_key, f"KARA2 {model}", load_separator)
                 if progress_callback:
                     progress_callback(0.42, "KARA2 模型已就绪，正在分离人声")
                 outputs = separator.separate(

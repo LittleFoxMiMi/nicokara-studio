@@ -88,6 +88,12 @@ def test_fa_kara_uses_ai_ruby_and_converts_to_romaji(tmp_path, monkeypatch):
     assert updated["lyrics"]["lines"][0]["units"][0]["timing_source"] == "fa_kara"
     assert updated["lyrics"]["lines"][0]["units"][0]["end_ms"] > 0
 
+    offset_updated, offset_summary = FAKaraAligner(lambda: (FakeModel(), FakeBundle())).align(
+        document, audio, time_offset_ms=5000
+    )
+    assert offset_updated["lyrics"]["lines"][0]["units"][0]["start_ms"] >= 5000
+    assert offset_summary["time_offset_ms"] == 5000
+
     missing = {"lyrics": {"lines": [{"id": "line", "units": [{"surface": "昨日", "ruby": None}]}]}}
     with pytest.raises(FAKaraAlignmentError, match="AI 注音"):
         FAKaraAligner(lambda: (FakeModel(), FakeBundle())).align(missing, audio)

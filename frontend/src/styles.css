@@ -315,6 +315,22 @@ button {
   box-shadow: 0 4px 14px #1a73e84d;
   z-index: 4;
 }
+.fab.model-fab {
+  right: auto;
+  left: 26px;
+  border: 0;
+  background: #e3e3e3;
+  color: #80868b;
+  box-shadow: none;
+}
+.fab.model-fab.loaded {
+  background: #0b57d0;
+  color: #fff;
+  box-shadow: 0 4px 14px #0b57d04d;
+}
+.model-fab:disabled {
+  cursor: default;
+}
 .editor {
   padding: 22px 28px 32px;
   max-width: 1500px;

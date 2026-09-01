@@ -33,3 +33,25 @@ def prepare_source_audio(video: Path, derived_dir: Path, ffmpeg: str) -> tuple[P
     if not asr.is_file() or asr.stat().st_size == 0:
         convert_audio(source, asr, ffmpeg, channels=1, sample_rate=16000)
     return source, asr
+
+
+def extract_audio_clip(source: Path, target: Path, ffmpeg: str, start_ms: int, end_ms: int) -> None:
+    if end_ms <= start_ms:
+        raise AudioProcessingError("局部识别结束时间必须晚于开始时间")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.unlink(missing_ok=True)
+    try:
+        subprocess.run(
+            [
+                ffmpeg, "-y", "-ss", f"{start_ms / 1000:.3f}", "-i", str(source),
+                "-t", f"{(end_ms - start_ms) / 1000:.3f}", "-vn", "-c:a", "pcm_s16le", str(target),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=1800,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        target.unlink(missing_ok=True)
+        raise AudioProcessingError("FFmpeg 无法截取单句识别音频") from exc
+    if not target.is_file() or target.stat().st_size == 0:
+        raise AudioProcessingError("FFmpeg 生成了空的单句识别音频")

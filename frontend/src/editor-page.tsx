@@ -12,6 +12,7 @@ import {
   RotateCcw,
   Redo2,
   Save,
+  Scissors,
   Square,
   Trash2,
   Undo2,
@@ -40,6 +41,20 @@ function settingsHref() {
 }
 function clone<T>(value: T): T {
   return structuredClone(value);
+}
+
+function createClientId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, "0"));
+    return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10).join("")}`;
+  }
+  return `local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }
 
 function updateUnit(
@@ -96,6 +111,26 @@ function updateLineTiming(
             }
           : line,
       ),
+    },
+  };
+}
+
+function collapseLineTiming(document: ProjectDocument, lineId: string): ProjectDocument {
+  return {
+    ...document,
+    lyrics: {
+      ...document.lyrics,
+      lines: document.lyrics.lines.map((line) => {
+        if (line.id !== lineId) return line;
+        const timed = line.units.filter((unit) => unit.start_ms !== null && unit.end_ms !== null);
+        return {
+          ...line,
+          start_ms: line.start_ms ?? (timed.length ? Math.min(...timed.map((unit) => unit.start_ms as number)) : null),
+          end_ms: line.end_ms ?? (timed.length ? Math.max(...timed.map((unit) => unit.end_ms as number)) : null),
+          timing_source: "manual",
+          timing_precision: "line",
+        };
+      }),
     },
   };
 }
@@ -185,6 +220,166 @@ function placeLineAt(
       }),
     },
   };
+}
+
+type UnitSplitRange = { start: number; end: number };
+
+function mergeSplitRange(ranges: UnitSplitRange[], start: number, end: number): UnitSplitRange[] {
+  const next: UnitSplitRange[] = [];
+  let inserted = false;
+  for (const range of ranges) {
+    if (range.end <= start || range.start >= end) {
+      next.push(range);
+      continue;
+    }
+    if (range.start < start) next.push({ start: range.start, end: start });
+    if (!inserted) {
+      next.push({ start, end });
+      inserted = true;
+    }
+    if (range.end > end) next.push({ start: end, end: range.end });
+  }
+  return next.sort((left, right) => left.start - right.start);
+}
+
+function splitLyricUnit(
+  document: ProjectDocument,
+  lineId: string,
+  unitId: string,
+  ranges: UnitSplitRange[],
+): ProjectDocument {
+  return {
+    ...document,
+    lyrics: {
+      ...document.lyrics,
+      lines: document.lyrics.lines.map((line) => {
+        if (line.id !== lineId) return line;
+        const original = line.units.find((unit) => unit.id === unitId);
+        if (!original) return line;
+        const characters = Array.from(original.surface);
+        const duration = original.start_ms !== null && original.end_ms !== null
+          ? original.end_ms - original.start_ms
+          : null;
+        const splitUnits = ranges.map((range, index): LyricUnit => {
+          const first = index === 0;
+          const hasRuby = Boolean(original.ruby || original.ruby_2);
+          const unit: LyricUnit = {
+            ...original,
+            id: first ? original.id : createClientId(),
+            surface: characters.slice(range.start, range.end).join(""),
+            start_ms: duration === null ? null : Math.round((original.start_ms as number) + duration * range.start / characters.length),
+            end_ms: duration === null ? null : Math.round((original.start_ms as number) + duration * range.end / characters.length),
+            timing_source: ranges.length > 1 ? "estimated" : original.timing_source,
+            timing_confidence: ranges.length > 1 ? null : original.timing_confidence,
+            ruby: first ? original.ruby : null,
+            ruby_2: first ? original.ruby_2 : null,
+            ruby_source: first ? original.ruby_source : "none",
+          };
+          if (first && hasRuby) unit.ruby_span = Math.max(Number(original.ruby_span || 1), characters.length);
+          else if (!first) unit.ruby_span = undefined;
+          return unit;
+        });
+        const units = line.units.flatMap((unit) => unit.id === unitId ? splitUnits : [unit]);
+        return {
+          ...line,
+          units,
+          timing_precision: ranges.length > 1 ? "phrase" : line.timing_precision,
+        };
+      }),
+    },
+  };
+}
+
+function UnitSplitDialog({ unit, onClose, onConfirm }: {
+  unit: LyricUnit;
+  onClose: () => void;
+  onConfirm: (ranges: UnitSplitRange[]) => void;
+}) {
+  const characters = useMemo(() => Array.from(unit.surface), [unit.surface]);
+  const [ranges, setRanges] = useState<UnitSplitRange[]>(() => characters.map((_, index) => ({ start: index, end: index + 1 })));
+  const [history, setHistory] = useState<UnitSplitRange[][]>([]);
+  const [selection, setSelection] = useState<UnitSplitRange | null>(null);
+  const [confirmError, setConfirmError] = useState<string | null>(null);
+  const dragAnchorRef = useRef<number | null>(null);
+  const selectedRange = selection
+    ? { start: Math.min(selection.start, selection.end), end: Math.max(selection.start, selection.end) + 1 }
+    : null;
+  const alreadyGrouped = selectedRange
+    ? ranges.some((range) => range.start === selectedRange.start && range.end === selectedRange.end)
+    : false;
+
+  function characterIndexAt(clientX: number, clientY: number): number | null {
+    const element = document.elementFromPoint(clientX, clientY)?.closest<HTMLElement>("[data-split-index]");
+    if (!element) return null;
+    const index = Number(element.dataset.splitIndex);
+    return Number.isInteger(index) ? index : null;
+  }
+  function groupSelection() {
+    if (!selectedRange || selectedRange.end - selectedRange.start < 2 || alreadyGrouped) return;
+    setHistory((current) => [...current, ranges]);
+    setRanges(mergeSplitRange(ranges, selectedRange.start, selectedRange.end));
+    setSelection(null);
+  }
+  function undoLocal() {
+    const previous = history[history.length - 1];
+    if (!previous) return;
+    setRanges(previous);
+    setHistory((current) => current.slice(0, -1));
+    setSelection(null);
+  }
+  function confirmSplit() {
+    setConfirmError(null);
+    try {
+      onConfirm(ranges);
+    } catch (reason) {
+      setConfirmError(reason instanceof Error ? reason.message : "无法应用拆分，请重试。");
+    }
+  }
+
+  return <div className="scrim">
+    <section className="dialog unit-split-dialog" role="dialog" aria-modal="true" aria-labelledby="unit-split-title">
+      <div className="dialog-head">
+        <div><h2 id="unit-split-title">拆分 Unit</h2><p className="muted">{unit.surface}</p></div>
+        <button className="icon-button" type="button" title="撤回上一次拆分" aria-label="撤回上一次拆分" disabled={!history.length} onClick={undoLocal}><Undo2 size={19} /></button>
+        <button className="icon-button" type="button" title="关闭" onClick={onClose}><X size={19} /></button>
+      </div>
+      <div
+        className="unit-split-grid"
+        onPointerDown={(event) => {
+          const index = characterIndexAt(event.clientX, event.clientY);
+          if (index === null) return;
+          event.currentTarget.setPointerCapture(event.pointerId);
+          dragAnchorRef.current = index;
+          setSelection({ start: index, end: index });
+        }}
+        onPointerMove={(event) => {
+          if (dragAnchorRef.current === null) return;
+          const index = characterIndexAt(event.clientX, event.clientY);
+          if (index !== null) setSelection({ start: dragAnchorRef.current, end: index });
+        }}
+        onPointerUp={(event) => {
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+          dragAnchorRef.current = null;
+        }}
+        onPointerCancel={() => { dragAnchorRef.current = null; }}
+      >
+        {ranges.map((range, groupIndex) => <span className={`unit-split-group ${range.end - range.start > 1 ? "combined" : ""}`} key={`${range.start}-${range.end}`}>
+          {characters.slice(range.start, range.end).map((character, offset) => {
+            const index = range.start + offset;
+            const selected = selectedRange && index >= selectedRange.start && index < selectedRange.end;
+            return <button type="button" tabIndex={-1} className={`unit-split-character ${selected ? "selected" : ""}`} data-split-index={index} key={`${groupIndex}-${index}`}>{character}</button>;
+          })}
+        </span>)}
+      </div>
+      <div className="unit-split-summary"><span>{selectedRange ? `已选 ${selectedRange.end - selectedRange.start} 字` : "未选择"}</span><strong>{ranges.length} Units</strong></div>
+      {confirmError && <div className="unit-split-error" role="alert"><AlertCircle size={16} />{confirmError}</div>}
+      <div className="dialog-actions unit-split-actions">
+        <button className="button tonal" type="button" disabled={!selectedRange || selectedRange.end - selectedRange.start < 2 || alreadyGrouped} onClick={groupSelection}><Scissors size={17} />拆分</button>
+        <button className="button filled" type="button" onClick={confirmSplit}><Check size={17} />确定</button>
+        <button className="button text" type="button" onClick={onClose}>取消</button>
+      </div>
+    </section>
+  </div>;
 }
 
 function UnitEditDialog({
@@ -411,7 +606,8 @@ export function EditorPage({ id }: { id: string }) {
   const [alignmentBackend, setAlignmentBackend] = useState<"fa_kara" | "stable_ts">("fa_kara");
   const [faKaraModel, setFaKaraModel] = useState<"mms" | "yohane">("mms");
   const [fullSteps, setFullSteps] = useState<Record<string, boolean>>({ separation: true, transcription: true, pronunciation: true, global_alignment: true, alignment: true });
-  const [lineMenu, setLineMenu] = useState<{ lineId: string; x: number; y: number } | null>(null);
+  const [lineMenu, setLineMenu] = useState<{ lineId: string; unitId: string | null; x: number; y: number } | null>(null);
+  const [splitTarget, setSplitTarget] = useState<{ lineId: string; unitId: string } | null>(null);
   const uploadRequest = useRef<XMLHttpRequest | null>(null),
     videoRef = useRef<HTMLVideoElement>(null);
   const appliedJobs = useRef(new Set<string>());
@@ -657,7 +853,7 @@ export function EditorPage({ id }: { id: string }) {
     const current = documentRef.current;
     if (!current) return;
     const existing = ((current.styles as { presets?: StylePreset[] } | undefined)?.presets || []).filter((preset) => preset.name !== name);
-    const preset: StylePreset = { id: crypto.randomUUID(), name, style: { ...subtitleStyle } };
+    const preset: StylePreset = { id: createClientId(), name, style: { ...subtitleStyle } };
     replaceDocument({ ...current, styles: { ...(current.styles || {}), presets: [...existing, preset] } }, true);
   }
   function seek(ms: number) {
@@ -849,7 +1045,10 @@ export function EditorPage({ id }: { id: string }) {
       return;
     }
     const analysis = (documentRef.current as ProjectDocument & { analysis?: Record<string, { status?: string }> }).analysis || {};
-    if (analysis.global_alignment?.status !== "completed") {
+    const scopedLine = lineIds?.length === 1
+      ? documentRef.current.lyrics.lines.find((line) => line.id === lineIds[0])
+      : null;
+    if (analysis.global_alignment?.status !== "completed" && !(scopedLine && scopedLine.start_ms !== null && scopedLine.end_ms !== null)) {
       setWorkflowNotice("请先完成 stable-ts 全局对齐，再运行词/短语精修。");
       return;
     }
@@ -868,6 +1067,14 @@ export function EditorPage({ id }: { id: string }) {
     } finally {
       setAnalysisStarting(false);
     }
+  }
+
+  function collapseLine(lineId: string) {
+    const current = documentRef.current;
+    if (!current) return;
+    beginEdit();
+    replaceDocument(collapseLineTiming(current, lineId), false);
+    setSelectedId(current.lyrics.lines.find((line) => line.id === lineId)?.units[0]?.id || null);
   }
 
   async function startFaKara(lineIds?: string[]) {
@@ -1329,7 +1536,7 @@ export function EditorPage({ id }: { id: string }) {
                     onContextMenu={(event) => {
                       event.preventDefault();
                       if (!hasVideo || activeJob) return;
-                      setLineMenu({ lineId: line.id, x: event.clientX, y: event.clientY });
+                      setLineMenu({ lineId: line.id, unitId: null, x: event.clientX, y: event.clientY });
                     }}
                     onDragStart={(event) => {
                       event.dataTransfer.effectAllowed = "move";
@@ -1407,6 +1614,9 @@ export function EditorPage({ id }: { id: string }) {
           }}
           onOpenEditor={setEditingId}
           onDropLine={placeLine}
+          onOpenContextMenu={(lineId, unitId, lineLevel, x, y) => {
+            if (!activeJob) setLineMenu({ lineId, unitId: lineLevel ? null : unitId, x, y });
+          }}
         />
       </main>
       <a className="fab" title="设置" href={settingsHref()}>
@@ -1432,17 +1642,31 @@ export function EditorPage({ id }: { id: string }) {
           }}
         />
       )}
+      {splitTarget && (() => {
+        const target = lines.find((line) => line.id === splitTarget.lineId)?.units.find((unit) => unit.id === splitTarget.unitId);
+        if (!target) return null;
+        return <UnitSplitDialog unit={target} onClose={() => setSplitTarget(null)} onConfirm={(ranges) => {
+          const current = documentRef.current;
+          const owner = current?.lyrics.lines.find((line) => line.id === splitTarget.lineId);
+          if (!current || !owner?.units.some((unit) => unit.id === splitTarget.unitId)) {
+            throw new Error("工程内容已发生变化，请关闭后重新打开拆分页面。");
+          }
+          replaceDocument(splitLyricUnit(current, splitTarget.lineId, splitTarget.unitId, ranges), true);
+          setSelectedId(splitTarget.unitId);
+          setSplitTarget(null);
+        }} />;
+      })()}
       {lineMenu && (() => {
         const index = lines.findIndex((line) => line.id === lineMenu.lineId);
-        const remaining = lines.slice(index).map((line) => line.id);
+        const menuLine = lines[index];
+        const menuUnit = lineMenu.unitId ? menuLine?.units.find((unit) => unit.id === lineMenu.unitId) : null;
         return <div className="line-context-menu" style={{ left: lineMenu.x, top: lineMenu.y }} onPointerDown={(event) => event.stopPropagation()}>
-          <strong>分析范围</strong>
-          <button onClick={() => { setLineMenu(null); void startTranscription([lineMenu.lineId]); }}>当前行</button>
-          <button onClick={() => { setLineMenu(null); void startTranscription(remaining); }}>从此处到结尾</button>
-          <button onClick={() => { setLineMenu(null); void startTranscription(); }}>全曲</button>
-          {alignmentBackend === "fa_kara"
-            ? <button onClick={() => { setLineMenu(null); void startFaKara([lineMenu.lineId]); }}>FA-Kara 对齐当前行</button>
-            : <button onClick={() => { setLineMenu(null); void startAlignment([lineMenu.lineId]); }}>词/短语精修当前行</button>}
+          <strong>时间单元</strong>
+          <button disabled={menuLine?.timing_precision === "line"} onClick={() => { setLineMenu(null); collapseLine(lineMenu.lineId); }}>还原为整句时间单元</button>
+          <button disabled={menuLine?.start_ms === null || menuLine?.end_ms === null} onClick={() => { setLineMenu(null); alignmentBackend === "fa_kara" ? void startFaKara([lineMenu.lineId]) : void startAlignment([lineMenu.lineId]); }}>
+            {alignmentBackend === "fa_kara" ? "用 FA-Kara 重新识别此句" : "用 stable-ts 重新识别此句"}
+          </button>
+          {menuUnit && Array.from(menuUnit.surface).length > 1 && <button onClick={() => { setLineMenu(null); setSplitTarget({ lineId: lineMenu.lineId, unitId: menuUnit.id }); }}><Scissors size={15} />拆分此 Unit</button>}
         </div>;
       })()}
       {fullAnalysisOpen && (

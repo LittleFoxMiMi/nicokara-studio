@@ -5,6 +5,7 @@ import {
   Play,
   Plus,
   Rewind,
+  MoveHorizontal,
   ZoomIn,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -97,6 +98,7 @@ export function TimelineCanvas({
   onUpdateRubyGroup,
   onOpenEditor,
   onDropLine,
+  onOpenContextMenu,
 }: {
   projectId: string;
   waveformSource: string;
@@ -120,6 +122,7 @@ export function TimelineCanvas({
   onUpdateRubyGroup: (lineId: string, unitIds: string[], ruby: string, rubySpan: number, clearUnitIds: string[]) => void;
   onOpenEditor: (id: string) => void;
   onDropLine: (lineId: string, startMs: number) => void;
+  onOpenContextMenu: (lineId: string, unitId: string, lineLevel: boolean, x: number, y: number) => void;
 }) {
   const canvasRefs = useRef<(HTMLCanvasElement | null)[]>([]);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -137,6 +140,7 @@ export function TimelineCanvas({
   const [waveform, setWaveform] = useState<Waveform | null>(null);
   const [waveformError, setWaveformError] = useState(false);
   const [rubyAdjustEnabled, setRubyAdjustEnabled] = useState(false);
+  const [unitTimeAdjustEnabled, setUnitTimeAdjustEnabled] = useState(false);
   const [zoom, setZoom] = useState(() => savedTimeline?.zoom ?? 80);
   const zoomRef = useRef(zoom);
   const scrollLeftRef = useRef(savedTimeline?.scrollLeft ?? 0);
@@ -556,6 +560,7 @@ export function TimelineCanvas({
       .find((hit) => x >= hit.x1 - 4 && x <= hit.x2 + 4 && y >= hit.y1 - 4 && y <= hit.y2 + 4);
   }
   function pointerDown(event: React.PointerEvent<HTMLCanvasElement>) {
+    if (event.button !== 0) return;
     const { x, y } = point(event);
     const rubyEdge = rubyAdjustEnabled && rubyGroupsRef.current.find((group) => y >= group.y1 - 8 && y <= group.y2 + 8 && (Math.abs(x - group.x1) <= 8 || Math.abs(x - group.x2) <= 8));
     if (rubyEdge) {
@@ -587,9 +592,9 @@ export function TimelineCanvas({
     dragRef.current = {
       hit,
       mode:
-        Math.abs(x - hit.x1) <= edge
+        unitTimeAdjustEnabled && Math.abs(x - hit.x1) <= edge
           ? "start"
-          : Math.abs(x - hit.x2) <= edge
+          : unitTimeAdjustEnabled && Math.abs(x - hit.x2) <= edge
             ? "end"
             : "move",
       clientX: event.clientX,
@@ -703,6 +708,15 @@ export function TimelineCanvas({
     }
   }
 
+  function contextMenu(event: React.MouseEvent<HTMLCanvasElement>) {
+    const { x, y } = point(event as unknown as React.PointerEvent<HTMLCanvasElement>);
+    const hit = hitAt(x, y);
+    if (!hit) return;
+    event.preventDefault();
+    onSelect(hit.unit.id);
+    onOpenContextMenu(hit.lineId, hit.unit.id, hit.lineLevel, event.clientX, event.clientY);
+  }
+
   function dragPosition(clientX: number) {
     const content = contentRef.current;
     if (!content) return null;
@@ -743,6 +757,15 @@ export function TimelineCanvas({
             onClick={() => setRubyAdjustEnabled((value) => !value)}
           >
             Ruby调整
+          </button>
+          <button
+            type="button"
+            className={`button timeline-ruby-toggle ${unitTimeAdjustEnabled ? "filled" : "tonal"}`}
+            aria-pressed={unitTimeAdjustEnabled}
+            title={unitTimeAdjustEnabled ? "关闭起止时间调整；拖动任意位置都会移动整个 unit" : "启用后可拖动 unit 两侧调整起止时间"}
+            onClick={() => setUnitTimeAdjustEnabled((value) => !value)}
+          >
+            <MoveHorizontal size={14} />Unit时间
           </button>
         </div>
         <div className="transport-controls">
@@ -842,6 +865,7 @@ export function TimelineCanvas({
               onPointerUp={(event) => finishPointerDrag(event, true)}
               onPointerCancel={(event) => finishPointerDrag(event, false)}
               onDoubleClick={doubleClick}
+              onContextMenu={contextMenu}
             />;
           })}
           <div

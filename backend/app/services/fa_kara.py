@@ -77,6 +77,7 @@ class FAKaraAligner:
         line_ids: list[str] | None = None,
         overwrite_locked: bool = False,
         result_path: Path | None = None,
+        time_offset_ms: int = 0,
         progress_callback: Callable[[float, str], None] | None = None,
     ) -> tuple[dict, dict]:
         try:
@@ -129,8 +130,8 @@ class FAKaraAligner:
             target_spans = spans[target_index] if target_index < len(spans) else []
             if not target_spans:
                 continue
-            start_ms = round(float(target_spans[0].start) * frame_duration_ms)
-            end_ms = max(start_ms, round(float(target_spans[-1].end) * frame_duration_ms))
+            start_ms = time_offset_ms + round(float(target_spans[0].start) * frame_duration_ms)
+            end_ms = max(start_ms, time_offset_ms + round(float(target_spans[-1].end) * frame_duration_ms))
             score_values = []
             for item in target_spans:
                 raw_score = float(getattr(item, "score", 0.0))
@@ -177,4 +178,5 @@ class FAKaraAligner:
             "skipped_locked": locked,
             "low_confidence_units": low_confidence,
             "result_artifact": result_path.name if result_path else None,
+            "time_offset_ms": time_offset_ms,
         }

@@ -155,6 +155,7 @@ class StableTSAligner:
         line_ids: list[str] | None = None,
         overwrite_locked: bool = False,
         segment_padding_seconds: float = 2.0,
+        time_offset_ms: int = 0,
         progress_callback: Callable[[float, str], None] | None = None,
     ) -> tuple[dict, dict]:
         try:
@@ -175,7 +176,7 @@ class StableTSAligner:
             line_start, line_end = line.get("start_ms"), line.get("end_ms")
             if line_start is None or line_end is None or int(line_end) <= int(line_start):
                 raise StableTSAlignmentError("精修前必须先完成 stable-ts 全局对齐")
-            line_start, line_end = int(line_start), int(line_end)
+            line_start, line_end = int(line_start) - time_offset_ms, int(line_end) - time_offset_ms
             padded_start = max(0.0, line_start / 1000 - segment_padding_seconds)
             padded_end = line_end / 1000 + segment_padding_seconds
             units = [unit for unit in line.get("units", []) if str(unit.get("surface", ""))]
@@ -224,8 +225,8 @@ class StableTSAligner:
                     continue
                 starts = [float(getattr(item, "start", 0)) for item in timed]
                 ends = [float(getattr(item, "end", 0)) for item in timed]
-                start_ms = round(min(starts) * 1000)
-                end_ms = max(start_ms, round(max(ends) * 1000))
+                start_ms = time_offset_ms + round(min(starts) * 1000)
+                end_ms = max(start_ms, time_offset_ms + round(max(ends) * 1000))
                 probabilities = [float(getattr(item, "probability", 0.85) or 0.85) for item in timed]
                 confidence = round(sum(probabilities) / len(probabilities), 4)
                 unit["start_ms"] = start_ms
@@ -256,5 +257,6 @@ class StableTSAligner:
             "applied_units": applied,
             "low_confidence_units": low_confidence,
             "segment_padding_seconds": segment_padding_seconds,
-            "range_source": "stable_ts_global_with_segment_padding",
+            "range_source": "single_line_audio_clip" if time_offset_ms else "stable_ts_global_with_segment_padding",
+            "time_offset_ms": time_offset_ms,
         }

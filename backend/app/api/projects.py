@@ -293,7 +293,10 @@ def align(project_id: str, payload: AnalysisRequest, request: Request):
     if project["revision"] != payload.revision:
         raise HTTPException(409, {"code": "revision_conflict"})
     completion = _analysis_completion(document, project_id, settings)
-    if not completion["global_alignment"]:
+    scoped_line = next((line for line in document.get("lyrics", {}).get("lines", []) if payload.line_ids == [line.get("id")]), None)
+    if not completion["global_alignment"] and not (
+        scoped_line and scoped_line.get("start_ms") is not None and scoped_line.get("end_ms") is not None
+    ):
         raise HTTPException(422, "请先完成 stable-ts 全局对齐")
     return request.app.state.analysis_runner.enqueue(project_id, "STABLE_ALIGNMENT", payload.revision, payload.model_dump())
 
