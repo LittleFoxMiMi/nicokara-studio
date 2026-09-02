@@ -91,6 +91,7 @@ class FasterWhisperTranscriber:
         model_name: str,
         device: str,
         compute_type: str,
+        language: str = "ja",
         start_ms: int | None = None,
         end_ms: int | None = None,
         progress_callback: Callable[[float, str], None] | None = None,
@@ -104,7 +105,7 @@ class FasterWhisperTranscriber:
             should_cancel=should_cancel,
         )
         options: dict[str, Any] = {
-            "language": "ja",
+            "language": "zh" if str(language).lower() == "cn" else "ja",
             "beam_size": 5,
             "vad_filter": True,
             "word_timestamps": True,

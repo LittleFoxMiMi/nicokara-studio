@@ -5,8 +5,12 @@ requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
+  "cmudict>=1.1,<2",
+  "Janome>=0.5,<1",
   "pydantic-settings>=2.10,<3",
+  "pyphen>=0.17,<1",
   "pykakasi>=2.3,<3",
+  "pypinyin>=0.55,<1",
   "python-multipart>=0.0.20,<1",
   "uvicorn[standard]>=0.35,<1",
 ]

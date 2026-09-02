@@ -96,6 +96,7 @@ export function TimelineCanvas({
   onUpdateUnit,
   onUpdateLine,
   onUpdateRubyGroup,
+  rubyEnabled,
   onOpenEditor,
   onDropLine,
   onOpenContextMenu,
@@ -120,6 +121,7 @@ export function TimelineCanvas({
   ) => void;
   onUpdateLine: (lineId: string, startMs: number, endMs: number) => void;
   onUpdateRubyGroup: (lineId: string, unitIds: string[], ruby: string, rubySpan: number, clearUnitIds: string[]) => void;
+  rubyEnabled: boolean;
   onOpenEditor: (id: string) => void;
   onDropLine: (lineId: string, startMs: number) => void;
   onOpenContextMenu: (lineId: string, unitId: string, lineLevel: boolean, x: number, y: number) => void;
@@ -151,6 +153,10 @@ export function TimelineCanvas({
   const width = Math.max(900, Math.ceil((durationMs / 1000) * zoom));
   const height = 260;
   const tileCount = Math.max(1, Math.ceil(width / CANVAS_TILE_WIDTH));
+
+  useEffect(() => {
+    if (!rubyEnabled) setRubyAdjustEnabled(false);
+  }, [rubyEnabled]);
 
   function saveTimelineState() {
     if (typeof window === "undefined") return;
@@ -749,7 +755,7 @@ export function TimelineCanvas({
         <div className="timeline-title">
           <strong>时间轴</strong>
           <span>{timedUnits.length} 个时间单元</span>
-          <button
+          {rubyEnabled && <button
             type="button"
             className={`button timeline-ruby-toggle ${rubyAdjustEnabled ? "filled" : "tonal"}`}
             aria-pressed={rubyAdjustEnabled}
@@ -757,7 +763,7 @@ export function TimelineCanvas({
             onClick={() => setRubyAdjustEnabled((value) => !value)}
           >
             Ruby调整
-          </button>
+          </button>}
           <button
             type="button"
             className={`button timeline-ruby-toggle ${unitTimeAdjustEnabled ? "filled" : "tonal"}`}

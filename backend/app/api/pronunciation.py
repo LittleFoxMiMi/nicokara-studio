@@ -20,6 +20,7 @@ from app.services.pronunciation import (
 )
 from app.services.secrets import SecretStore
 from app.services.ai_client import AIClient
+from app.services.fa_kara_text import normalize_language
 
 router = APIRouter(prefix="/projects", tags=["pronunciation"])
 
@@ -61,9 +62,15 @@ def _selection(document: dict, payload: PronunciationRequest) -> PronunciationSe
     return PronunciationSelection(payload.line_ids, payload.unit_ids, payload.overwrite_policy)
 
 
+def _require_japanese(document: dict) -> None:
+    if normalize_language(document.get("project", {}).get("language")) == "cn":
+        raise HTTPException(422, "中文工程不需要注音")
+
+
 @router.post("/{project_id}/pronunciation/local")
 def local_pronunciation(project_id: str, payload: PronunciationRequest, request: Request):
     db, project, document = _project(request, project_id)
+    _require_japanese(document)
     if project["revision"] != payload.revision:
         raise HTTPException(409, {"code": "revision_conflict"})
     selection = _selection(document, payload)
@@ -78,6 +85,7 @@ def local_pronunciation(project_id: str, payload: PronunciationRequest, request:
 @router.post("/{project_id}/pronunciation/ai")
 def ai_pronunciation(project_id: str, payload: PronunciationRequest, request: Request):
     db, project, document = _project(request, project_id)
+    _require_japanese(document)
     if project["revision"] != payload.revision:
         raise HTTPException(409, {"code": "revision_conflict"})
     selection = _selection(document, payload)

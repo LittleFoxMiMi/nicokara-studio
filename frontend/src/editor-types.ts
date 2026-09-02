@@ -9,6 +9,8 @@ export type Project = {
   revision: number;
 };
 
+export type ProjectLanguage = "jp" | "cn";
+
 export type LyricUnit = {
   id: string;
   surface: string;
@@ -20,6 +22,7 @@ export type LyricUnit = {
   ruby_2?: string | null;
   ruby_span?: number;
   ruby_source: string;
+  alignment_reading?: string;
   roles: string[];
   locked: boolean;
 };
@@ -37,7 +40,7 @@ export type LyricLine = {
 
 export type ProjectDocument = {
   schema_version: number;
-  project: { id: string; name: string; title: string; artist: string; revision: number };
+  project: { id: string; name: string; title: string; artist: string; language?: ProjectLanguage; revision: number };
   media: Record<string, unknown>;
   lyrics: { source_type: string; detected_type?: string; original_filename?: string | null; lines: LyricLine[] };
   styles: Record<string, unknown>;

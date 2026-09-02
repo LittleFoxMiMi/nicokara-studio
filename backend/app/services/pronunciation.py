@@ -8,9 +8,9 @@ from typing import Any, Callable
 import httpx
 from uuid import uuid4
 
-from pykakasi import kakasi
 from app.services.ai_client import AIClient
 from app.services.secrets import SecretStore
+from app.services.fa_kara_text import annotation_segments, contains_kanji, is_kana, local_fa_groups, normalize_language, split_fa_kara_ranges, tokenize_fa_kara
 
 DEFAULT_SYSTEM_PROMPT = r'''你是日语卡拉 OK 歌词注音器。你的任务是只为歌词正文中的汉字或包含汉字的特殊表记生成日语假名读音，不得翻译、改写、纠正或删除歌词正文。
 
@@ -19,10 +19,10 @@ DEFAULT_SYSTEM_PROMPT = r'''你是日语卡拉 OK 歌词注音器。你的任务
   "result": [
     {
       "line_index": 0,
-      "raw": ["雨", "が", "降った"],
+      "raw": "雨が降った",
       "pronunciation": [
-        [0, 1, "雨", "あめ"],
-        [2, 3, "降", "ふ"]
+        [0, "雨", "あめ"],
+        [2, "降", "ふ"]
       ]
     }
   ]
@@ -30,9 +30,9 @@ DEFAULT_SYSTEM_PROMPT = r'''你是日语卡拉 OK 歌词注音器。你的任务
 
 协议规则：
 1. line_index 必须是输入歌词行的 0-based 行号，按输入顺序返回，不得新增、删除、重复或调换行。
-2. raw 是对原始歌词行的分词数组；把 raw 数组元素直接拼接后，必须与原始歌词行完全一致。不得修改空白、标点、假名、拉丁字母或歌词正文。
-3. pronunciation 的每项必须严格是 [start, end, surface, reading]。start/end 是原始歌词行的 Unicode 字符半开区间 [start,end)，不是 raw 下标。
-4. surface 必须严格等于原始歌词在 [start,end) 范围内的文字；范围不得越界、不得重叠，按 start 升序排列。
+2. raw 必须是原始歌词行的完整字符串，不是分词数组；必须逐字符等于输入歌词，不得修改空白、标点、假名、拉丁字母或歌词正文。
+3. pronunciation 的每项必须严格是 [start, surface, reading]。start 是原始歌词行的 Unicode 字符位置，结束位置由 surface 长度推导。
+4. surface 必须严格匹配从 start 开始的原始歌词文字，不能越界、不能重叠，按 start 升序排列。
 5. reading 只填写实际日语读音，使用平假名为主；多汉字词、当て字和特殊读音作为整体返回，例如 昨日 -> きのう、九十九折 -> つづらおり。
 6. 只为汉字或包含汉字的特殊表记返回 pronunciation；假名、助词和标点不要重复返回。没有注音时 pronunciation 返回 []。
 7. 不要生成工程内部 id、时间、置信度或其他字段。'''
@@ -47,7 +47,7 @@ DEFAULT_USER_TEMPLATE = r'''请严格按照系统协议，为下面的完整歌�
 Whisper 顺序参考（只有 segment_index 和 text，没有歌词行号，也没有可写回的时间）：
 {{whisper_segments}}
 
-再次检查：raw 拼接必须等于每行原文；pronunciation 必须使用 [start,end,surface,reading]；surface 必须匹配原文；只注音汉字；最后只输出 JSON。'''
+再次检查：raw 必须等于每行原文字符串；pronunciation 必须使用 [start,surface,reading]；surface 必须匹配原文；只注音日语汉字；最后只输出 JSON。'''
 READING_RE = re.compile(r"^[ぁ-ゖァ-ヺー・ゔヴーA-Za-z0-9'\- ]+$")
 
 
@@ -72,9 +72,8 @@ def _contains_kanji(value: str) -> bool:
 def local_reading(surface: str) -> tuple[str | None, float]:
     if not surface or not _contains_kanji(surface):
         return None, 1.0
-    converter = kakasi()
-    pieces = converter.convert(surface)
-    reading = "".join(item.get("hira", item.get("orig", "")) for item in pieces)
+    readings = [reading for _, _, reading in local_fa_groups(surface) if reading]
+    reading = "".join(readings)
     return (reading or None), (0.72 if reading else 0.0)
 
 
@@ -93,22 +92,61 @@ def _selected_units(document: dict, selection: PronunciationSelection) -> list[t
 
 def apply_local(document: dict, selection: PronunciationSelection, *, fallback: bool = False) -> tuple[dict, dict]:
     updated = deepcopy(document)
+    language = normalize_language(updated.get("project", {}).get("language"))
     applied = 0
     skipped_locked = 0
     low_confidence = 0
-    for _, unit in _selected_units(updated, selection):
-        if unit.get("locked") and selection.overwrite_policy != "all":
-            skipped_locked += 1
+    selected_lines = set(selection.line_ids)
+    selected_units = set(selection.unit_ids)
+    for line in updated.get("lyrics", {}).get("lines", []):
+        line_selected = line["id"] in selected_lines
+        if (selected_lines or selected_units) and not line_selected and not any(unit["id"] in selected_units for unit in line.get("units", [])):
             continue
-        reading, confidence = local_reading(str(unit.get("surface", "")))
-        if not reading:
-            continue
-        unit["ruby"] = reading
-        unit["ruby_source"] = "local_fallback" if fallback else "local"
-        unit["ruby_confidence"] = confidence
-        if confidence < 0.55:
-            low_confidence += 1
-        applied += 1
+        rebuilt: list[dict] = []
+        for original in line.get("units", []):
+            if selected_units and not line_selected and original.get("id") not in selected_units:
+                rebuilt.append(original)
+                continue
+            if original.get("locked") and selection.overwrite_policy != "all":
+                skipped_locked += 1
+                rebuilt.append(original)
+                continue
+            surface = str(original.get("surface", ""))
+            groups = local_fa_groups(surface, language=language)
+            alignment_readings = {(start, end): reading for start, end, reading in tokenize_fa_kara(surface, language=language)}
+            if not groups:
+                rebuilt.append(original)
+                continue
+            for group_index, (group_start, group_end, reading) in enumerate(groups):
+                group_surface = surface[group_start:group_end]
+                display_reading = reading if reading and any(is_kana(char) for char in reading) else None
+                pieces = [(group_start + left, group_start + right) for left, right in split_fa_kara_ranges(group_surface, language=language)] if display_reading and contains_kanji(group_surface) else [(group_start, group_end)]
+                for piece_index, (left, right) in enumerate(pieces):
+                    unit = deepcopy(original)
+                    unit["surface"] = surface[left:right]
+                    if group_index or piece_index:
+                        unit["id"] = str(uuid4())
+                    unit["ruby"] = None
+                    unit["ruby_source"] = "none"
+                    unit.pop("ruby_confidence", None)
+                    unit["ruby_span"] = 0
+                    token_reading = alignment_readings.get((left, right))
+                    if token_reading and not display_reading:
+                        unit["alignment_reading"] = token_reading
+                    else:
+                        unit.pop("alignment_reading", None)
+                    if display_reading and piece_index == 0:
+                        unit["ruby"] = display_reading
+                        unit["ruby_source"] = "local_fallback" if fallback else "local"
+                        unit["ruby_confidence"] = 0.72
+                        unit["ruby_span"] = len(group_surface)
+                        applied += 1
+                    if original.get("start_ms") is not None and original.get("end_ms") is not None and surface:
+                        span = original["end_ms"] - original["start_ms"]
+                        unit["start_ms"] = round(original["start_ms"] + span * left / len(surface))
+                        unit["end_ms"] = round(original["start_ms"] + span * right / len(surface))
+                    rebuilt.append(unit)
+        line["units"] = rebuilt
     updated.setdefault("pronunciation", {})["last_run"] = {"mode": "local_fallback" if fallback else "local", "applied": applied}
     return updated, {"applied": applied, "skipped_locked": skipped_locked, "low_confidence": low_confidence, "source": "local_fallback" if fallback else "local"}
 
@@ -165,30 +203,31 @@ def validate_ai_result(payload: Any, lines: list[dict], allowed_line_indices: se
         line = line_map[index]
         text = "".join(unit.get("surface", "") for unit in line.get("units", []))
         raw = item.get("raw")
-        if check_raw and (not isinstance(raw, list) or "".join(str(part) for part in raw) != text):
-            raise PronunciationValidationError(f"第 {index + 1} 行 raw 与歌词正文不一致")
+        if check_raw and (not isinstance(raw, str) or raw != text):
+            raise PronunciationValidationError(f"第 {index + 1} 行 raw 必须与歌词正文完全一致")
         ranges = item.get("pronunciation", [])
         if not isinstance(ranges, list):
             raise PronunciationValidationError("pronunciation 必须是数组")
         last_end = -1
         checked = []
         for entry in ranges:
-            if not isinstance(entry, list) or len(entry) != 4:
-                raise PronunciationValidationError("注音项必须是 [start,end,surface,reading]")
-            start, end, surface, reading = entry
-            if not isinstance(start, int) or not isinstance(end, int) or start < 0 or end <= start or end > len(text) or start < last_end:
-                raise PronunciationValidationError("注音范围越界或重叠")
-            if text[start:end] != surface or not isinstance(reading, str) or not READING_RE.match(reading):
+            if not isinstance(entry, list) or len(entry) != 3:
+                raise PronunciationValidationError("注音项必须是 [start,surface,reading]")
+            start, surface, reading = entry
+            end = start + len(surface) if isinstance(start, int) and isinstance(surface, str) else -1
+            if not isinstance(start, int) or not isinstance(surface, str) or start < 0 or end <= start or end > len(text) or start < last_end:
+                raise PronunciationValidationError("注音位置越界或重叠")
+            if text[start:end] != surface or not contains_kanji(surface) or not isinstance(reading, str) or not READING_RE.match(reading):
                 raise PronunciationValidationError("注音 surface 或 reading 不合法")
-            checked.append([start, end, surface, reading])
+            checked.append([start, surface, reading])
             last_end = end
-        validated.append({"line_index": index, "pronunciation": checked})
+        validated.append({"line_index": index, "raw": text, "pronunciation": checked})
         seen.add(index)
     return validated
 
 
 def validate_ai_result_partial(payload: Any, lines: list[dict], allowed_line_indices: set[int] | None = None) -> tuple[list[dict], set[int], set[int]]:
-    """Keep valid rows, separating raw tokenization errors from pronunciation errors."""
+    """Keep valid rows while rejecting malformed full-line protocol rows."""
     if not isinstance(payload, dict) or not isinstance(payload.get("result"), list):
         raise PronunciationValidationError("AI 响应缺少 result 数组")
     line_map = {index: line for index, line in enumerate(lines)}
@@ -210,16 +249,21 @@ def validate_ai_result_partial(payload: Any, lines: list[dict], allowed_line_ind
         try:
             valid.extend(validate_ai_result({"result": [item]}, lines, allowed_line_indices))
         except PronunciationValidationError:
-            try:
-                valid.extend(validate_ai_result({"result": [item]}, lines, allowed_line_indices, check_raw=False))
+            if not isinstance(item.get("raw"), str) or item.get("raw") != "".join(
+                unit.get("surface", "") for unit in line_map[index].get("units", [])
+            ):
                 raw_mismatch.add(index)
-            except PronunciationValidationError:
-                invalid.add(index)
+            invalid.add(index)
+    expected = allowed_line_indices if allowed_line_indices is not None else set(line_map)
+    invalid.update(expected - seen)
     return valid, invalid, raw_mismatch
 
 
 def apply_ai(document: dict, result: list[dict], selection: PronunciationSelection) -> tuple[dict, dict]:
     updated = deepcopy(document)
+    language = normalize_language(updated.get("project", {}).get("language"))
+    if language == "cn":
+        raise PronunciationValidationError("中文工程不需要注音")
     lines = updated.get("lyrics", {}).get("lines", [])
     selected_lines = set(selection.line_ids)
     selected_units = set(selection.unit_ids)
@@ -231,6 +275,12 @@ def apply_ai(document: dict, result: list[dict], selection: PronunciationSelecti
             continue
         annotations = proposal["pronunciation"]
         line_selected = line["id"] in selected_lines
+        line_text = "".join(str(unit.get("surface", "")) for unit in line.get("units", []))
+        segments = annotation_segments(line_text, annotations)
+        alignment_readings = {(start, end): reading for start, end, reading in tokenize_fa_kara(line_text, language=language)}
+        # AI is a Japanese-kanji Ruby provider; Chinese/English phonetics stay
+        # in the deterministic FA-Kara alignment field and are never surfaced.
+        japanese_context = language == "jp"
         cursor = 0
         next_units: list[dict] = []
         for original in line.get("units", []):
@@ -240,42 +290,56 @@ def apply_ai(document: dict, result: list[dict], selection: PronunciationSelecti
             if selected_units and not line_selected and original.get("id") not in selected_units:
                 next_units.append(deepcopy(original))
                 continue
-            boundaries = {0, len(surface)}
-            for start, end, _, _ in annotations:
-                if start < unit_end and end > unit_start:
-                    boundaries.add(max(0, start - unit_start))
-                    boundaries.add(min(len(surface), end - unit_start))
-            points = sorted(boundaries)
-            for chunk_index, (left, right) in enumerate(zip(points, points[1:])):
+            if original.get("locked") and selection.overwrite_policy != "all":
+                skipped_locked += 1
+                next_units.append(deepcopy(original))
+                continue
+            local_segments: list[tuple[int, int, list[Any] | None]] = []
+            for start, end, annotation in segments:
+                left, right = max(start, unit_start), min(end, unit_end)
+                if left < right:
+                    local_segments.append((left, right, annotation))
+            if not local_segments and surface:
+                local_segments = [(unit_start + left, unit_start + right, None) for left, right in split_fa_kara_ranges(surface, language=language)]
+            expanded_segments: list[tuple[int, int, list[Any] | None]] = []
+            for absolute_left, absolute_right, annotation in local_segments:
+                if annotation is None:
+                    expanded_segments.append((absolute_left, absolute_right, None))
+                    continue
+                local_left = absolute_left - unit_start
+                local_right = absolute_right - unit_start
+                for left, right in split_fa_kara_ranges(surface[local_left:local_right], language=language):
+                    expanded_segments.append((absolute_left + left, absolute_left + right, annotation))
+            for chunk_index, (absolute_left, absolute_right, annotation) in enumerate(expanded_segments):
+                left, right = absolute_left - unit_start, absolute_right - unit_start
                 chunk = deepcopy(original)
                 chunk["surface"] = surface[left:right]
                 if chunk_index:
                     chunk["id"] = str(uuid4())
-                # A pronunciation proposal belongs to the complete surface range.
-                # Keep it on the first unit and let ruby_span mark the following
-                # units as part of the same word group; never repeat a phrase
-                # reading on every kanji.
-                if annotations:
-                    chunk["ruby"] = None
-                    chunk["ruby_source"] = "none"
-                    chunk.pop("ruby_confidence", None)
-                    chunk["ruby_span"] = 0
+                chunk["ruby"] = None
+                chunk["ruby_source"] = "none"
+                chunk.pop("ruby_confidence", None)
+                chunk["ruby_span"] = 0
+                token_reading = alignment_readings.get((absolute_left, absolute_right))
+                if token_reading and not (japanese_context and contains_kanji(chunk["surface"])):
+                    chunk["alignment_reading"] = token_reading
+                else:
+                    chunk.pop("alignment_reading", None)
+                if annotation is not None:
+                    _, _, reading = annotation
                 if original.get("start_ms") is not None and original.get("end_ms") is not None and surface:
                     span = original["end_ms"] - original["start_ms"]
                     chunk["start_ms"] = round(original["start_ms"] + span * left / len(surface))
                     chunk["end_ms"] = round(original["start_ms"] + span * right / len(surface))
-                for start, end, _, reading in annotations:
-                    absolute_left, absolute_right = unit_start + left, unit_start + right
-                    if absolute_left >= start and absolute_right <= end:
-                        if original.get("locked") and selection.overwrite_policy != "all":
-                            skipped_locked += 1
-                        elif unit_start + left == start:
-                            chunk["ruby"] = reading
-                            chunk["ruby_source"] = "ai"
-                            chunk["ruby_confidence"] = 0.9
-                            chunk["ruby_span"] = end - start
-                            applied += 1
-                        break
+                if annotation is not None:
+                    annotation_start = int(annotation[0])
+                    annotation_end = annotation_start + len(str(annotation[1]))
+                    if absolute_left == annotation_start:
+                        chunk["ruby"] = reading
+                        chunk["ruby_source"] = "ai"
+                        chunk["ruby_confidence"] = 0.9
+                        chunk["ruby_span"] = annotation_end - annotation_start
+                        applied += 1
                 next_units.append(chunk)
         line["units"] = next_units
     updated.setdefault("pronunciation", {})["last_run"] = {"mode": "ai", "applied": applied}

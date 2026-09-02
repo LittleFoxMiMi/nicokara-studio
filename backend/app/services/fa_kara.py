@@ -6,10 +6,12 @@ import math
 import re
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from pykakasi import kakasi
 
 from app.services.alignment import AlignmentQualityError
+from app.services.fa_kara_text import normalize_language, phonetic_for_surface, tokenize_fa_kara
 
 
 class FAKaraAlignmentError(AlignmentQualityError):
@@ -27,15 +29,20 @@ def _romaji(reading: str) -> str:
     return _MODEL_READING_RE.sub("", converted).lower()
 
 
-def _unit_reading(unit: dict[str, Any]) -> str:
+def _unit_reading(unit: dict[str, Any], *, language: str = "jp") -> str:
     surface = str(unit.get("surface") or "")
     ruby = str(unit.get("ruby") or "").strip()
-    if _KANJI_RE.search(surface) and not ruby:
+    alignment_reading = str(unit.get("alignment_reading") or "").strip()
+    language = normalize_language(language)
+    if language == "jp" and _KANJI_RE.search(surface) and not ruby:
         raise FAKaraAlignmentError("FA-Kara 需要已有 AI 注音：请先为含汉字的歌词生成 Ruby")
-    return _romaji(ruby or surface)
+    if language == "jp":
+        return _romaji(ruby) if ruby else alignment_reading or phonetic_for_surface(surface, language=language)
+    return alignment_reading or phonetic_for_surface(surface, language=language)
 
 
-def _groups(line: dict[str, Any]) -> list[tuple[list[dict[str, Any]], str]]:
+def _groups(line: dict[str, Any], *, language: str = "jp") -> list[tuple[list[dict[str, Any]], str]]:
+    language = normalize_language(language)
     units = [unit for unit in line.get("units", []) if str(unit.get("surface") or "")]
     result: list[tuple[list[dict[str, Any]], str]] = []
     index = 0
@@ -51,15 +58,48 @@ def _groups(line: dict[str, Any]) -> list[tuple[list[dict[str, Any]], str]]:
             covered_chars += len(str(units[member_end].get("surface") or ""))
             member_end += 1
         members = units[index:member_end]
-        reading = str(unit.get("ruby") or "").strip()
+        reading = str(unit.get("ruby") or "").strip() if language == "jp" else ""
         if not reading:
-            readings = [_unit_reading(member) for member in members]
+            readings = [_unit_reading(member, language=language) for member in members]
             reading = "".join(readings)
-        reading = _romaji(reading)
+        if language == "jp":
+            reading = _romaji(reading)
         if reading:
             result.append((members, reading))
         index += len(members)
     return result
+
+
+def _prepare_chinese_units(lines: list[dict[str, Any]]) -> None:
+    """Split Chinese surfaces into deterministic FA-Kara units without creating Ruby."""
+    for line in lines:
+        rebuilt: list[dict[str, Any]] = []
+        for original in line.get("units", []):
+            surface = str(original.get("surface") or "")
+            tokens = tokenize_fa_kara(surface, language="cn")
+            if not tokens:
+                continue
+            for index, (start, end, reading) in enumerate(tokens):
+                unit = copy.deepcopy(original)
+                unit["surface"] = surface[start:end]
+                if index:
+                    unit["id"] = str(uuid4())
+                unit["ruby"] = None
+                unit["ruby_2"] = None
+                unit["ruby_source"] = "none"
+                unit.pop("ruby_span", None)
+                unit.pop("ruby_confidence", None)
+                if reading:
+                    unit["alignment_reading"] = reading
+                else:
+                    unit.pop("alignment_reading", None)
+                start_ms, end_ms = original.get("start_ms"), original.get("end_ms")
+                if start_ms is not None and end_ms is not None and surface:
+                    duration = int(end_ms) - int(start_ms)
+                    unit["start_ms"] = round(int(start_ms) + duration * start / len(surface))
+                    unit["end_ms"] = round(int(start_ms) + duration * end / len(surface))
+                rebuilt.append(unit)
+        line["units"] = rebuilt
 
 
 class FAKaraAligner:
@@ -90,13 +130,16 @@ class FAKaraAligner:
             raise FAKaraAlignmentError("FA-Kara 找不到人声音频，请先完成 KARA2 分离")
         document = copy.deepcopy(source_document)
         lines = document.get("lyrics", {}).get("lines", [])
+        language = normalize_language(document.get("project", {}).get("language"))
         selected = set(line_ids or [line["id"] for line in lines])
+        if language == "cn":
+            _prepare_chinese_units([line for line in lines if line["id"] in selected])
         selected_lines = [line for line in lines if line["id"] in selected]
         if not selected_lines:
             raise FAKaraAlignmentError("没有可用于 FA-Kara 对齐的歌词行")
         targets: list[tuple[dict[str, Any], list[dict[str, Any]], str]] = []
         for line in selected_lines:
-            for members, reading in _groups(line):
+            for members, reading in _groups(line, language=language):
                 targets.append((line, members, reading))
         if not targets:
             raise FAKaraAlignmentError("歌词没有可转换为罗马音的内容")

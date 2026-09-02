@@ -156,3 +156,65 @@ def test_fa_kara_settings_validate_backend_and_model(tmp_path, monkeypatch):
         assert valid.json()["fa_kara_model"] == "yohane"
         assert client.put("/api/settings", json={"values": {"alignment_backend": "unknown"}}).status_code == 422
         assert client.put("/api/settings", json={"values": {"fa_kara_model": "unknown"}}).status_code == 422
+
+
+def test_chinese_project_uses_pinyin_and_skips_pronunciation(tmp_path, monkeypatch):
+    from app.services.fa_kara import _groups, _prepare_chinese_units
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("NICOKARA_DATA_DIR", str(tmp_path))
+    groups = _groups({"units": [{"surface": "中国", "ruby": "ちゅうごく"}]}, language="cn")
+    assert groups[0][1] == "zhongguo"
+    lines = [{"units": [{"id": "unit", "surface": "银行", "ruby": "ぎんこう", "start_ms": 0, "end_ms": 1000}]}]
+    _prepare_chinese_units(lines)
+    assert [unit["surface"] for unit in lines[0]["units"]] == ["银", "行"]
+    assert [unit["alignment_reading"] for unit in lines[0]["units"]] == ["yin", "hang"]
+    assert all(unit["ruby"] is None for unit in lines[0]["units"])
+
+    with TestClient(create_app()) as client:
+        project = client.post("/api/projects", json={"name": "中文工程"}).json()
+        document = client.get(f"/api/projects/{project['id']}/document").json()["document"]
+        document["project"]["language"] = "cn"
+        document["lyrics"]["lines"] = [{"id": "line", "units": [{"id": "unit", "surface": "中国", "ruby": "ちゅうごく"}]}]
+        document["media"]["video_filename"] = "video.mp4"
+        saved = client.put(f"/api/projects/{project['id']}/document", json={"revision": 1, "document": document})
+        assert saved.status_code == 200
+        current = client.get(f"/api/projects/{project['id']}/document").json()
+        normalized = current["document"]
+        assert normalized["project"]["language"] == "cn"
+        assert normalized["lyrics"]["lines"][0]["units"][0]["ruby"] is None
+        client.app.state.analysis_runner = SimpleNamespace(enqueue=lambda *args: {"id": "full-cn", "request": args[3]})
+        full = client.post(
+            f"/api/projects/{project['id']}/analysis",
+            json={"revision": current["revision"], "alignment_backend": "stable_ts", "steps": ["separation", "transcription", "pronunciation", "fa_kara"]},
+        )
+        assert full.status_code == 202
+        assert full.json()["request"]["steps"] == ["separation", "transcription", "fa_kara"]
+        pronunciation = client.post(
+            f"/api/projects/{project['id']}/pronunciation-job",
+            json={"revision": full.json().get("request", {}).get("revision", current["revision"]), "mode": "local"},
+        )
+        assert pronunciation.status_code == 422
+
+
+def test_japanese_alignment_rejects_missing_ruby_and_accepts_ruby_span(tmp_path, monkeypatch):
+    from app.services.fa_kara_text import missing_japanese_ruby
+
+    assert missing_japanese_ruby([{"id": "line", "units": [
+        {"id": "u1", "surface": "昨", "ruby": "きのう", "ruby_span": 2},
+        {"id": "u2", "surface": "日", "ruby": None},
+        {"id": "u3", "surface": "雨", "ruby": None},
+    ]}]) == [{"line_index": 0, "line_id": "line", "unit_id": "u3", "characters": "雨"}]
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("NICOKARA_DATA_DIR", str(tmp_path))
+    with TestClient(create_app()) as client:
+        project = client.post("/api/projects", json={"name": "日文漏注音"}).json()
+        document = client.get(f"/api/projects/{project['id']}/document").json()["document"]
+        document["project"]["language"] = "jp"
+        document["media"]["video_filename"] = "video.mp4"
+        document["lyrics"]["lines"] = [{"id": "line", "units": [{"id": "u1", "surface": "雨", "ruby": None}]}]
+        saved = client.put(f"/api/projects/{project['id']}/document", json={"revision": 1, "document": document}).json()
+        response = client.post(f"/api/projects/{project['id']}/fa-kara", json={"revision": saved["revision"]})
+        assert response.status_code == 422
+        assert "雨" in response.text

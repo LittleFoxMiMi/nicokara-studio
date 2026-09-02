@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import copy
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +16,7 @@ from app.services.alignment import AlignmentQualityError
 from app.services.audio import AudioProcessingError, extract_audio_clip, prepare_source_audio
 from app.services.cancellation import OperationCanceled
 from app.services.pronunciation import PronunciationSelection, PronunciationValidationError, apply_local, run_ai_pronunciation
+from app.services.fa_kara_text import normalize_language
 from app.services.separation import Kara2Separator
 from app.services.stable_ts import StableTSAligner, StableTSAlignmentError, rough_line_ranges
 from app.services.fa_kara import FAKaraAligner
@@ -144,6 +146,7 @@ class AnalysisPipeline:
             model_name=payload.get("whisper_model") or payload.get("model") or values.get("whisper_model") or self.settings.whisper_model,
             device=payload.get("whisper_device") or values.get("whisper_device") or self.settings.whisper_device,
             compute_type=payload.get("compute_type") or values.get("whisper_compute_type") or self.settings.whisper_compute_type,
+            language=normalize_language(document.get("project", {}).get("language")),
             start_ms=max(0, start_ms - 3000) if isinstance(start_ms, int) else None,
             end_ms=end_ms + 3000 if isinstance(end_ms, int) else None,
             progress_callback=lambda value, message: self._step(job_id, "transcription", 0.08 + value * 0.84, message),
@@ -163,6 +166,13 @@ class AnalysisPipeline:
         return document, revision, {"segment_count": len(transcript.segments), "output_revision": revision}
 
     def _pronounce(self, job_id: str, project_id: str, document: dict, revision: int, payload: dict) -> tuple[dict, int, dict]:
+        if normalize_language(document.get("project", {}).get("language")) == "cn":
+            updated = copy.deepcopy(document)
+            updated.setdefault("pronunciation", {})["last_run"] = {"mode": "skipped_cn", "applied": 0}
+            updated.setdefault("analysis", {})["pronunciation"] = {"status": "completed", "job_id": job_id, "mode": "skipped_cn", "applied": 0}
+            updated, revision = self._save(project_id, updated, revision)
+            self._step(job_id, "pronunciation", 1.0, "中文工程跳过注音")
+            return updated, revision, {"mode": "skipped_cn", "applied": 0, "output_revision": revision}
         selection = PronunciationSelection(payload.get("line_ids", []), payload.get("unit_ids", []), payload.get("overwrite_policy", "unlocked_only"))
         if payload.get("mode") == "local":
             self._step(job_id, "pronunciation", 0.15, "正在生成本地日语读音")

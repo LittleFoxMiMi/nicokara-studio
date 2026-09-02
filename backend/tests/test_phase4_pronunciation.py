@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 
+import pytest
 from fastapi.testclient import TestClient
 import httpx
 
@@ -34,7 +35,7 @@ def test_ai_pronunciation_batches_and_retries_structural_failure(tmp_path, monke
                 return {"invalid": []}
             line_index = 0 if len(calls) == 1 else 1
             text = "a" * 80 if line_index == 0 else "b" * 80
-            return {"result": [{"line_index": line_index, "raw": [text], "pronunciation": []}]}
+            return {"result": [{"line_index": line_index, "raw": text, "pronunciation": []}]}
 
         monkeypatch.setattr("app.api.pronunciation.AIClient.complete", fake_complete)
         response = client.post(f"/api/projects/{project['id']}/pronunciation/ai", json={"revision": imported["revision"], "mode": "ai", "profile_id": profile["id"]})
@@ -44,7 +45,7 @@ def test_ai_pronunciation_batches_and_retries_structural_failure(tmp_path, monke
         assert len(calls) == 3
 
 
-def test_ai_pronunciation_keeps_reading_when_raw_tokenization_is_wrong(tmp_path, monkeypatch):
+def test_ai_pronunciation_rejects_noncanonical_raw_protocol(tmp_path, monkeypatch):
     get_settings.cache_clear()
     monkeypatch.setenv("NICOKARA_DATA_DIR", str(tmp_path))
     with TestClient(create_app()) as client:
@@ -54,18 +55,15 @@ def test_ai_pronunciation_keeps_reading_when_raw_tokenization_is_wrong(tmp_path,
 
         def fake_complete(self, system_prompt, user_prompt):
             return {"result": [
-                {"line_index": 0, "raw": ["雨"], "pronunciation": [[0, 1, "雨", "あめ"]]},
-                {"line_index": 1, "raw": ["青"], "pronunciation": [[0, 2, "青空", "あおぞら"]]},
+                {"line_index": 0, "raw": ["雨"], "pronunciation": [[0, "雨", "あめ"]]},
+                {"line_index": 1, "raw": "青空", "pronunciation": [[0, "青空", "あおぞら"]]},
             ]}
 
         monkeypatch.setattr("app.api.pronunciation.AIClient.complete", fake_complete)
         response = client.post(f"/api/projects/{project['id']}/pronunciation/ai", json={"revision": imported["revision"], "mode": "ai", "profile_id": profile["id"]})
-        assert response.status_code == 200
-        body = response.json()
-        assert body["summary"]["raw_mismatch_lines"] == 1
-        units = body["document"]["lyrics"]["lines"]
-        assert units[0]["units"][0]["ruby_source"] == "ai"
-        assert units[1]["units"][0]["ruby_source"] == "ai"
+        assert response.status_code == 502
+        stored = client.get(f"/api/projects/{project['id']}/document").json()
+        assert stored["revision"] == imported["revision"]
 
 
 def test_ai_pronunciation_validation_failure_does_not_write_local_fallback(tmp_path, monkeypatch):
@@ -78,8 +76,8 @@ def test_ai_pronunciation_validation_failure_does_not_write_local_fallback(tmp_p
 
         def fake_complete(self, system_prompt, user_prompt):
             return {"result": [
-                {"line_index": 0, "raw": ["雨"], "pronunciation": [[0, 1, "雨", "あめ"]]},
-                {"line_index": 1, "raw": ["青空"], "pronunciation": [[0, 2, "青", "あお"]]},
+                {"line_index": 0, "raw": "雨", "pronunciation": [[0, "雨", "あめ"]]},
+                {"line_index": 1, "raw": "青空", "pronunciation": [[1, "青", "あお"]]},
             ]}
 
         monkeypatch.setattr("app.api.pronunciation.AIClient.complete", fake_complete)
@@ -109,12 +107,12 @@ def test_local_pronunciation_updates_only_selected_units_and_preserves_text(tmp_
 def test_ai_protocol_rejects_surface_mismatch_and_splits_units():
     lines = [{"id": "line", "units": [{"id": "unit", "surface": "雨が降った"}]}]
     try:
-        validate_ai_result({"result": [{"line_index": 0, "raw": ["雨が降つた"], "pronunciation": []}]}, lines)
+        validate_ai_result({"result": [{"line_index": 0, "raw": "雨が降つた", "pronunciation": []}]}, lines)
     except PronunciationValidationError:
         pass
     else:
         raise AssertionError("surface mismatch should be rejected")
-    result = validate_ai_result({"result": [{"line_index": 0, "raw": ["雨が", "降った"], "pronunciation": [[0, 1, "雨", "あめ"], [2, 3, "降", "ふ"]]}]}, lines)
+    result = validate_ai_result({"result": [{"line_index": 0, "raw": "雨が降った", "pronunciation": [[0, "雨", "あめ"], [2, "降", "ふ"]]}]}, lines)
     updated, summary = apply_ai({"lyrics": {"lines": lines}}, result, PronunciationSelection([], []))
     units = updated["lyrics"]["lines"][0]["units"]
     assert "".join(unit["surface"] for unit in units) == "雨が降った"
@@ -125,13 +123,33 @@ def test_ai_protocol_rejects_surface_mismatch_and_splits_units():
 
 def test_ai_phrase_reading_is_stored_once_with_ruby_span():
     lines = [{"id": "line", "units": [{"id": "unit", "surface": "昨日", "start_ms": 0, "end_ms": 1000}]}]
-    result = validate_ai_result({"result": [{"line_index": 0, "raw": ["昨日"], "pronunciation": [[0, 2, "昨日", "きのう"]]}]}, lines)
+    result = validate_ai_result({"result": [{"line_index": 0, "raw": "昨日", "pronunciation": [[0, "昨日", "きのう"]]}]}, lines)
     updated, summary = apply_ai({"lyrics": {"lines": lines}}, result, PronunciationSelection([], []))
     units = updated["lyrics"]["lines"][0]["units"]
-    assert len(units) == 1
+    assert [unit["surface"] for unit in units] == ["昨", "日"]
     assert units[0]["ruby"] == "きのう"
     assert units[0]["ruby_span"] == 2
-    assert summary["applied"] == 1
+    assert units[1]["ruby"] is None
+
+
+def test_ai_protocol_uses_full_raw_string_and_derives_end_from_surface():
+    lines = [{"id": "line", "units": [{"id": "unit", "surface": "昨日は雨"}]}]
+    result = validate_ai_result(
+        {"result": [{"line_index": 0, "raw": "昨日は雨", "pronunciation": [[0, "昨日", "きのう"], [3, "雨", "あめ"]]}]},
+        lines,
+    )
+    assert result[0]["raw"] == "昨日は雨"
+    assert result[0]["pronunciation"] == [[0, "昨日", "きのう"], [3, "雨", "あめ"]]
+    with pytest.raises(PronunciationValidationError):
+        validate_ai_result({"result": [{"line_index": 0, "raw": ["昨日は雨"], "pronunciation": []}]}, lines)
+
+
+def test_ai_apply_splits_unannotated_japanese_with_fa_kara_rules():
+    lines = [{"id": "line", "units": [{"id": "unit", "surface": "かなっでABC"}]}]
+    result = validate_ai_result({"result": [{"line_index": 0, "raw": "かなっでABC", "pronunciation": []}]}, lines)
+    updated, summary = apply_ai({"lyrics": {"lines": lines}}, result, PronunciationSelection([], []))
+    assert [unit["surface"] for unit in updated["lyrics"]["lines"][0]["units"]] == ["か", "なっ", "で", "ABC"]
+    assert summary["applied"] == 0
 
 
 def test_profile_response_never_returns_api_key(tmp_path, monkeypatch):
@@ -182,6 +200,8 @@ def test_full_analysis_stops_when_ai_pronunciation_fails(tmp_path, monkeypatch):
             json={"revision": 1, "format": "text", "content": "雨"},
         ).json()
         document = imported["document"]
+        document["lyrics"]["lines"][0]["units"][0]["ruby"] = "あめ"
+        document["lyrics"]["lines"][0]["units"][0]["ruby_source"] = "manual"
         document["media"]["video_filename"] = "video.mp4"
         saved = client.put(
             f"/api/projects/{project['id']}/document",
@@ -218,4 +238,4 @@ def test_full_analysis_stops_when_ai_pronunciation_fails(tmp_path, monkeypatch):
         assert alignment_started == []
         stored = client.get(f"/api/projects/{project['id']}/document").json()
         assert stored["revision"] == saved["revision"]
-        assert stored["document"]["lyrics"]["lines"][0]["units"][0]["ruby"] is None
+        assert stored["document"]["lyrics"]["lines"][0]["units"][0]["ruby"] == "あめ"

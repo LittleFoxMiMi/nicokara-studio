@@ -27,6 +27,7 @@ import type {
   LyricUnit,
   Project,
   ProjectDocument,
+  ProjectLanguage,
 } from "./editor-types";
 import { api, formatTime, parseTime } from "./editor-types";
 import { LyricsImportDialog } from "./lyrics-import-dialog";
@@ -166,6 +167,70 @@ function updateRubyGroup(
   };
 }
 
+function updateProjectLanguage(document: ProjectDocument, language: ProjectLanguage): ProjectDocument {
+  const analysis = { ...((document as ProjectDocument & { analysis?: Record<string, unknown> }).analysis || {}) };
+  delete analysis.pronunciation;
+  delete analysis.global_alignment;
+  delete analysis.alignment;
+  delete analysis.fa_kara;
+  return {
+    ...document,
+    project: { ...document.project, language },
+    analysis,
+    pronunciation: undefined,
+    lyrics: {
+      ...document.lyrics,
+      lines: document.lyrics.lines.map((line) => ({
+        ...line,
+        units: line.units.map((unit) => ({
+          ...unit,
+          ruby: null,
+          ruby_2: null,
+          ruby_span: undefined,
+          ruby_source: "none",
+          alignment_reading: undefined,
+        })),
+      })),
+    },
+  } as ProjectDocument;
+}
+
+type MissingRubyReport = { unitIds: string[]; lines: { lineIndex: number; characters: string }[] };
+
+function missingJapaneseRuby(document: ProjectDocument): MissingRubyReport {
+  const unitIds: string[] = [];
+  const lines: { lineIndex: number; characters: string }[] = [];
+  document.lyrics.lines.forEach((line, lineIndex) => {
+    const missingCharacters: string[] = [];
+    let index = 0;
+    while (index < line.units.length) {
+      const unit = line.units[index];
+      const surface = unit.surface || "";
+      if (unit.ruby?.trim()) {
+        let covered = Array.from(surface).length;
+        let memberEnd = index + 1;
+        const span = Math.max(1, Number(unit.ruby_span || 1));
+        while (covered < span && memberEnd < line.units.length) {
+          covered += Array.from(line.units[memberEnd].surface || "").length;
+          memberEnd += 1;
+        }
+        index = memberEnd;
+        continue;
+      }
+      const kanji = Array.from(surface).filter((character) => /[一-龯々]/.test(character)).join("");
+      if (kanji) {
+        missingCharacters.push(...Array.from(kanji));
+        unitIds.push(unit.id);
+      }
+      index += 1;
+    }
+    if (missingCharacters.length) {
+      lines.push({ lineIndex, characters: Array.from(new Set(missingCharacters)).join("、") });
+    }
+  });
+  return { unitIds, lines };
+}
+
 function placeLineAt(
   document: ProjectDocument,
   lineId: string,
@@ -275,6 +340,7 @@ function splitLyricUnit(
             ruby_2: first ? original.ruby_2 : null,
             ruby_source: first ? original.ruby_source : "none",
           };
+          delete unit.alignment_reading;
           if (first && hasRuby) unit.ruby_span = Math.max(Number(original.ruby_span || 1), characters.length);
           else if (!first) unit.ruby_span = undefined;
           return unit;
@@ -384,10 +450,12 @@ function UnitSplitDialog({ unit, onClose, onConfirm }: {
 
 function UnitEditDialog({
   unit,
+  rubyEnabled,
   onClose,
   onSave,
 }: {
   unit: LyricUnit;
+  rubyEnabled: boolean;
   onClose: () => void;
   onSave: (patch: Partial<LyricUnit>) => void;
 }) {
@@ -411,20 +479,20 @@ function UnitEditDialog({
             onChange={(event) => setSurface(event.target.value)}
           />
         </label>
-        <label className="field-label">
+        {rubyEnabled && <label className="field-label">
           Ruby
           <input
             value={ruby}
             onChange={(event) => setRuby(event.target.value)}
           />
-        </label>
-        <label className="field-label">
+        </label>}
+        {rubyEnabled && <label className="field-label">
           第二 Ruby
           <input
             value={ruby2}
             onChange={(event) => setRuby2(event.target.value)}
           />
-        </label>
+        </label>}
         <div className="dialog-actions">
           <button className="button text" onClick={onClose}>
             取消
@@ -435,9 +503,10 @@ function UnitEditDialog({
             onClick={() =>
               onSave({
                 surface,
-                ruby: ruby || null,
-                ruby_2: ruby2 || null,
-                ruby_source: ruby || ruby2 ? "manual" : "none",
+                ruby: rubyEnabled && ruby ? ruby : null,
+                ruby_2: rubyEnabled && ruby2 ? ruby2 : null,
+                ruby_source: rubyEnabled && (ruby || ruby2) ? "manual" : "none",
+                alignment_reading: undefined,
               })
             }
           >
@@ -452,9 +521,11 @@ function UnitEditDialog({
 
 function UnitInspector({
   unit,
+  rubyEnabled,
   onCommit,
 }: {
   unit: LyricUnit;
+  rubyEnabled: boolean;
   onCommit: (patch: Partial<LyricUnit>) => void;
 }) {
   const [start, setStart] = useState(formatTime(unit.start_ms));
@@ -476,8 +547,9 @@ function UnitInspector({
       start_ms: startMs,
       end_ms: endMs,
       surface,
-      ruby: ruby || null,
-      ruby_source: ruby ? "manual" : "none",
+      ruby: rubyEnabled && ruby ? ruby : null,
+      ruby_source: rubyEnabled && ruby ? "manual" : "none",
+      alignment_reading: undefined,
       timing_source: "manual",
       timing_confidence: 1,
     });
@@ -492,7 +564,7 @@ function UnitInspector({
             : unit.timing_source === "estimated"
               ? "估算时间"
               : "精确时间"}
-          {unit.ruby ? ` · Ruby ${unit.ruby_source || "manual"}` : " · 未注音"}
+          {rubyEnabled ? (unit.ruby ? ` · Ruby ${unit.ruby_source || "manual"}` : " · 未注音") : ""}
         </span>
       </div>
       <label className="field-label">
@@ -503,14 +575,14 @@ function UnitInspector({
           onKeyDown={(event) => event.key === "Enter" && apply()}
         />
       </label>
-      <label className="field-label">
+      {rubyEnabled && <label className="field-label">
         Ruby
         <input
           value={ruby}
           onChange={(event) => setRuby(event.target.value)}
           onKeyDown={(event) => event.key === "Enter" && apply()}
         />
-      </label>
+      </label>}
       <div className="time-fields">
         <label className="field-label">
           开始
@@ -603,6 +675,8 @@ export function EditorPage({ id }: { id: string }) {
   const [fullAnalysisOpen, setFullAnalysisOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [workflowNotice, setWorkflowNotice] = useState<string | null>(null);
+  const [pendingLanguage, setPendingLanguage] = useState<ProjectLanguage | null>(null);
+  const [missingRubyDialog, setMissingRubyDialog] = useState<MissingRubyReport | null>(null);
   const [alignmentBackend, setAlignmentBackend] = useState<"fa_kara" | "stable_ts">("fa_kara");
   const [faKaraModel, setFaKaraModel] = useState<"mms" | "yohane">("mms");
   const [fullSteps, setFullSteps] = useState<Record<string, boolean>>({ separation: true, transcription: true, pronunciation: true, global_alignment: true, alignment: true });
@@ -849,6 +923,27 @@ export function EditorPage({ id }: { id: string }) {
     if (!current) return;
     replaceDocument({ ...current, styles: { ...(current.styles || {}), ...patch } }, true);
   }
+  function changeLanguage(language: ProjectLanguage) {
+    const current = documentRef.current;
+    if (!current || (current.project.language || "jp") === language) return;
+    setPendingLanguage(language);
+  }
+  function confirmLanguageChange() {
+    const current = documentRef.current;
+    if (!current || !pendingLanguage) return;
+    replaceDocument(updateProjectLanguage(current, pendingLanguage), true);
+    setPendingLanguage(null);
+  }
+  function requireJapaneseRuby(): boolean {
+    const current = documentRef.current;
+    if (!current || current.project.language === "cn") return true;
+    const report = missingJapaneseRuby(current);
+    if (report.lines.length) {
+      setMissingRubyDialog(report);
+      return false;
+    }
+    return true;
+  }
   function saveStylePreset(name: string) {
     const current = documentRef.current;
     if (!current) return;
@@ -980,13 +1075,13 @@ export function EditorPage({ id }: { id: string }) {
     }
   }
 
-  async function runPronunciation(mode: "local" | "ai", lineIds?: string[]) {
-    if (!documentRef.current?.lyrics.lines.length) return;
+  async function runPronunciation(mode: "local" | "ai", lineIds?: string[], targetUnitIds?: string[]) {
+    if (!documentRef.current?.lyrics.lines.length || documentRef.current.project.language === "cn") return;
     setPronunciationRunning(true);
     setError(null);
     try {
       const revision = await saveNow();
-      const unitIds = selectedId && !lineIds?.length ? [selectedId] : [];
+      const unitIds = targetUnitIds || (selectedId && !lineIds?.length ? [selectedId] : []);
       const job = await api<AnalysisJob>(`/projects/${id}/pronunciation-job`, {
         method: "POST",
         body: JSON.stringify({ revision, line_ids: lineIds || [], unit_ids: unitIds, mode, overwrite_policy: "unlocked_only" }),
@@ -1001,13 +1096,18 @@ export function EditorPage({ id }: { id: string }) {
   }
 
   async function startGlobalAlignment() {
+    if (documentRef.current?.project.language === "cn") {
+      setWorkflowNotice("中文工程使用 FA-Kara 和拼音进行对齐。");
+      return;
+    }
+    if (!requireJapaneseRuby()) return;
     if (!documentRef.current?.media.video_filename) {
       setWorkflowNotice("请先上传视频，再进行 stable-ts 全局对齐。");
       return;
     }
     const analysisDocument = documentRef.current as ProjectDocument & { analysis?: Record<string, { status?: string }>; pronunciation?: { last_run?: { mode?: string } } };
     const analysis = analysisDocument.analysis || {};
-    const pronunciationDone = analysis.pronunciation?.status === "completed"
+    const pronunciationDone = analysisDocument.project.language === "cn" || analysis.pronunciation?.status === "completed"
       || ["local", "ai", "local_fallback"].includes(String(analysisDocument.pronunciation?.last_run?.mode || ""))
       || analysisDocument.lyrics.lines.every((line) => line.units.every((unit) => !unit.surface.match(/[一-龯]/) || unit.ruby));
     if (documentRef.current.media.waveform_source !== "vocals") {
@@ -1040,6 +1140,11 @@ export function EditorPage({ id }: { id: string }) {
   }
 
   async function startAlignment(lineIds?: string[]) {
+    if (documentRef.current?.project.language === "cn") {
+      setWorkflowNotice("中文工程使用 FA-Kara 和拼音进行对齐。");
+      return;
+    }
+    if (!requireJapaneseRuby()) return;
     if (!documentRef.current?.media.video_filename) {
       setWorkflowNotice("请先上传视频，再进行 stable-ts 词/短语精修。");
       return;
@@ -1078,6 +1183,7 @@ export function EditorPage({ id }: { id: string }) {
   }
 
   async function startFaKara(lineIds?: string[]) {
+    if (!requireJapaneseRuby()) return;
     if (!documentRef.current?.media.video_filename) {
       setWorkflowNotice("请先上传视频，再进行 FA-Kara 对齐。");
       return;
@@ -1092,7 +1198,7 @@ export function EditorPage({ id }: { id: string }) {
       setWorkflowNotice("请先完成 Whisper 人声粗识别，再进行 FA-Kara 对齐。");
       return;
     }
-    const pronunciationDone = analysis.pronunciation?.status === "completed"
+    const pronunciationDone = analysisDocument.project.language === "cn" || analysis.pronunciation?.status === "completed"
       || ["local", "ai", "local_fallback"].includes(String(analysisDocument.pronunciation?.last_run?.mode || ""))
       || analysisDocument.lyrics.lines.every((line) => line.units.every((unit) => !unit.surface.match(/[一-龯]/) || unit.ruby));
     if (!pronunciationDone) {
@@ -1117,18 +1223,21 @@ export function EditorPage({ id }: { id: string }) {
   }
 
   async function startFullAnalysis() {
+    if (!requireJapaneseRuby()) return;
     setFullAnalysisOpen(false);
     setAnalysisStarting(true);
     setError(null);
     try {
       const revision = await saveNow();
-      const stepOrder = alignmentBackend === "fa_kara"
-        ? ["separation", "transcription", "pronunciation", "fa_kara"]
+      const language = documentRef.current?.project.language === "cn" ? "cn" : "jp";
+      const selectedBackend = language === "cn" ? "fa_kara" : alignmentBackend;
+      const stepOrder = selectedBackend === "fa_kara"
+        ? (language === "cn" ? ["separation", "transcription", "fa_kara"] : ["separation", "transcription", "pronunciation", "fa_kara"])
         : ["separation", "transcription", "pronunciation", "global_alignment", "alignment"];
       const steps = stepOrder.filter((key) => fullSteps[key]);
       const job = await api<AnalysisJob>(`/projects/${id}/analysis`, {
         method: "POST",
-        body: JSON.stringify({ revision, steps, alignment_backend: alignmentBackend, fa_kara_model: faKaraModel, line_ids: [], unit_ids: [], overwrite_policy: "unlocked_only", preserve_line_anchors: documentRef.current?.lyrics.source_type === "lrc" }),
+        body: JSON.stringify({ revision, steps, alignment_backend: selectedBackend, fa_kara_model: faKaraModel, line_ids: [], unit_ids: [], overwrite_policy: "unlocked_only", preserve_line_anchors: documentRef.current?.lyrics.source_type === "lrc" }),
       });
       setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]);
     } catch (reason) {
@@ -1140,6 +1249,7 @@ export function EditorPage({ id }: { id: string }) {
   }
 
   async function openFullAnalysis() {
+    if (!requireJapaneseRuby()) return;
     setAnalysisStarting(true);
     setError(null);
     try {
@@ -1147,8 +1257,10 @@ export function EditorPage({ id }: { id: string }) {
       const loadedJobs = await api<AnalysisJob[]>(`/jobs?project_id=${encodeURIComponent(id)}&limit=12`);
       await reloadFromServer();
       setJobs(loadedJobs);
-      setFullSteps(alignmentBackend === "fa_kara"
-        ? { separation: true, transcription: true, pronunciation: true, fa_kara: true }
+      const language = documentRef.current?.project.language === "cn" ? "cn" : "jp";
+      const selectedBackend = language === "cn" ? "fa_kara" : alignmentBackend;
+      setFullSteps(selectedBackend === "fa_kara"
+        ? (language === "cn" ? { separation: true, transcription: true, fa_kara: true } : { separation: true, transcription: true, pronunciation: true, fa_kara: true })
         : { separation: true, transcription: true, pronunciation: true, global_alignment: true, alignment: true });
       setFullAnalysisOpen(true);
     } catch (reason) {
@@ -1232,6 +1344,8 @@ export function EditorPage({ id }: { id: string }) {
   );
   const hasVideo = Boolean(document.media.video_filename),
     lines = document.lyrics.lines;
+  const language: ProjectLanguage = document.project.language === "cn" ? "cn" : "jp";
+  const effectiveAlignmentBackend = language === "cn" ? "fa_kara" : alignmentBackend;
   const activeJob = jobs.find((job) => ["QUEUED", "PREPARING", "RUNNING"].includes(job.status));
   const visibleJob = activeJob || jobs[0] || null;
   const selected =
@@ -1302,17 +1416,17 @@ export function EditorPage({ id }: { id: string }) {
               <FileText size={17} />
               {lines.length ? "替换歌词" : "添加歌词"}
             </button>
-            <button className="button tonal" disabled={!lines.length || pronunciationRunning} onClick={() => void runPronunciation("local")} title="为未锁定单元生成本地日语读音">
+            <button className="button tonal" disabled={language === "cn" || !lines.length || pronunciationRunning} onClick={() => void runPronunciation("local")} title={language === "cn" ? "中文工程不需要注音" : "为未锁定单元生成本地日语读音"}>
               <WandSparkles size={17} />
               {pronunciationRunning ? "注音中" : "本地注音"}
             </button>
-            <button className="button tonal" disabled={!lines.length || pronunciationRunning} onClick={() => void runPronunciation("ai")} title="使用当前 AI profile 生成读音，失败时保留现有歌词和 Ruby">
+            <button className="button tonal" disabled={language === "cn" || !lines.length || pronunciationRunning} onClick={() => void runPronunciation("ai")} title={language === "cn" ? "中文工程不需要注音" : "使用当前 AI profile 生成读音，失败时保留现有歌词和 Ruby"}>
               <WandSparkles size={17} />AI 注音
             </button>
             <button className="button tonal" disabled={!hasVideo || !lines.length || Boolean(activeJob) || analysisStarting} onClick={() => void startTranscription()} title="仅运行 Whisper 人声粗识别">
               <AudioLines size={17} />粗识别
             </button>
-            {alignmentBackend === "stable_ts" ? <>
+            {effectiveAlignmentBackend === "stable_ts" ? <>
               <button className="button tonal" disabled={!hasVideo || !lines.length || Boolean(activeJob) || analysisStarting} onClick={() => void startGlobalAlignment()} title="使用 AI 注音完整歌词生成行级时间">
                 <AudioLines size={17} />全局对齐
               </button>
@@ -1465,6 +1579,13 @@ export function EditorPage({ id }: { id: string }) {
                   }
                 />
               </label>
+              <label className="field-label">
+                歌词语言
+                <select value={language} onChange={(event) => changeLanguage(event.target.value as ProjectLanguage)}>
+                  <option value="jp">JP · 日语</option>
+                  <option value="cn">CN · 中文</option>
+                </select>
+              </label>
               <div className="field-row">
                 <label className="field-label">
                   歌曲名
@@ -1574,6 +1695,7 @@ export function EditorPage({ id }: { id: string }) {
             {selected && (
               <UnitInspector
                 unit={selected.unit}
+                rubyEnabled={language === "jp"}
                 onCommit={(patch) =>
                   updateSelected(
                     selected.line.id,
@@ -1612,6 +1734,7 @@ export function EditorPage({ id }: { id: string }) {
             const current = documentRef.current;
             if (current) replaceDocument(updateRubyGroup(current, lineId, unitIds, ruby, rubySpan, clearUnitIds), true);
           }}
+          rubyEnabled={language === "jp"}
           onOpenEditor={setEditingId}
           onDropLine={placeLine}
           onOpenContextMenu={(lineId, unitId, lineLevel, x, y) => {
@@ -1632,6 +1755,7 @@ export function EditorPage({ id }: { id: string }) {
       {editing && (
         <UnitEditDialog
           unit={editing}
+          rubyEnabled={language === "jp"}
           onClose={() => setEditingId(null)}
           onSave={(patch) => {
             const owner = lines.find((line) =>
@@ -1663,8 +1787,8 @@ export function EditorPage({ id }: { id: string }) {
         return <div className="line-context-menu" style={{ left: lineMenu.x, top: lineMenu.y }} onPointerDown={(event) => event.stopPropagation()}>
           <strong>时间单元</strong>
           <button disabled={menuLine?.timing_precision === "line"} onClick={() => { setLineMenu(null); collapseLine(lineMenu.lineId); }}>还原为整句时间单元</button>
-          <button disabled={menuLine?.start_ms === null || menuLine?.end_ms === null} onClick={() => { setLineMenu(null); alignmentBackend === "fa_kara" ? void startFaKara([lineMenu.lineId]) : void startAlignment([lineMenu.lineId]); }}>
-            {alignmentBackend === "fa_kara" ? "用 FA-Kara 重新识别此句" : "用 stable-ts 重新识别此句"}
+          <button disabled={menuLine?.start_ms === null || menuLine?.end_ms === null} onClick={() => { setLineMenu(null); effectiveAlignmentBackend === "fa_kara" ? void startFaKara([lineMenu.lineId]) : void startAlignment([lineMenu.lineId]); }}>
+            {effectiveAlignmentBackend === "fa_kara" ? "用 FA-Kara 重新识别此句" : "用 stable-ts 重新识别此句"}
           </button>
           {menuUnit && Array.from(menuUnit.surface).length > 1 && <button onClick={() => { setLineMenu(null); setSplitTarget({ lineId: lineMenu.lineId, unitId: menuUnit.id }); }}><Scissors size={15} />拆分此 Unit</button>}
         </div>;
@@ -1674,12 +1798,16 @@ export function EditorPage({ id }: { id: string }) {
           <section className="dialog full-analysis-dialog" role="dialog" aria-modal="true" aria-labelledby="full-analysis-title">
             <div className="dialog-head"><div><h2 id="full-analysis-title">确认全曲分析</h2><p className="muted">将按勾选顺序执行；跳过未完成流程会被后端拒绝。</p></div><button className="icon-button" title="关闭" onClick={() => setFullAnalysisOpen(false)}><X size={18} /></button></div>
             <div className="pipeline-preview">
-              {(alignmentBackend === "fa_kara" ? [
+              {(effectiveAlignmentBackend === "fa_kara" ? (language === "cn" ? [
+                ["separation", "KARA2 分离人声", "提取音频并生成 vocals / instrumental"],
+                ["transcription", "Whisper 人声粗识别", "保存实际演唱的 segment 文本和粗时间"],
+                ["fa_kara", `FA-Kara 对齐 · ${faKaraModel === "yohane" ? "YoHane" : "MMS_FA"}`, "使用中文拼音生成词/字级时间"],
+              ] : [
                 ["separation", "KARA2 分离人声", "提取音频并生成 vocals / instrumental"],
                 ["transcription", "Whisper 人声粗识别", "保存实际演唱的 segment 文本和粗时间"],
                 ["pronunciation", "AI 注音", "结合完整歌词与 Whisper segment 生成 Ruby"],
                 ["fa_kara", `FA-Kara 对齐 · ${faKaraModel === "yohane" ? "YoHane" : "MMS_FA"}`, "一次生成行级与词/短语时间"],
-              ] : [
+              ]) : [
                 ["separation", "KARA2 分离人声", "提取音频并生成 vocals / instrumental"],
                 ["transcription", "Whisper 人声粗识别", "保存实际演唱的 segment 文本和粗时间"],
                 ["pronunciation", "AI 注音", "结合完整歌词与 Whisper segment 生成 Ruby"],
@@ -1702,6 +1830,25 @@ export function EditorPage({ id }: { id: string }) {
             <div className="dialog-head"><h2 id="workflow-notice-title">暂时无法开始</h2><button className="icon-button" title="关闭" onClick={() => setWorkflowNotice(null)}><X size={18} /></button></div>
             <p className="workflow-notice-copy">{workflowNotice}</p>
             <div className="dialog-actions"><button className="button filled" onClick={() => setWorkflowNotice(null)}>知道了</button></div>
+          </section>
+        </div>
+      )}
+      {pendingLanguage && (
+        <div className="scrim">
+          <section className="dialog workflow-notice" role="alertdialog" aria-modal="true" aria-labelledby="language-change-title">
+            <div className="dialog-head"><h2 id="language-change-title">确认切换歌词语言</h2><button className="icon-button" title="关闭" onClick={() => setPendingLanguage(null)}><X size={18} /></button></div>
+            <p className="workflow-notice-copy">切换语言会清除当前工程的 Ruby、Ruby 范围和相关分析结果。</p>
+            <div className="dialog-actions"><button className="button text" onClick={() => setPendingLanguage(null)}>取消</button><button className="button filled" onClick={confirmLanguageChange}><Check size={17} />切换并清除 Ruby</button></div>
+          </section>
+        </div>
+      )}
+      {missingRubyDialog && (
+        <div className="scrim">
+          <section className="dialog workflow-notice" role="alertdialog" aria-modal="true" aria-labelledby="missing-ruby-title">
+            <div className="dialog-head"><h2 id="missing-ruby-title">无法开始对齐</h2><button className="icon-button" title="关闭" onClick={() => setMissingRubyDialog(null)}><X size={18} /></button></div>
+            <p className="workflow-notice-copy">以下日文汉字尚未注音：</p>
+            <ul className="missing-ruby-list">{missingRubyDialog.lines.map((item) => <li key={item.lineIndex}>第 {item.lineIndex + 1} 行：{item.characters}</li>)}</ul>
+            <div className="dialog-actions"><button className="button tonal" onClick={() => { const ids = missingRubyDialog.unitIds; setMissingRubyDialog(null); void runPronunciation("local", undefined, ids); }}><WandSparkles size={17} />使用本地注音</button><button className="button filled" onClick={() => setMissingRubyDialog(null)}>确定</button></div>
           </section>
         </div>
       )}

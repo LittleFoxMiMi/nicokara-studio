@@ -14,6 +14,7 @@ from app.media.waveform import generate_waveform
 from app.services.audio import prepare_source_audio
 from app.schemas.projects import AnalysisRequest, DocumentSave, ExportRequest, FAKaraRequest, FullAnalysisRequest, LyricsDetect, LyricsImport, ProjectCreate, ProjectPatch, ProjectResponse, SeparationRequest
 from app.services.kirakara_export import build_worker_html, export_output_path, export_raw_output_path
+from app.services.fa_kara_text import missing_japanese_ruby, normalize_language
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -28,7 +29,33 @@ def project_or_404(db: Database, project_id: str) -> dict:
     return project
 
 def initial_document(project_id: str, name: str) -> dict:
-    return {"schema_version": 1, "project": {"id": project_id, "name": name, "title": "", "artist": "", "revision": 1}, "media": {"video_asset_id": None, "duration_ms": None, "width": None, "height": None, "fps": None, "video_filename": None, "thumbnail_url": None}, "lyrics": {"source_type": "manual", "lines": []}, "styles": {}, "layout": {}, "export_presets": []}
+    return {"schema_version": 1, "project": {"id": project_id, "name": name, "title": "", "artist": "", "language": "jp", "revision": 1}, "media": {"video_asset_id": None, "duration_ms": None, "width": None, "height": None, "fps": None, "video_filename": None, "thumbnail_url": None}, "lyrics": {"source_type": "manual", "lines": []}, "styles": {}, "layout": {}, "export_presets": []}
+
+
+def document_language(document: dict) -> str:
+    return normalize_language(document.get("project", {}).get("language"))
+
+
+def _missing_ruby_message(document: dict) -> str | None:
+    missing = missing_japanese_ruby(document.get("lyrics", {}).get("lines", []))
+    if document_language(document) != "jp" or not missing:
+        return None
+    labels = [f"第 {item['line_index'] + 1} 行：{item['characters']}" for item in missing]
+    return "以下日文汉字尚未注音：" + "；".join(labels) + "。请先完成本地注音或 AI 注音。"
+
+
+def normalize_document(document: dict) -> dict:
+    language = document_language(document)
+    document.setdefault("project", {})["language"] = language
+    if language == "cn":
+        for line in document.get("lyrics", {}).get("lines", []):
+            for unit in line.get("units", []):
+                unit["ruby"] = None
+                unit["ruby_2"] = None
+                unit["ruby_source"] = "none"
+                unit.pop("ruby_span", None)
+                unit.pop("ruby_confidence", None)
+    return document
 
 @router.get("", response_model=list[ProjectResponse])
 def list_projects(request: Request): return services(request)[1].list_projects()
@@ -96,7 +123,7 @@ def get_document(project_id: str, request: Request):
 @router.put("/{project_id}/document")
 def save_document(project_id: str, payload: DocumentSave, request: Request):
     db = services(request)[1]; project_or_404(db, project_id)
-    try: return db.save_document(project_id, payload.document, payload.revision)
+    try: return db.save_document(project_id, normalize_document(payload.document), payload.revision)
     except ValueError as exc:
         raise HTTPException(409, {"code": "revision_conflict"}) from exc
 
@@ -118,6 +145,7 @@ def import_lyrics(project_id: str, payload: LyricsImport, request: Request):
             filename=payload.filename,
             media_duration_ms=duration if isinstance(duration, int) else None,
         )
+        normalize_document(document)
         result = db.save_document(project_id, document, payload.revision)
     except ValueError as exc:
         if str(exc).startswith("revision_conflict"):
@@ -184,6 +212,8 @@ def fa_kara(project_id: str, payload: FAKaraRequest, request: Request):
         raise HTTPException(422, "请先上传视频")
     if not document.get("lyrics", {}).get("lines"):
         raise HTTPException(422, "请先添加歌词")
+    if message := _missing_ruby_message(document):
+        raise HTTPException(422, message)
     if not (settings.projects_dir / project_id / "derived" / "vocals_asr.wav").is_file():
         raise HTTPException(422, "请先完成 KARA2 人声分离")
     completion = _analysis_completion(document, project_id, settings)
@@ -205,10 +235,11 @@ def _analysis_completion(document: dict, project_id: str, settings: Settings) ->
     lines = document.get("lyrics", {}).get("lines", [])
     has_kanji = any("一" <= char <= "龯" for line in lines for unit in line.get("units", []) for char in str(unit.get("surface", "")))
     analysis = document.get("analysis", {})
+    language = document_language(document)
     return {
         "separation": (derived / "vocals_asr.wav").is_file(),
         "transcription": (derived / "transcript.json").is_file() and analysis.get("transcription", {}).get("status") == "completed",
-        "pronunciation": (not has_kanji) or analysis.get("pronunciation", {}).get("status") == "completed" or document.get("pronunciation", {}).get("last_run", {}).get("mode") in {"local", "ai", "local_fallback"},
+        "pronunciation": language == "cn" or (not has_kanji) or analysis.get("pronunciation", {}).get("status") == "completed" or document.get("pronunciation", {}).get("last_run", {}).get("mode") in {"local", "ai", "local_fallback"},
         "global_alignment": (derived / "stable_global.json").is_file() and bool(lines) and all(line.get("start_ms") is not None and line.get("end_ms") is not None for line in lines) and analysis.get("global_alignment", {}).get("status") == "completed",
         "alignment": analysis.get("alignment", {}).get("status") == "completed",
         "fa_kara": (derived / "fa_kara.json").is_file() and analysis.get("fa_kara", {}).get("status") == "completed",
@@ -227,14 +258,17 @@ def _validate_full_steps(
         raise HTTPException(409, {"code": "revision_conflict"})
     if not document.get("media", {}).get("video_filename"):
         raise HTTPException(422, "请先上传视频")
+    language = document_language(document)
     steps = list(dict.fromkeys(payload.steps))
+    if language == "cn":
+        steps = [step for step in steps if step != "pronunciation"]
     if not steps:
         raise HTTPException(422, "至少选择一个分析流程")
     complete = _analysis_completion(document, project_id, settings)
     order = (
-        ["separation", "transcription", "pronunciation", "fa_kara"]
+        (["separation", "transcription", "fa_kara"] if language == "cn" else ["separation", "transcription", "pronunciation", "fa_kara"])
         if alignment_backend == "fa_kara"
-        else ["separation", "transcription", "pronunciation", "global_alignment", "alignment"]
+        else (["separation", "transcription", "global_alignment", "alignment"] if language == "cn" else ["separation", "transcription", "pronunciation", "global_alignment", "alignment"])
     )
     unexpected = [key for key in steps if key not in order]
     if unexpected:
@@ -247,6 +281,9 @@ def _validate_full_steps(
             missing = [item for item in previous if item not in steps and not complete[item]]
             if missing:
                 raise HTTPException(422, f"{key} 的前置流程尚未完成：{missing[0]}")
+    if any(step in {"fa_kara", "global_alignment", "alignment"} for step in steps):
+        if message := _missing_ruby_message(document):
+            raise HTTPException(422, message)
 
 
 @router.post("/{project_id}/analysis", status_code=202)
@@ -258,9 +295,13 @@ def full_analysis(project_id: str, payload: FullAnalysisRequest, request: Reques
         raise HTTPException(404, "工程文档不存在")
     configured = db.settings()
     alignment_backend = payload.alignment_backend or str(configured.get("alignment_backend") or "fa_kara")
+    if document_language(document) == "cn":
+        alignment_backend = "fa_kara"
     _validate_full_steps(project, document, project_id, payload, settings, alignment_backend)
     body = payload.model_dump()
     body["steps"] = list(dict.fromkeys(payload.steps))
+    if document_language(document) == "cn":
+        body["steps"] = [step for step in body["steps"] if step != "pronunciation"]
     body["alignment_backend"] = alignment_backend
     body["fa_kara_model"] = payload.fa_kara_model or str(configured.get("fa_kara_model") or "mms")
     return request.app.state.analysis_runner.enqueue(project_id, "FULL_ANALYSIS", payload.revision, body)
@@ -273,6 +314,10 @@ def align_global(project_id: str, payload: AnalysisRequest, request: Request):
     document = db.document(project_id)
     if not document:
         raise HTTPException(404, "工程文档不存在")
+    if document_language(document) == "cn":
+        raise HTTPException(422, "中文工程请使用 FA-Kara 对齐")
+    if message := _missing_ruby_message(document):
+        raise HTTPException(422, message)
     if project["revision"] != payload.revision:
         raise HTTPException(409, {"code": "revision_conflict"})
     completion = _analysis_completion(document, project_id, settings)
@@ -290,6 +335,10 @@ def align(project_id: str, payload: AnalysisRequest, request: Request):
     document = db.document(project_id)
     if not document:
         raise HTTPException(404, "工程文档不存在")
+    if document_language(document) == "cn":
+        raise HTTPException(422, "中文工程请使用 FA-Kara 对齐")
+    if message := _missing_ruby_message(document):
+        raise HTTPException(422, message)
     if project["revision"] != payload.revision:
         raise HTTPException(409, {"code": "revision_conflict"})
     completion = _analysis_completion(document, project_id, settings)
@@ -310,6 +359,8 @@ def pronunciation_job(project_id: str, payload: dict, request: Request):
         raise HTTPException(422, "请先添加歌词")
     if project["revision"] != payload.get("revision"):
         raise HTTPException(409, {"code": "revision_conflict"})
+    if document_language(document) == "cn":
+        raise HTTPException(422, "中文工程不需要注音")
     body = {"revision": project["revision"], "line_ids": payload.get("line_ids", []), "unit_ids": payload.get("unit_ids", []), "overwrite_policy": payload.get("overwrite_policy", "unlocked_only"), "profile_id": payload.get("profile_id"), "mode": payload.get("mode", "ai"), "steps": ["pronunciation"]}
     return request.app.state.analysis_runner.enqueue(project_id, "PRONUNCIATION", project["revision"], body)
 
