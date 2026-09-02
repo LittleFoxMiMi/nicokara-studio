@@ -13,11 +13,11 @@ from app.core.config import Settings
 from app.core.database import Database
 from app.media.waveform import generate_waveform
 from app.services.alignment import AlignmentQualityError
-from app.services.audio import AudioProcessingError, extract_audio_clip, prepare_source_audio
+from app.services.audio import AudioProcessingError, convert_audio, extract_audio_clip, prepare_source_audio
 from app.services.cancellation import OperationCanceled
 from app.services.pronunciation import PronunciationSelection, PronunciationValidationError, apply_local, run_ai_pronunciation
 from app.services.fa_kara_text import normalize_language
-from app.services.separation import Kara2Separator
+from app.services.separation import VocalSeparator
 from app.services.stable_ts import StableTSAligner, StableTSAlignmentError, rough_line_ranges
 from app.services.fa_kara import FAKaraAligner
 from app.services.transcription import FasterWhisperTranscriber, Transcript, TranscriptSegment, TranscriptWord
@@ -37,7 +37,7 @@ class JobCanceled(RuntimeError):
 
 
 STEP_LABELS = {
-    "separation": "KARA2 分离人声",
+    "separation": "人声分离",
     "transcription": "Whisper 粗识别",
     "pronunciation": "AI 注音",
     "global_alignment": "stable-ts 全局对齐",
@@ -52,7 +52,7 @@ class AnalysisPipeline:
         self.settings = settings
         self.database = database
         self.model_store = model_store or ResidentModelStore()
-        self.separator = Kara2Separator(settings.models_dir / "separator", settings.ffmpeg_path, model_store=self.model_store)
+        self.separator = VocalSeparator(settings.models_dir / "separator", settings.ffmpeg_path, model_store=self.model_store)
         self.transcriber = FasterWhisperTranscriber(download_root=settings.models_dir / "whisper", model_store=self.model_store)
 
     def _step(self, job_id: str, key: str, progress: float, message: str, *, status: str | None = None) -> None:
@@ -105,24 +105,55 @@ class AnalysisPipeline:
             raise AudioProcessingError("工程尚未上传视频")
         self._step(job_id, "separation", 0.02, "正在准备 44.1 kHz 双声道音频")
         source_audio, _ = prepare_source_audio(video, derived, self.settings.ffmpeg_path)
-        self._step(job_id, "separation", 0.18, "音频已准备，正在下载或加载 KARA2 模型")
-        vocals, instrumental, vocals_asr = self.separator.separate(
-            source_audio,
-            derived,
-            model=payload.get("separator_model") or payload.get("model") or values.get("separator_model") or self.settings.separator_model,
-            device=payload.get("separator_device") or payload.get("device") or values.get("separator_device") or self.settings.separator_device,
-            progress_callback=lambda value, message: self._step(job_id, "separation", value, message),
-            should_cancel=lambda: self._should_cancel(job_id),
-        )
-        self._step(job_id, "separation", 0.78, "KARA2 分离完成，正在生成 vocals 波形")
+        legacy_model = payload.get("separator_model") or payload.get("model") or values.get("separator_model") or self.settings.separator_model
+        vocals_model = payload.get("separator_vocals_model") or values.get("separator_vocals_model") or legacy_model
+        device = payload.get("separator_device") or payload.get("device") or values.get("separator_device") or self.settings.separator_device
+        token = job_id.replace("-", "")[:12]
+        staged_vocals_name = f"{token}_vocals.wav"
+        staged_instrumental_name = f"{token}_unused_instrumental.wav"
+        staged_asr_name = f"{token}_vocals_asr.wav"
+        staged_paths = [
+            derived / name for name in (
+                staged_vocals_name,
+                staged_instrumental_name,
+                staged_asr_name,
+            )
+        ]
+        self._step(job_id, "separation", 0.18, f"正在加载人声模型：{vocals_model}")
+        try:
+            staged_vocals, _, staged_asr = self.separator.separate(
+                source_audio,
+                derived,
+                model=str(vocals_model),
+                device=str(device),
+                progress_callback=lambda value, message: self._step(job_id, "separation", 0.18 + value * 0.58, message),
+                should_cancel=lambda: self._should_cancel(job_id),
+                vocals_filename=staged_vocals_name,
+                instrumental_filename=staged_instrumental_name,
+                asr_filename=staged_asr_name,
+            )
+            if staged_asr is None:
+                raise AudioProcessingError("无法生成 Whisper 人声音频")
+            vocals = derived / "vocals.wav"
+            vocals_asr = derived / "vocals_asr.wav"
+            staged_vocals.replace(vocals)
+            staged_asr.replace(vocals_asr)
+        finally:
+            for staged_path in staged_paths:
+                staged_path.unlink(missing_ok=True)
+        self._step(job_id, "separation", 0.78, "人声分离完成，正在生成 vocals 波形")
         vocal_waveform = derived / "vocal_waveform.json"
         if not generate_waveform(vocals, vocal_waveform, self.settings.ffmpeg_path):
             raise AudioProcessingError("无法生成人声波形")
         document["media"] = {**document.get("media", {}), "waveform_source": "vocals", "waveform_url": f"/api/projects/{project_id}/waveform", "vocal_waveform_generated": True}
-        document.setdefault("analysis", {})["separation"] = {"status": "completed", "job_id": job_id}
+        document.setdefault("analysis", {})["separation"] = {
+            "status": "completed",
+            "job_id": job_id,
+            "vocals_model": vocals_model,
+        }
         document, revision = self._save(project_id, document, revision)
-        self._step(job_id, "separation", 1.0, "KARA2 人声分离完成")
-        return document, revision, {"source_audio": source_audio.name, "vocals": vocals.name, "instrumental": instrumental.name, "vocals_asr": vocals_asr.name, "vocal_waveform": vocal_waveform.name, "output_revision": revision}
+        self._step(job_id, "separation", 1.0, "人声分离完成")
+        return document, revision, {"source_audio": source_audio.name, "vocals": vocals.name, "vocals_asr": vocals_asr.name, "vocal_waveform": vocal_waveform.name, "vocals_model": vocals_model, "output_revision": revision}
 
     @staticmethod
     def _read_transcript(path: Path) -> Transcript:
@@ -138,7 +169,7 @@ class AnalysisPipeline:
         source_asr = derived / "source_asr.wav"
         audio = vocals_asr if vocals_asr.is_file() else source_asr
         if not audio.is_file():
-            raise AudioProcessingError("请先完成 KARA2 人声分离")
+            raise AudioProcessingError("请先完成人声分离")
         self._step(job_id, "transcription", 0.02, "正在下载或加载 Whisper 模型")
         start_ms, end_ms = payload.get("start_ms"), payload.get("end_ms")
         transcript = self.transcriber.transcribe(
@@ -201,7 +232,7 @@ class AnalysisPipeline:
         audio = derived / "vocals_asr.wav"
         global_result = derived / "stable_global.json"
         if not audio.is_file():
-            raise AudioProcessingError("请先完成 KARA2 人声分离")
+            raise AudioProcessingError("请先完成人声分离")
         model_name = payload.get("whisper_model") or payload.get("model") or values.get("whisper_model") or self.settings.whisper_model
         stable = self._stable_aligner(job_id, "global_alignment", model_name, values)
         token_step = int(values.get("stable_ts_token_step", 100))
@@ -217,7 +248,7 @@ class AnalysisPipeline:
         _, derived, _ = self._paths(project_id)
         audio = derived / "vocals_asr.wav"
         if not audio.is_file():
-            raise AudioProcessingError("请先完成 KARA2 人声分离")
+            raise AudioProcessingError("请先完成人声分离")
         model_name = payload.get("whisper_model") or payload.get("model") or values.get("whisper_model") or self.settings.whisper_model
         stable = self._stable_aligner(job_id, "alignment", model_name, values)
         line_ids = payload.get("line_ids") or None
@@ -245,7 +276,7 @@ class AnalysisPipeline:
         _, derived, _ = self._paths(project_id)
         audio = derived / "vocals_asr.wav"
         if not audio.is_file():
-            raise AudioProcessingError("请先完成 KARA2 人声分离，再运行 FA-Kara 对齐")
+            raise AudioProcessingError("请先完成人声分离，再运行 FA-Kara 对齐")
         model_name = str(payload.get("fa_kara_model") or payload.get("model") or values.get("fa_kara_model") or "mms")
         aligner = FAKaraAligner(
             lambda: self.transcriber.get_fa_kara_model(
@@ -299,14 +330,76 @@ class AnalysisPipeline:
         extract_audio_clip(audio, clip_path, self.settings.ffmpeg_path, start_ms, end_ms)
         return clip_path, start_ms
 
-    def _export(self, job_id: str, project_id: str, document: dict, payload: dict) -> dict:
+    def _prepare_export_instrumental(self, job_id: str, project_id: str, payload: dict, values: dict) -> Path:
+        video, derived, _ = self._paths(project_id)
+        if not video.is_file():
+            raise AudioProcessingError("工程尚未上传视频")
+        legacy_model = values.get("separator_model") or self.settings.separator_model
+        model = payload.get("separator_instrumental_model") or values.get("separator_instrumental_model") or legacy_model
+        device = payload.get("separator_device") or values.get("separator_device") or self.settings.separator_device
+        self._step(job_id, "export", 0.01, "正在检查 OFF VOCAL 音频缓存")
+        source_audio_path = derived / "source_audio.wav"
+        if source_audio_path.is_file() and source_audio_path.stat().st_mtime_ns < video.stat().st_mtime_ns:
+            source_audio_path.unlink(missing_ok=True)
+            (derived / "source_asr.wav").unlink(missing_ok=True)
+        if not source_audio_path.is_file() or source_audio_path.stat().st_size == 0:
+            convert_audio(video, source_audio_path, self.settings.ffmpeg_path, channels=2, sample_rate=44100)
+        source_audio = source_audio_path
+        instrumental = derived / "instrumental.wav"
+        cache_path = derived / "instrumental.meta.json"
+        cache_key = {
+            "version": 1,
+            "model": str(model),
+            "video_size": video.stat().st_size,
+            "video_mtime_ns": video.stat().st_mtime_ns,
+            "source_size": source_audio.stat().st_size,
+            "source_mtime_ns": source_audio.stat().st_mtime_ns,
+        }
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.is_file() else None
+        except (OSError, ValueError):
+            cached = None
+        if instrumental.is_file() and instrumental.stat().st_size > 0 and cached == cache_key:
+            self._step(job_id, "export", 0.2, f"正在复用 OFF VOCAL 分离缓存：{model}")
+            return instrumental
+
+        self._step(job_id, "export", 0.02, f"正在使用 {model} 生成 OFF VOCAL 音频")
+        token = job_id.replace("-", "")[:12]
+        staged_vocals_name = f"{token}_unused_export_vocals.wav"
+        staged_instrumental_name = f"{token}_export_instrumental.wav"
+        staged_cache_path = derived / f"{token}_instrumental.meta.json"
+        staged_paths = [derived / staged_vocals_name, derived / staged_instrumental_name, staged_cache_path]
+        try:
+            _, staged_instrumental, _ = self.separator.separate(
+                source_audio,
+                derived,
+                model=str(model),
+                device=str(device),
+                progress_callback=lambda value, message: self._step(job_id, "export", 0.02 + value * 0.18, message),
+                should_cancel=lambda: self._should_cancel(job_id),
+                vocals_filename=staged_vocals_name,
+                instrumental_filename=staged_instrumental_name,
+                asr_filename=None,
+            )
+            staged_cache_path.write_text(json.dumps(cache_key, ensure_ascii=False, indent=2), encoding="utf-8")
+            staged_instrumental.replace(instrumental)
+            staged_cache_path.replace(cache_path)
+            return instrumental
+        finally:
+            for staged_path in staged_paths:
+                staged_path.unlink(missing_ok=True)
+
+    def _export(self, job_id: str, project_id: str, document: dict, payload: dict, values: dict) -> dict:
+        off_vocal = payload.get("audio_track") == "off_vocal"
+        if off_vocal:
+            self._prepare_export_instrumental(job_id, project_id, payload, values)
         return run_kirakara_export(
             job_id,
             project_id,
             document,
             payload,
             self.settings,
-            progress_callback=lambda value, message: self._step(job_id, "export", value, message),
+            progress_callback=lambda value, message: self._step(job_id, "export", 0.2 + value * 0.8 if off_vocal else value, message),
             should_cancel=lambda: bool(self.database.get_job(job_id) and self.database.get_job(job_id)["cancel_requested"]),
         )
 
@@ -333,7 +426,7 @@ class AnalysisPipeline:
         if job["type"] == "FA_KARA_ALIGNMENT":
             return self._fa_kara(job_id, project_id, document, revision, payload, values)[2]
         if job["type"] == "EXPORT":
-            return self._export(job_id, project_id, document, payload)
+            return self._export(job_id, project_id, document, payload, values)
         if job["type"] != "FULL_ANALYSIS":
             raise ValueError("unknown_job_type")
         result: dict = {}

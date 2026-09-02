@@ -15,6 +15,7 @@ from app.services.audio import prepare_source_audio
 from app.schemas.projects import AnalysisRequest, DocumentSave, ExportRequest, FAKaraRequest, FullAnalysisRequest, LyricsDetect, LyricsImport, ProjectCreate, ProjectPatch, ProjectResponse, SeparationRequest
 from app.services.kirakara_export import build_worker_html, export_output_path, export_raw_output_path
 from app.services.fa_kara_text import missing_japanese_ruby, normalize_language
+from app.services.separation import SUPPORTED_SEPARATOR_MODELS
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -182,7 +183,14 @@ def separate(project_id: str, payload: SeparationRequest, request: Request):
     document = db.document(project_id)
     if not document or not document.get("media", {}).get("video_filename"):
         raise HTTPException(422, "请先上传视频")
-    return request.app.state.analysis_runner.enqueue(project_id, "VOCAL_SEPARATION", payload.revision, payload.model_dump())
+    configured = db.settings()
+    legacy_model = payload.model or str(configured.get("separator_model") or request.app.state.settings.separator_model)
+    vocals_model = payload.separator_vocals_model or str(configured.get("separator_vocals_model") or legacy_model)
+    if vocals_model not in SUPPORTED_SEPARATOR_MODELS:
+        raise HTTPException(422, "人声分离模型必须从 MDX 或 VR 下拉列表中选择")
+    body = payload.model_dump()
+    body["separator_vocals_model"] = vocals_model
+    return request.app.state.analysis_runner.enqueue(project_id, "VOCAL_SEPARATION", payload.revision, body)
 
 @router.post("/{project_id}/transcribe", status_code=202)
 def transcribe(project_id: str, payload: AnalysisRequest, request: Request):
@@ -215,7 +223,7 @@ def fa_kara(project_id: str, payload: FAKaraRequest, request: Request):
     if message := _missing_ruby_message(document):
         raise HTTPException(422, message)
     if not (settings.projects_dir / project_id / "derived" / "vocals_asr.wav").is_file():
-        raise HTTPException(422, "请先完成 KARA2 人声分离")
+        raise HTTPException(422, "请先完成人声分离")
     completion = _analysis_completion(document, project_id, settings)
     if not completion["transcription"]:
         raise HTTPException(422, "请先完成 Whisper 粗识别")
@@ -304,6 +312,10 @@ def full_analysis(project_id: str, payload: FullAnalysisRequest, request: Reques
         body["steps"] = [step for step in body["steps"] if step != "pronunciation"]
     body["alignment_backend"] = alignment_backend
     body["fa_kara_model"] = payload.fa_kara_model or str(configured.get("fa_kara_model") or "mms")
+    legacy_model = str(configured.get("separator_model") or settings.separator_model)
+    body["separator_vocals_model"] = payload.separator_vocals_model or str(configured.get("separator_vocals_model") or legacy_model)
+    if body["separator_vocals_model"] not in SUPPORTED_SEPARATOR_MODELS:
+        raise HTTPException(422, "人声分离模型必须从 MDX 或 VR 下拉列表中选择")
     return request.app.state.analysis_runner.enqueue(project_id, "FULL_ANALYSIS", payload.revision, body)
 
 
@@ -373,9 +385,24 @@ def export_project(project_id: str, payload: ExportRequest, request: Request):
     document = db.document(project_id)
     if not document or not document.get("media", {}).get("video_filename"):
         raise HTTPException(422, "导出请先上传视频")
-    if payload.audio_track == "off_vocal" and not (services(request)[0].projects_dir / project_id / "derived" / "instrumental.wav").is_file():
-        raise HTTPException(422, "请先完成 KARA2 人声分离")
-    return request.app.state.analysis_runner.enqueue(project_id, "EXPORT", payload.revision, {**payload.model_dump(), "steps": ["export"]})
+    configured = db.settings()
+    video_crf = payload.video_crf if payload.video_crf is not None else int(configured.get("export_mp4_crf" if payload.format == "mp4" else "export_webm_crf", 20 if payload.format == "mp4" else 32))
+    if payload.format == "mp4" and video_crf > 51:
+        raise HTTPException(422, "MP4 CRF 必须是 0 到 51 的整数")
+    body = {
+        **payload.model_dump(),
+        "video_crf": video_crf,
+        "h264_preset": payload.h264_preset or str(configured.get("export_h264_preset") or "medium"),
+        "vp9_cpu_used": payload.vp9_cpu_used if payload.vp9_cpu_used is not None else int(configured.get("export_vp9_cpu_used", 2)),
+        "audio_bitrate_kbps": payload.audio_bitrate_kbps if payload.audio_bitrate_kbps is not None else int(configured.get("export_audio_bitrate_kbps", 192)),
+        "gop_seconds": payload.gop_seconds if payload.gop_seconds is not None else float(configured.get("export_gop_seconds", 2)),
+        "separator_instrumental_model": payload.separator_instrumental_model or str(configured.get("separator_instrumental_model") or configured.get("separator_model") or request.app.state.settings.separator_model),
+        "separator_device": payload.separator_device or str(configured.get("separator_device") or request.app.state.settings.separator_device),
+        "steps": ["export"],
+    }
+    if payload.audio_track == "off_vocal" and body["separator_instrumental_model"] not in SUPPORTED_SEPARATOR_MODELS:
+        raise HTTPException(422, "OFF VOCAL 模型必须从 MDX 或 VR 下拉列表中选择")
+    return request.app.state.analysis_runner.enqueue(project_id, "EXPORT", payload.revision, body)
 
 @router.get("/{project_id}/exports")
 def list_exports(project_id: str, request: Request, limit: int = Query(20, ge=1, le=100)):
@@ -496,7 +523,7 @@ def get_audio(project_id: str, request: Request, track: str = Query("on_vocal", 
     else:
         path = derived / "instrumental.wav"
     if not path.is_file():
-        raise HTTPException(404, "指定音轨不存在，请先完成 KARA2 分离")
+        raise HTTPException(404, "指定音轨不存在，请先完成人声分离")
     return FileResponse(path, media_type="audio/wav")
 
 @router.get("/{project_id}/thumbnail")

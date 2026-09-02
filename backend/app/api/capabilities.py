@@ -6,6 +6,8 @@ from importlib.metadata import PackageNotFoundError, version
 
 from fastapi import APIRouter, Request
 
+from app.services.separation import SEPARATOR_MODEL_GROUPS
+
 router = APIRouter(prefix="/settings/capabilities", tags=["settings"])
 
 
@@ -30,10 +32,22 @@ def capabilities(request: Request):
     if "DmlExecutionProvider" in providers:
         separator_devices.insert(0, "directml")
     whisper_devices = ["cpu"]
-    models = []
+    installed_model_names: set[str] = set()
     model_dir = settings.models_dir / "separator"
     if model_dir.exists():
-        models = [{"name": item.name, "size": item.stat().st_size} for item in model_dir.glob("*.onnx")]
+        installed_model_names = {
+            item.name for item in model_dir.iterdir() if item.is_file() and item.suffix.lower() in {".onnx", ".pth"}
+        }
+    model_groups = [
+        {
+            "architecture": architecture,
+            "models": [
+                {"name": name, "filename": filename, "installed": filename in installed_model_names}
+                for name, filename in group
+            ],
+        }
+        for architecture, group in SEPARATOR_MODEL_GROUPS.items()
+    ]
     whisper_dir = settings.models_dir / "whisper"
     whisper_models = []
     if whisper_dir.exists():
@@ -46,7 +60,8 @@ def capabilities(request: Request):
             "devices": separator_devices,
             "providers": providers,
             "default_model": settings.separator_model,
-            "models": models,
+            "model_groups": model_groups,
+            "installed_models": sorted(installed_model_names),
         },
         "whisper": {
             "available": importlib.util.find_spec("faster_whisper") is not None,

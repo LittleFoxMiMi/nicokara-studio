@@ -536,6 +536,25 @@ button {
   color: #6b7280;
   font-size: 12px;
 }
+.settings-metric {
+  min-height: 76px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+  padding-left: 14px;
+  border-left: 3px solid #d2e3fc;
+  color: #3c4043;
+}
+.settings-metric > span,
+.settings-metric > small {
+  color: #6b7280;
+  font-size: 12px;
+}
+.settings-metric > strong {
+  color: #174ea6;
+  font-size: 22px;
+}
 .settings-grid select,
 .settings-section label select {
   background: #fff;

@@ -39,12 +39,14 @@ class FullAnalysisRequest(AnalysisRequest):
     )
     alignment_backend: Literal["fa_kara", "stable_ts"] | None = None
     fa_kara_model: Literal["mms", "yohane"] | None = None
+    separator_vocals_model: str | None = Field(default=None, max_length=255)
     profile_id: str | None = None
 
 class SeparationRequest(BaseModel):
     revision: int = Field(ge=1)
     device: Literal["auto", "directml", "cpu"] = "auto"
     model: str | None = Field(default=None, max_length=255)
+    separator_vocals_model: str | None = Field(default=None, max_length=255)
 
 class PronunciationRequest(BaseModel):
     revision: int = Field(ge=1)
@@ -58,6 +60,13 @@ class ExportRequest(BaseModel):
     revision: int = Field(ge=1)
     format: Literal["mp4", "webm"] = "mp4"
     audio_track: Literal["on_vocal", "off_vocal"] = "on_vocal"
+    video_crf: int | None = Field(default=None, ge=0, le=63)
+    h264_preset: Literal["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"] | None = None
+    vp9_cpu_used: int | None = Field(default=None, ge=0, le=8)
+    audio_bitrate_kbps: int | None = Field(default=None, ge=64, le=512)
+    gop_seconds: float | None = Field(default=None, ge=0.5, le=10)
+    separator_instrumental_model: str | None = Field(default=None, max_length=255)
+    separator_device: Literal["auto", "directml", "cpu"] | None = None
 
 class AIProfilePayload(BaseModel):
     name: str = Field(min_length=1, max_length=120)

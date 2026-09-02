@@ -178,14 +178,25 @@ setInterval(async()=>{{try{{const s=await fetch(d.cancelUrl).then(r=>r.json()); 
 </script>'''
 
 
-def _encode_with_ffmpeg(raw: Path, output: Path, audio: Path, fmt: str, ffmpeg: str, fps: float, duration_ms: int, *, progress_callback: Callable[[float, str], None] | None = None, should_cancel: Callable[[], bool] | None = None) -> None:
+def _encoding_args(fmt: str, fps: float, payload: dict) -> tuple[list[str], list[str]]:
     output_fps = max(1.0, float(fps or 30))
+    crf = int(payload.get("video_crf", 32 if fmt == "webm" else 20))
+    audio_bitrate = int(payload.get("audio_bitrate_kbps", 192))
+    gop = str(max(1, round(output_fps * float(payload.get("gop_seconds", 2)))))
     if fmt == "webm":
-        video_args = ["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0", "-g", str(max(1, round(output_fps * 2)))]
-        audio_args = ["-c:a", "libopus", "-b:a", "160k"]
+        cpu_used = int(payload.get("vp9_cpu_used", 2))
+        video_args = ["-c:v", "libvpx-vp9", "-crf", str(crf), "-b:v", "0", "-deadline", "good", "-cpu-used", str(cpu_used), "-g", gop]
+        audio_args = ["-c:a", "libopus", "-b:a", f"{audio_bitrate}k"]
     else:
-        video_args = ["-c:v", "libx264", "-preset", "medium", "-crf", "20", "-g", str(max(1, round(output_fps * 2))), "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
-        audio_args = ["-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2"]
+        preset = str(payload.get("h264_preset") or "medium")
+        video_args = ["-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-g", gop, "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+        audio_args = ["-c:a", "aac", "-b:a", f"{audio_bitrate}k", "-ar", "44100", "-ac", "2"]
+    return video_args, audio_args
+
+
+def _encode_with_ffmpeg(raw: Path, output: Path, audio: Path, fmt: str, ffmpeg: str, fps: float, duration_ms: int, payload: dict, *, progress_callback: Callable[[float, str], None] | None = None, should_cancel: Callable[[], bool] | None = None) -> None:
+    output_fps = max(1.0, float(fps or 30))
+    video_args, audio_args = _encoding_args(fmt, output_fps, payload)
     # Force constant frame pacing in the final file. The browser-generated raw
     # container can carry fractional or slightly irregular timestamps; leaving
     # sync to the muxer makes some players present it as visibly lower FPS.
@@ -246,7 +257,7 @@ def run_kirakara_export(job_id: str, project_id: str, document: dict, payload: d
                     raise ExportError("导出音轨不存在，请先准备音频或完成人声分离")
                 duration_ms = round(_media_number(document.get("media", {}).get("duration_ms"), 1000))
                 fps = max(1.0, _media_number(document.get("media", {}).get("fps"), 30))
-                _encode_with_ffmpeg(raw, output, audio, fmt, settings.ffmpeg_path, fps, duration_ms, progress_callback=progress_callback, should_cancel=should_cancel)
+                _encode_with_ffmpeg(raw, output, audio, fmt, settings.ffmpeg_path, fps, duration_ms, payload, progress_callback=progress_callback, should_cancel=should_cancel)
                 raw.unlink(missing_ok=True)
                 if progress_callback:
                     progress_callback(1.0, "Kirakara 服务端导出完成")

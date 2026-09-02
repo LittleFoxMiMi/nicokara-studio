@@ -127,7 +127,7 @@ class FAKaraAligner:
         except ImportError as exc:
             raise FAKaraAlignmentError("FA-Kara 运行时需要 soundfile、torch 和 torchaudio") from exc
         if not audio.is_file():
-            raise FAKaraAlignmentError("FA-Kara 找不到人声音频，请先完成 KARA2 分离")
+            raise FAKaraAlignmentError("FA-Kara 找不到人声音频，请先完成人声分离")
         document = copy.deepcopy(source_document)
         lines = document.get("lyrics", {}).get("lines", [])
         language = normalize_language(document.get("project", {}).get("language"))

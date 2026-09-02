@@ -7,14 +7,14 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.core.database import Database
 from app.domain.lyrics import parse_lyrics
 from app.main import create_app
 from app.services.alignment import align_document, normalize_reading, split_moras
 from app.services.cancellation import OperationCanceled
-from app.services.pipeline import AnalysisRunner
-from app.services.separation import Kara2Separator, provider_for
+from app.services.pipeline import AnalysisPipeline, AnalysisRunner
+from app.services.separation import VocalSeparator, provider_for
 from app.services.transcription import FasterWhisperTranscriber, Transcript, TranscriptSegment, TranscriptWord
 
 
@@ -70,7 +70,7 @@ def test_lrc_alignment_keeps_line_anchor() -> None:
     assert aligned["lyrics"]["lines"][1] == document["lyrics"]["lines"][1]
 
 
-def test_kara2_separator_requests_directml_and_places_both_stems(tmp_path, monkeypatch) -> None:
+def test_vocal_separator_requests_directml_and_places_both_stems(tmp_path, monkeypatch) -> None:
     created = []
 
     class FakeSeparator:
@@ -95,7 +95,7 @@ def test_kara2_separator_requests_directml_and_places_both_stems(tmp_path, monke
     derived.mkdir()
     source = tmp_path / "source.wav"
     source.write_bytes(b"audio")
-    separator = Kara2Separator(
+    separator = VocalSeparator(
         tmp_path / "models", "ffmpeg",
         separator_factory=FakeSeparator,
         providers_factory=lambda: ["DmlExecutionProvider", "CPUExecutionProvider"],
@@ -110,6 +110,95 @@ def test_kara2_separator_requests_directml_and_places_both_stems(tmp_path, monke
     assert instrumental.read_bytes() == b"instrumental"
     assert asr.read_bytes() == b"asr"
     assert provider_for("auto", ["DmlExecutionProvider", "CPUExecutionProvider"]) == "DmlExecutionProvider"
+
+
+def test_pipeline_defers_export_instrumental_until_off_vocal_export(tmp_path, monkeypatch) -> None:
+    settings = Settings(data_dir=tmp_path)
+    settings.prepare()
+    database = Database(settings.database_path)
+    database.initialize()
+    project_id = "project"
+    document = {
+        "project": {"id": project_id, "name": "Project", "revision": 1},
+        "media": {"video_filename": "video.mp4"},
+        "lyrics": {"lines": []},
+    }
+    database.create_project(project_id, "Project", document)
+    database.create_job("job", project_id, "VOCAL_SEPARATION", 1, {"steps": ["separation"]})
+    project_dir = settings.projects_dir / project_id
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "video.mp4").write_bytes(b"video")
+    source_audio = project_dir / "derived" / "source_audio.wav"
+    source_audio.parent.mkdir(parents=True, exist_ok=True)
+    source_audio.write_bytes(b"source")
+    calls = []
+
+    class FakeVocalSeparator:
+        def separate(self, source, derived, *, model, vocals_filename, instrumental_filename, asr_filename, **kwargs):
+            calls.append(model)
+            vocals = derived / vocals_filename
+            instrumental = derived / instrumental_filename
+            asr = derived / asr_filename if asr_filename else None
+            vocals.write_bytes(f"vocals:{model}".encode())
+            instrumental.write_bytes(f"instrumental:{model}".encode())
+            if asr:
+                asr.write_bytes(f"asr:{model}".encode())
+            return vocals, instrumental, asr
+
+    monkeypatch.setattr("app.services.pipeline.prepare_source_audio", lambda *args: (source_audio, source_audio))
+    monkeypatch.setattr("app.services.pipeline.generate_waveform", lambda source, target, ffmpeg: target.write_text("{}") is not None)
+    pipeline = AnalysisPipeline(settings, database)
+    pipeline.separator = FakeVocalSeparator()
+
+    updated, revision, result = pipeline._separate(
+        "job",
+        project_id,
+        document,
+        1,
+        {"separator_vocals_model": "Kim_Vocal_2.onnx"},
+        {},
+    )
+
+    derived = project_dir / "derived"
+    assert calls == ["Kim_Vocal_2.onnx"]
+    assert (derived / "vocals.wav").read_bytes() == b"vocals:Kim_Vocal_2.onnx"
+    assert (derived / "vocals_asr.wav").read_bytes() == b"asr:Kim_Vocal_2.onnx"
+    assert not (derived / "instrumental.wav").exists()
+    assert updated["analysis"]["separation"]["vocals_model"] == "Kim_Vocal_2.onnx"
+    assert "instrumental" not in result
+
+    database.create_job("export-job", project_id, "EXPORT", revision, {"steps": ["export"]})
+    pipeline._prepare_export_instrumental(
+        "export-job",
+        project_id,
+        {"separator_instrumental_model": "UVR_MDXNET_KARA_2.onnx"},
+        {},
+    )
+
+    assert calls == ["Kim_Vocal_2.onnx", "UVR_MDXNET_KARA_2.onnx"]
+    assert (derived / "instrumental.wav").read_bytes() == b"instrumental:UVR_MDXNET_KARA_2.onnx"
+
+    database.create_job("cached-export", project_id, "EXPORT", revision, {"steps": ["export"]})
+    pipeline._prepare_export_instrumental(
+        "cached-export",
+        project_id,
+        {"separator_instrumental_model": "UVR_MDXNET_KARA_2.onnx"},
+        {},
+    )
+
+    assert calls == ["Kim_Vocal_2.onnx", "UVR_MDXNET_KARA_2.onnx"]
+    assert (derived / "instrumental.wav").read_bytes() == b"instrumental:UVR_MDXNET_KARA_2.onnx"
+
+    database.create_job("second-export", project_id, "EXPORT", revision, {"steps": ["export"]})
+    pipeline._prepare_export_instrumental(
+        "second-export",
+        project_id,
+        {"separator_instrumental_model": "5_HP-Karaoke-UVR.pth"},
+        {},
+    )
+
+    assert calls == ["Kim_Vocal_2.onnx", "UVR_MDXNET_KARA_2.onnx", "5_HP-Karaoke-UVR.pth"]
+    assert (derived / "instrumental.wav").read_bytes() == b"instrumental:5_HP-Karaoke-UVR.pth"
 
 
 def test_whisper_auto_falls_back_to_cpu_int8_and_keeps_clip_scope(tmp_path, monkeypatch) -> None:
@@ -452,7 +541,7 @@ def test_stable_alignment_endpoint_requires_global_alignment_only(tmp_path, monk
         assert calls[-1][1] == "STABLE_ALIGNMENT"
 
 
-def test_stable_ts_settings_validate_token_step_and_segment_padding(tmp_path, monkeypatch) -> None:
+def test_analysis_and_export_settings_validate_ranges_and_models(tmp_path, monkeypatch) -> None:
     get_settings.cache_clear()
     monkeypatch.setenv("NICOKARA_DATA_DIR", str(tmp_path))
     with TestClient(create_app()) as client:
@@ -466,8 +555,15 @@ def test_stable_ts_settings_validate_token_step_and_segment_padding(tmp_path, mo
 
         invalid_token_step = client.put("/api/settings", json={"values": {"stable_ts_token_step": 443}})
         invalid_padding = client.put("/api/settings", json={"values": {"stable_ts_segment_padding_seconds": -1}})
+        invalid_crf = client.put("/api/settings", json={"values": {"export_mp4_crf": 52}})
+        invalid_separator_model = client.put("/api/settings", json={"values": {"separator_vocals_model": "not-a-model.onnx"}})
         assert invalid_token_step.status_code == 422
         assert invalid_padding.status_code == 422
+        assert invalid_crf.status_code == 422
+        assert invalid_separator_model.status_code == 422
+
+        capabilities = client.get("/api/settings/capabilities").json()
+        assert [group["architecture"] for group in capabilities["separator"]["model_groups"]] == ["MDX", "VR"]
 
 
 def test_job_steps_are_persisted_per_task(tmp_path) -> None:
@@ -476,7 +572,7 @@ def test_job_steps_are_persisted_per_task(tmp_path) -> None:
     database.create_project("project", "Project", {"project": {"revision": 1}})
     job = database.create_job("job", "project", "FULL_ANALYSIS", 1, {"steps": ["separation", "transcription"]})
     assert [item["key"] for item in job["steps"]] == ["separation", "transcription"]
-    database.update_job("job", steps=[{"key": "separation", "label": "KARA2", "status": "running", "progress": 0.5}])
+    database.update_job("job", steps=[{"key": "separation", "label": "人声分离", "status": "running", "progress": 0.5}])
     assert database.get_job("job")["steps"][0]["progress"] == 0.5
     global_job = database.create_job("global", "project", "STABLE_GLOBAL_ALIGNMENT", 1, {})
     assert global_job["steps"][0]["key"] == "global_alignment"

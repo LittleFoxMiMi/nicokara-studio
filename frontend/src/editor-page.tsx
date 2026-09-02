@@ -613,7 +613,6 @@ function UnitInspector({
 
 function ExportDialog({
   hasVideo,
-  hasInstrumental,
   jobs,
   onClose,
   onStart,
@@ -621,7 +620,6 @@ function ExportDialog({
   onDelete,
 }: {
   hasVideo: boolean;
-  hasInstrumental: boolean;
   jobs: AnalysisJob[];
   onClose: () => void;
   onStart: (payload: { format: "mp4" | "webm"; audio_track: "on_vocal" | "off_vocal" }) => void;
@@ -637,10 +635,10 @@ function ExportDialog({
       <div className="dialog-head"><div><h2 id="export-title">导出工程</h2><p className="muted">服务端使用 Kirakara 原生渲染器导出，结果可重复下载。</p></div><button className="icon-button" title="关闭" onClick={onClose}><X size={18} /></button></div>
       <div className="export-form">
         <label className="field-label">视频格式<select value={format} onChange={(event) => setFormat(event.target.value as typeof format)}><option value="mp4">MP4 · H.264</option><option value="webm">WebM · VP9</option></select></label>
-        <label className="field-label">音轨<select value={audioTrack} onChange={(event) => setAudioTrack(event.target.value as typeof audioTrack)}><option value="on_vocal">ON VOCAL · 原始音轨</option><option value="off_vocal" disabled={!hasInstrumental}>OFF VOCAL · KARA2 instrumental{hasInstrumental ? "" : "（需先完成人声分离）"}</option></select></label>
+        <label className="field-label">音轨<select value={audioTrack} onChange={(event) => setAudioTrack(event.target.value as typeof audioTrack)}><option value="on_vocal">ON VOCAL · 原始音轨</option><option value="off_vocal">OFF VOCAL · 导出时生成人声分离伴奏</option></select></label>
         {!hasVideo && <p className="form-hint error-text">视频导出需要先上传视频。</p>}
       </div>
-      <div className="dialog-actions"><button className="button text" onClick={onClose}>关闭</button><button className="button filled" disabled={Boolean(active) || !hasVideo || (audioTrack === "off_vocal" && !hasInstrumental)} onClick={() => onStart({ format, audio_track: audioTrack })}><Download size={17} />开始导出</button></div>
+      <div className="dialog-actions"><button className="button text" onClick={onClose}>关闭</button><button className="button filled" disabled={Boolean(active) || !hasVideo} onClick={() => onStart({ format, audio_track: audioTrack })}><Download size={17} />开始导出</button></div>
       {active && <div className="export-active"><LoaderCircle className="spin" size={17} /><span>{active.message || "服务端导出中"} · {Math.round(active.progress * 100)}%</span><div className="analysis-progress export-progress"><i style={{ width: `${Math.max(2, active.progress * 100)}%` }} /></div><button className="icon-button compact" title="取消导出" onClick={() => onCancel(active.id)}><Square size={15} /></button></div>}
       <div className="export-history"><h3>导出历史</h3>{exportJobs.filter((job) => job.status === "SUCCEEDED").length === 0 ? <p className="muted">暂无可下载文件</p> : exportJobs.filter((job) => job.status === "SUCCEEDED").map((job) => <div className="export-history-row" key={job.id}><span><strong>{String(job.result?.filename || "导出文件")}</strong><small>{String(job.request?.format || "mp4").toUpperCase()} · {job.request?.audio_track === "off_vocal" ? "OFF VOCAL" : "ON VOCAL"} · {new Date(job.created_at).toLocaleString()}</small></span><a className="icon-button" title="下载" href={`/api/projects/${job.project_id}/exports/${job.id}/download`}><Download size={17} /></a><button className="icon-button" title="删除导出记录" onClick={() => onDelete(job.id)}><Trash2 size={17} /></button></div>)}</div>
     </section>
@@ -1006,7 +1004,7 @@ export function EditorPage({ id }: { id: string }) {
       return;
     }
     if (documentRef.current.media.waveform_source !== "vocals") {
-      setWorkflowNotice("请先完成 KARA2 人声分离，再运行 Whisper 人声粗识别。");
+      setWorkflowNotice("请先完成人声分离，再运行 Whisper 人声粗识别。");
       return;
     }
     setAnalysisStarting(true);
@@ -1111,7 +1109,7 @@ export function EditorPage({ id }: { id: string }) {
       || ["local", "ai", "local_fallback"].includes(String(analysisDocument.pronunciation?.last_run?.mode || ""))
       || analysisDocument.lyrics.lines.every((line) => line.units.every((unit) => !unit.surface.match(/[一-龯]/) || unit.ruby));
     if (documentRef.current.media.waveform_source !== "vocals") {
-      setWorkflowNotice("请先完成 KARA2 人声分离，再进行 stable-ts 全局对齐。");
+      setWorkflowNotice("请先完成人声分离，再进行 stable-ts 全局对齐。");
       return;
     }
     if (analysis.transcription?.status !== "completed") {
@@ -1189,7 +1187,7 @@ export function EditorPage({ id }: { id: string }) {
       return;
     }
     if (documentRef.current.media.waveform_source !== "vocals") {
-      setWorkflowNotice("请先完成 KARA2 人声分离，再进行 FA-Kara 对齐。");
+      setWorkflowNotice("请先完成人声分离，再进行 FA-Kara 对齐。");
       return;
     }
     const analysisDocument = documentRef.current as ProjectDocument & { analysis?: Record<string, { status?: string }>; pronunciation?: { last_run?: { mode?: string } } };
@@ -1474,7 +1472,7 @@ export function EditorPage({ id }: { id: string }) {
               {activeJob ? <LoaderCircle className="spin" size={18} /> : visibleJob.status === "FAILED" ? <AlertCircle size={18} /> : <AudioLines size={18} />}
             </span>
             <div className="analysis-copy">
-              <strong>{visibleJob.type === "EXPORT" ? "Kirakara 服务端导出" : visibleJob.type === "VOCAL_SEPARATION" ? "KARA2 双 stem" : visibleJob.type === "FA_KARA_ALIGNMENT" ? "FA-Kara 对齐" : visibleJob.type === "FULL_ANALYSIS" && visibleJob.request?.alignment_backend === "fa_kara" ? "KARA2 + Whisper + FA-Kara" : "KARA2 + Whisper 对齐"}</strong>
+              <strong>{visibleJob.type === "EXPORT" ? "Kirakara 服务端导出" : visibleJob.type === "VOCAL_SEPARATION" ? "人声分离" : visibleJob.type === "FA_KARA_ALIGNMENT" ? "FA-Kara 对齐" : visibleJob.type === "FULL_ANALYSIS" && visibleJob.request?.alignment_backend === "fa_kara" ? "人声分离 + Whisper + FA-Kara" : "人声分离 + Whisper 对齐"}</strong>
               <span>{visibleJob.error_message || visibleJob.message || visibleJob.stage}</span>
             </div>
             <div className="analysis-steps">
@@ -1799,16 +1797,16 @@ export function EditorPage({ id }: { id: string }) {
             <div className="dialog-head"><div><h2 id="full-analysis-title">确认全曲分析</h2><p className="muted">将按勾选顺序执行；跳过未完成流程会被后端拒绝。</p></div><button className="icon-button" title="关闭" onClick={() => setFullAnalysisOpen(false)}><X size={18} /></button></div>
             <div className="pipeline-preview">
               {(effectiveAlignmentBackend === "fa_kara" ? (language === "cn" ? [
-                ["separation", "KARA2 分离人声", "提取音频并生成 vocals / instrumental"],
+                ["separation", "人声分离", "生成 Whisper / 对齐使用的 vocals"],
                 ["transcription", "Whisper 人声粗识别", "保存实际演唱的 segment 文本和粗时间"],
                 ["fa_kara", `FA-Kara 对齐 · ${faKaraModel === "yohane" ? "YoHane" : "MMS_FA"}`, "使用中文拼音生成词/字级时间"],
               ] : [
-                ["separation", "KARA2 分离人声", "提取音频并生成 vocals / instrumental"],
+                ["separation", "人声分离", "生成 Whisper / 对齐使用的 vocals"],
                 ["transcription", "Whisper 人声粗识别", "保存实际演唱的 segment 文本和粗时间"],
                 ["pronunciation", "AI 注音", "结合完整歌词与 Whisper segment 生成 Ruby"],
                 ["fa_kara", `FA-Kara 对齐 · ${faKaraModel === "yohane" ? "YoHane" : "MMS_FA"}`, "一次生成行级与词/短语时间"],
               ]) : [
-                ["separation", "KARA2 分离人声", "提取音频并生成 vocals / instrumental"],
+                ["separation", "人声分离", "生成 Whisper / 对齐使用的 vocals"],
                 ["transcription", "Whisper 人声粗识别", "保存实际演唱的 segment 文本和粗时间"],
                 ["pronunciation", "AI 注音", "结合完整歌词与 Whisper segment 生成 Ruby"],
                 ["global_alignment", "stable-ts 全局对齐", "只写入可单独观察的行级时间"],
@@ -1823,7 +1821,7 @@ export function EditorPage({ id }: { id: string }) {
           </section>
         </div>
       )}
-      {exportOpen && <ExportDialog hasVideo={hasVideo} hasInstrumental={String(document.media.waveform_source || "") === "vocals"} jobs={jobs} onClose={() => setExportOpen(false)} onStart={(payload) => void startExport(payload)} onCancel={(jobId) => void cancelJob(jobId)} onDelete={(jobId) => void deleteExport(jobId)} />}
+      {exportOpen && <ExportDialog hasVideo={hasVideo} jobs={jobs} onClose={() => setExportOpen(false)} onStart={(payload) => void startExport(payload)} onCancel={(jobId) => void cancelJob(jobId)} onDelete={(jobId) => void deleteExport(jobId)} />}
       {workflowNotice && (
         <div className="scrim">
           <section className="dialog workflow-notice" role="alertdialog" aria-modal="true" aria-labelledby="workflow-notice-title">

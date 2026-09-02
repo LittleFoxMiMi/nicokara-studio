@@ -7,17 +7,32 @@ from app.schemas.projects import AIProfilePayload, PromptPresetPayload, Settings
 from app.services.pronunciation import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_TEMPLATE
 from app.services.ai_client import AIClient
 from app.services.secrets import SecretStore
+from app.services.separation import SUPPORTED_SEPARATOR_MODELS
 router = APIRouter(prefix="/settings", tags=["settings"])
 @router.get("")
 def get_settings(request: Request):
+    stored = request.app.state.database.settings()
+    legacy_separator_model = stored.get("separator_model") or request.app.state.settings.separator_model
     return {
         "alignment_backend": "fa_kara",
         "fa_kara_model": "mms",
-        **request.app.state.database.settings(),
+        "separator_vocals_model": legacy_separator_model,
+        "separator_instrumental_model": legacy_separator_model,
+        "export_mp4_crf": 20,
+        "export_webm_crf": 32,
+        "export_h264_preset": "medium",
+        "export_vp9_cpu_used": 2,
+        "export_audio_bitrate_kbps": 192,
+        "export_gop_seconds": 2,
+        **stored,
     }
 @router.put("")
 def save_settings(payload: SettingsPayload, request: Request):
     values = payload.values
+    for key in ("separator_vocals_model", "separator_instrumental_model"):
+        model = values.get(key)
+        if model is not None and model not in SUPPORTED_SEPARATOR_MODELS:
+            raise HTTPException(422, "人声分离模型必须从 MDX 或 VR 下拉列表中选择")
     alignment_backend = values.get("alignment_backend")
     fa_kara_model = values.get("fa_kara_model")
     if alignment_backend not in {None, "fa_kara", "stable_ts"}:
@@ -48,6 +63,24 @@ def save_settings(payload: SettingsPayload, request: Request):
         raise HTTPException(422, "faster-whisper 不支持 DirectML")
     if separator_device not in {None, "auto", "directml", "cpu"} or whisper_device not in {None, "auto", "cpu"}:
         raise HTTPException(422, "当前版本仅支持 DirectML/CPU 分离和 CPU Whisper")
+    integer_ranges = {
+        "export_mp4_crf": (0, 51, "MP4 CRF"),
+        "export_webm_crf": (0, 63, "WebM CRF"),
+        "export_vp9_cpu_used": (0, 8, "VP9 编码速度"),
+        "export_audio_bitrate_kbps": (64, 512, "音频码率"),
+    }
+    for key, (minimum, maximum, label) in integer_ranges.items():
+        value = values.get(key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < minimum or value > maximum):
+            raise HTTPException(422, f"{label} 必须是 {minimum} 到 {maximum} 的整数")
+    gop_seconds = values.get("export_gop_seconds")
+    if gop_seconds is not None and (
+        isinstance(gop_seconds, bool) or not isinstance(gop_seconds, (int, float)) or gop_seconds < 0.5 or gop_seconds > 10
+    ):
+        raise HTTPException(422, "关键帧间隔必须是 0.5 到 10 秒")
+    h264_preset = values.get("export_h264_preset")
+    if h264_preset not in {None, "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}:
+        raise HTTPException(422, "H.264 preset 无效")
     proxy_url = str(values.get("proxy_url") or "").strip()
     if values.get("proxy_enabled") and (
         not proxy_url or urlparse(proxy_url).scheme not in {"http", "https"} or not urlparse(proxy_url).netloc
