@@ -75,17 +75,17 @@ def document_to_lrc(document: dict) -> str:
                     member_end += 1
                 members = units[index:member_end]
                 grouped_surface = _escape("".join(str(member.get("surface") or "") for member in members))
-                body.append(f"{prefix}{_timestamp(start)}{{{grouped_surface}|{_escape(ruby_text)}}}")
+                body.append(f"{_timestamp(start)}{prefix}{{{grouped_surface}|{_escape(ruby_text)}}}")
                 member_ends = [member.get("end_ms") for member in members if member.get("end_ms") is not None]
                 timeline_cursor = max(timeline_cursor, max(member_ends) if member_ends else start)
                 index += len(members)
                 continue
             surface = _escape(unit.get("surface"))
             if len(str(unit.get("surface"))) == 1:
-                body.append(f"{prefix}{_timestamp(start)}{surface}")
+                body.append(f"{_timestamp(start)}{prefix}{surface}")
             else:
                 chars = list(str(unit.get("surface")))
-                body.extend(f"{prefix if char_index == 0 else ''}{_timestamp(start + (end - start) * char_index / len(chars))}{_escape(char)}" for char_index, char in enumerate(chars))
+                body.extend(f"{_timestamp(start + (end - start) * char_index / len(chars))}{prefix if char_index == 0 else ''}{_escape(char)}" for char_index, char in enumerate(chars))
             timeline_cursor = max(timeline_cursor, unit.get("end_ms") if unit.get("end_ms") is not None else start)
             index += 1
         fallback_end = line.get("end_ms") if line.get("end_ms") is not None else (line.get("start_ms") or 0) + 500
@@ -127,6 +127,12 @@ def document_to_config(document: dict) -> dict:
     }
 
 
+def document_to_krl(document: dict) -> str:
+    config = json.dumps(document_to_config(document), ensure_ascii=False, indent=4)
+    lyrics = document_to_lrc(document)
+    return f"config {config}\n\n\n{lyrics}" if lyrics else f"config {config}\n"
+
+
 def _media_number(value: object, fallback: float) -> float:
     try:
         text = str(value)
@@ -139,12 +145,12 @@ def _media_number(value: object, fallback: float) -> float:
 
 
 def export_output_path(settings: Settings, project_id: str, job_id: str, fmt: str) -> Path:
-    extension = "webm" if fmt == "webm" else "mp4"
+    extension = fmt if fmt in {"mp4", "webm", "krl"} else "mp4"
     return settings.projects_dir / project_id / "exports" / f"{job_id[:8]}.{extension}"
 
 
 def export_raw_output_path(settings: Settings, project_id: str, job_id: str, fmt: str) -> Path:
-    extension = "webm" if fmt == "webm" else "mp4"
+    extension = fmt if fmt in {"mp4", "webm", "krl"} else "mp4"
     return settings.projects_dir / project_id / "exports" / f"{job_id[:8]}.kirakara.{extension}"
 
 
@@ -232,6 +238,21 @@ def run_kirakara_export(job_id: str, project_id: str, document: dict, payload: d
     output.parent.mkdir(parents=True, exist_ok=True)
     for marker in (output, raw, output.with_suffix(".error"), raw.with_suffix(".partial")):
         marker.unlink(missing_ok=True)
+    if fmt == "krl":
+        if should_cancel and should_cancel():
+            raise ExportCanceled("导出已取消")
+        temporary = output.with_suffix(".krl.partial")
+        temporary.write_text(document_to_krl(document), encoding="utf-8", newline="\n")
+        temporary.replace(output)
+        if progress_callback:
+            progress_callback(1.0, "KRL 工程文件导出完成")
+        return {
+            "output": output.name,
+            "filename": _safe_filename(document.get("project", {}).get("name"), "krl"),
+            "format": "krl",
+            "media_type": "text/plain; charset=utf-8",
+            "size_bytes": output.stat().st_size,
+        }
     chrome = _chrome_path(settings)
     worker_url = f"{settings.export_base_url.rstrip('/')}{settings.api_prefix}/projects/{project_id}/export-worker/{job_id}"
     profile = Path(tempfile.mkdtemp(prefix=f"nicokara-export-{job_id[:8]}-"))

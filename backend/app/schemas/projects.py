@@ -58,7 +58,7 @@ class PronunciationRequest(BaseModel):
 
 class ExportRequest(BaseModel):
     revision: int = Field(ge=1)
-    format: Literal["mp4", "webm"] = "mp4"
+    format: Literal["mp4", "webm", "krl"] = "mp4"
     audio_track: Literal["on_vocal", "off_vocal"] = "on_vocal"
     video_crf: int | None = Field(default=None, ge=0, le=63)
     h264_preset: Literal["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"] | None = None

@@ -1,11 +1,13 @@
 from pathlib import Path
+import time
 
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
 from app.core.config import get_settings
+from app.domain.lyrics.parser import parse_lyrics
 from app.main import create_app
-from app.services.kirakara_export import _encoding_args, build_worker_html, document_to_lrc, export_output_path
+from app.services.kirakara_export import _encoding_args, build_worker_html, document_to_krl, document_to_lrc, export_output_path, run_kirakara_export
 
 
 def _document() -> dict:
@@ -29,6 +31,93 @@ def test_export_output_path_keeps_selected_video_format(tmp_path: Path) -> None:
     settings = Settings(data_dir=tmp_path)
     assert export_output_path(settings, "project", "12345678-job", "mp4").name == "12345678.mp4"
     assert export_output_path(settings, "project", "12345678-job", "webm").name == "12345678.webm"
+    assert export_output_path(settings, "project", "12345678-job", "krl").name == "12345678.krl"
+
+
+def test_krl_export_contains_config_lyrics_roles_and_dual_ruby(tmp_path: Path) -> None:
+    document = _document()
+    document["lyrics"]["lines"] = [{
+        "start_ms": 1000,
+        "end_ms": 2000,
+        "units": [{
+            "surface": "物語",
+            "ruby": "ものがたり",
+            "ruby_2": "モノガタリ",
+            "ruby_span": 2,
+            "start_ms": 1000,
+            "end_ms": 2000,
+            "roles": ["Lead", "Chorus"],
+        }],
+    }]
+
+    content = document_to_krl(document)
+
+    assert content.startswith("config {")
+    assert '"fontFamily"' in content
+    assert "[00:01.00]【@Lead+Chorus】{物語|ものがたり>モノガタリ}[00:02.00]" in content
+    imported = parse_lyrics(content.split("\n\n\n", 1)[1], "krl", filename="roundtrip.krl")
+    assert [unit["surface"] for unit in imported["lines"][0]["units"]] == ["物", "語"]
+    assert imported["lines"][0]["units"][0]["ruby"] == "ものがたり"
+    assert imported["lines"][0]["units"][0]["ruby_2"] == "モノガタリ"
+    assert imported["lines"][0]["units"][0]["roles"] == ["Lead", "Chorus"]
+
+    settings = Settings(data_dir=tmp_path)
+    result = run_kirakara_export("12345678-job", "project", document, {"format": "krl"}, settings)
+    output = export_output_path(settings, "project", "12345678-job", "krl")
+    assert output.read_text(encoding="utf-8") == content
+    assert result["filename"] == "测试工程.krl"
+    assert result["media_type"] == "text/plain; charset=utf-8"
+
+
+def test_krl_export_endpoint_accepts_project_without_video(tmp_path: Path, monkeypatch) -> None:
+    get_settings.cache_clear()
+    monkeypatch.setenv("NICOKARA_DATA_DIR", str(tmp_path))
+    captured = {}
+    with TestClient(create_app()) as client:
+        project = client.post("/api/projects", json={"name": "Lyrics only"}).json()
+
+        def enqueue(project_id, job_type, revision, payload):
+            captured.update({"project_id": project_id, "job_type": job_type, "revision": revision, "payload": payload})
+            return {"id": "job", "request": payload}
+
+        client.app.state.analysis_runner.enqueue = enqueue
+        response = client.post(
+            f"/api/projects/{project['id']}/export",
+            json={"revision": project["revision"], "format": "krl", "audio_track": "off_vocal"},
+        )
+
+        assert response.status_code == 202
+        assert captured == {
+            "project_id": project["id"],
+            "job_type": "EXPORT",
+            "revision": project["revision"],
+            "payload": {"revision": project["revision"], "format": "krl", "steps": ["export"]},
+        }
+
+
+def test_krl_export_job_can_be_downloaded_without_chrome_or_video(tmp_path: Path, monkeypatch) -> None:
+    get_settings.cache_clear()
+    monkeypatch.setenv("NICOKARA_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("NICOKARA_CHROME_PATH", str(tmp_path / "missing-chrome.exe"))
+    with TestClient(create_app()) as client:
+        project = client.post("/api/projects", json={"name": "No browser needed"}).json()
+        queued = client.post(
+            f"/api/projects/{project['id']}/export",
+            json={"revision": project["revision"], "format": "krl"},
+        ).json()
+
+        job = queued
+        for _ in range(100):
+            job = client.get(f"/api/jobs/{queued['id']}").json()
+            if job["status"] in {"SUCCEEDED", "FAILED"}:
+                break
+            time.sleep(0.01)
+
+        assert job["status"] == "SUCCEEDED"
+        download = client.get(f"/api/projects/{project['id']}/exports/{queued['id']}/download")
+        assert download.status_code == 200
+        assert download.headers["content-type"].startswith("text/plain")
+        assert download.content.decode("utf-8").startswith("config {")
 
 
 def test_ffmpeg_encoding_args_use_export_settings() -> None:

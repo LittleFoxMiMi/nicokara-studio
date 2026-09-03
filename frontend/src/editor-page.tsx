@@ -565,25 +565,25 @@ function ExportDialog({
   hasVideo: boolean;
   jobs: AnalysisJob[];
   onClose: () => void;
-  onStart: (payload: { format: "mp4" | "webm"; audio_track: "on_vocal" | "off_vocal" }) => void;
+  onStart: (payload: { format: "mp4" | "webm" | "krl"; audio_track: "on_vocal" | "off_vocal" }) => void;
   onCancel: (jobId: string) => void;
   onDelete: (jobId: string) => void;
 }) {
-  const [format, setFormat] = useState<"mp4" | "webm">("mp4");
+  const [format, setFormat] = useState<"mp4" | "webm" | "krl">("mp4");
   const [audioTrack, setAudioTrack] = useState<"on_vocal" | "off_vocal">("on_vocal");
   const exportJobs = jobs.filter((job) => job.type === "EXPORT");
   const active = exportJobs.find((job) => ["QUEUED", "PREPARING", "RUNNING"].includes(job.status));
   return <div className="scrim">
     <section className="dialog export-dialog" role="dialog" aria-modal="true" aria-labelledby="export-title">
-      <div className="dialog-head"><div><h2 id="export-title">导出工程</h2><p className="muted">服务端使用 Kirakara 原生渲染器导出，结果可重复下载。</p></div><button className="icon-button" title="关闭" onClick={onClose}><X size={18} /></button></div>
+      <div className="dialog-head"><div><h2 id="export-title">导出工程</h2><p className="muted">视频使用 Kirakara 原生渲染；KRL 保留时间、Ruby、角色与当前字幕样式。</p></div><button className="icon-button" title="关闭" onClick={onClose}><X size={18} /></button></div>
       <div className="export-form">
-        <label className="field-label">视频格式<select value={format} onChange={(event) => setFormat(event.target.value as typeof format)}><option value="mp4">MP4 · H.264</option><option value="webm">WebM · VP9</option></select></label>
-        <label className="field-label">音轨<select value={audioTrack} onChange={(event) => setAudioTrack(event.target.value as typeof audioTrack)}><option value="on_vocal">ON VOCAL · 原始音轨</option><option value="off_vocal">OFF VOCAL · 导出时生成人声分离伴奏</option></select></label>
-        {!hasVideo && <p className="form-hint error-text">视频导出需要先上传视频。</p>}
+        <label className="field-label">输出格式<select value={format} onChange={(event) => setFormat(event.target.value as typeof format)}><option value="mp4">MP4 · H.264 视频</option><option value="webm">WebM · VP9 视频</option><option value="krl">KRL · Kirakara 工程</option></select></label>
+        {format !== "krl" && <label className="field-label">音轨<select value={audioTrack} onChange={(event) => setAudioTrack(event.target.value as typeof audioTrack)}><option value="on_vocal">ON VOCAL · 原始音轨</option><option value="off_vocal">OFF VOCAL · 导出时生成人声分离伴奏</option></select></label>}
+        {!hasVideo && format !== "krl" && <p className="form-hint error-text">视频导出需要先上传视频。</p>}
       </div>
-      <div className="dialog-actions"><button className="button text" onClick={onClose}>关闭</button><button className="button filled" disabled={Boolean(active) || !hasVideo} onClick={() => onStart({ format, audio_track: audioTrack })}><Download size={17} />开始导出</button></div>
+      <div className="dialog-actions"><button className="button text" onClick={onClose}>关闭</button><button className="button filled" disabled={Boolean(active) || (format !== "krl" && !hasVideo)} onClick={() => onStart({ format, audio_track: audioTrack })}><Download size={17} />开始导出</button></div>
       {active && <div className="export-active"><LoaderCircle className="spin" size={17} /><span>{active.message || "服务端导出中"} · {Math.round(active.progress * 100)}%</span><div className="analysis-progress export-progress"><i style={{ width: `${Math.max(2, active.progress * 100)}%` }} /></div><button className="icon-button compact" title="取消导出" onClick={() => onCancel(active.id)}><Square size={15} /></button></div>}
-      <div className="export-history"><h3>导出历史</h3>{exportJobs.filter((job) => job.status === "SUCCEEDED").length === 0 ? <p className="muted">暂无可下载文件</p> : exportJobs.filter((job) => job.status === "SUCCEEDED").map((job) => <div className="export-history-row" key={job.id}><span><strong>{String(job.result?.filename || "导出文件")}</strong><small>{String(job.request?.format || "mp4").toUpperCase()} · {job.request?.audio_track === "off_vocal" ? "OFF VOCAL" : "ON VOCAL"} · {new Date(job.created_at).toLocaleString()}</small></span><a className="icon-button" title="下载" href={`/api/projects/${job.project_id}/exports/${job.id}/download`}><Download size={17} /></a><button className="icon-button" title="删除导出记录" onClick={() => onDelete(job.id)}><Trash2 size={17} /></button></div>)}</div>
+      <div className="export-history"><h3>导出历史</h3>{exportJobs.filter((job) => job.status === "SUCCEEDED").length === 0 ? <p className="muted">暂无可下载文件</p> : exportJobs.filter((job) => job.status === "SUCCEEDED").map((job) => { const jobFormat = String(job.request?.format || "mp4"); return <div className="export-history-row" key={job.id}><span><strong>{String(job.result?.filename || "导出文件")}</strong><small>{jobFormat.toUpperCase()} · {jobFormat === "krl" ? "Kirakara 工程" : job.request?.audio_track === "off_vocal" ? "OFF VOCAL" : "ON VOCAL"} · {new Date(job.created_at).toLocaleString()}</small></span><a className="icon-button" title="下载" href={`/api/projects/${job.project_id}/exports/${job.id}/download`}><Download size={17} /></a><button className="icon-button" title="删除导出记录" onClick={() => onDelete(job.id)}><Trash2 size={17} /></button></div>; })}</div>
     </section>
   </div>;
 }
@@ -1068,7 +1068,7 @@ export function EditorPage({ id }: { id: string }) {
     }
   }
 
-  async function startExport(payload: { format: "mp4" | "webm"; audio_track: "on_vocal" | "off_vocal" }) {
+  async function startExport(payload: { format: "mp4" | "webm" | "krl"; audio_track: "on_vocal" | "off_vocal" }) {
     setError(null);
     try {
       const revision = await saveNow();
@@ -1076,7 +1076,7 @@ export function EditorPage({ id }: { id: string }) {
       setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]);
     } catch (reason) {
       const status = (reason as Error & { status?: number })?.status;
-      setError(status === 409 ? "工程版本已变化，请保存后重试。" : "无法启动服务端导出，请确认后端已启动并安装 Chrome。 ");
+      setError(status === 409 ? "工程版本已变化，请保存后重试。" : payload.format === "krl" ? "无法导出 KRL 工程文件，请确认后端已启动。" : "无法启动服务端导出，请确认后端已启动并安装 Chrome。 ");
     }
   }
 

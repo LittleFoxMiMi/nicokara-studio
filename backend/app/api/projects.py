@@ -395,8 +395,17 @@ def export_project(project_id: str, payload: ExportRequest, request: Request):
     if project["revision"] != payload.revision:
         raise HTTPException(409, {"code": "revision_conflict"})
     document = db.document(project_id)
-    if not document or not document.get("media", {}).get("video_filename"):
+    if not document:
+        raise HTTPException(404, "工程文档不存在")
+    if payload.format in {"mp4", "webm"} and not document.get("media", {}).get("video_filename"):
         raise HTTPException(422, "导出请先上传视频")
+    if payload.format == "krl":
+        return request.app.state.analysis_runner.enqueue(
+            project_id,
+            "EXPORT",
+            payload.revision,
+            {"revision": payload.revision, "format": "krl", "steps": ["export"]},
+        )
     configured = db.settings()
     video_crf = payload.video_crf if payload.video_crf is not None else int(configured.get("export_mp4_crf" if payload.format == "mp4" else "export_webm_crf", 20 if payload.format == "mp4" else 32))
     if payload.format == "mp4" and video_crf > 51:
@@ -412,7 +421,7 @@ def export_project(project_id: str, payload: ExportRequest, request: Request):
         "separator_device": payload.separator_device or str(configured.get("separator_device") or request.app.state.settings.separator_device),
         "steps": ["export"],
     }
-    if payload.audio_track == "off_vocal" and body["separator_instrumental_model"] not in SUPPORTED_SEPARATOR_MODELS:
+    if payload.format in {"mp4", "webm"} and payload.audio_track == "off_vocal" and body["separator_instrumental_model"] not in SUPPORTED_SEPARATOR_MODELS:
         raise HTTPException(422, "OFF VOCAL 模型必须从 MDX 或 VR 下拉列表中选择")
     return request.app.state.analysis_runner.enqueue(project_id, "EXPORT", payload.revision, body)
 
@@ -434,7 +443,8 @@ def download_export(project_id: str, job_id: str, request: Request):
     if not path.is_file():
         raise HTTPException(404, "导出文件已被清理")
     filename = result.get("filename") or f"{project_id}.{path.suffix.lstrip('.') }"
-    return FileResponse(path, media_type="video/mp4" if path.suffix == ".mp4" else "video/webm", filename=filename)
+    media_types = {".mp4": "video/mp4", ".webm": "video/webm", ".krl": "text/plain; charset=utf-8"}
+    return FileResponse(path, media_type=media_types.get(path.suffix, "application/octet-stream"), filename=filename)
 
 @router.delete("/{project_id}/exports/{job_id}", status_code=204)
 def delete_export(project_id: str, job_id: str, request: Request):

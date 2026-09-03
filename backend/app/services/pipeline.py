@@ -410,7 +410,7 @@ class AnalysisPipeline:
                 staged_path.unlink(missing_ok=True)
 
     def _export(self, job_id: str, project_id: str, document: dict, payload: dict, values: dict) -> dict:
-        off_vocal = payload.get("audio_track") == "off_vocal"
+        off_vocal = payload.get("format") in {"mp4", "webm"} and payload.get("audio_track") == "off_vocal"
         if off_vocal:
             self._prepare_export_instrumental(job_id, project_id, payload, values)
         return run_kirakara_export(
