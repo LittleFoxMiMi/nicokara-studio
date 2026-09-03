@@ -104,6 +104,7 @@ def test_vocal_separator_requests_directml_and_places_both_stems(tmp_path, monke
     vocals, instrumental, asr = separator.separate(source, derived, device="directml")
 
     assert created[0].kwargs["use_directml"] is True
+    assert created[0].kwargs["mdx_params"]["enable_denoise"] is True
     assert created[0].onnx_execution_provider == ["DmlExecutionProvider"]
     assert created[0].model == "UVR_MDXNET_KARA_2.onnx"
     assert vocals.read_bytes() == b"vocals"

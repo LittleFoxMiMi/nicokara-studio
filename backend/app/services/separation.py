@@ -150,6 +150,13 @@ class VocalSeparator:
                         output_dir=str(derived_dir),
                         output_format="WAV",
                         use_directml=provider == "DmlExecutionProvider",
+                        mdx_params={
+                            "hop_length": 1024,
+                            "segment_size": 256,
+                            "overlap": 0.25,
+                            "batch_size": 1,
+                            "enable_denoise": True,
+                        },
                     )
                     # audio-separator 0.44 requires torch-directml before it selects
                     # the ONNX DML provider, although MDX inference itself is ONNX.
