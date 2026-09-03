@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -144,6 +145,123 @@ def test_fa_kara_full_analysis_keeps_whisper_and_pronunciation_steps(tmp_path, m
         assert response.status_code == 202
         assert response.json()["request"]["steps"] == ["separation", "transcription", "pronunciation", "fa_kara"]
         assert response.json()["request"]["fa_kara_model"] == "yohane"
+
+
+def test_full_analysis_with_missing_ruby_stops_only_when_alignment_begins(tmp_path, monkeypatch):
+    get_settings.cache_clear()
+    monkeypatch.setenv("NICOKARA_DATA_DIR", str(tmp_path))
+    with TestClient(create_app()) as client:
+        project = client.post("/api/projects", json={"name": "全曲补注音"}).json()
+        document = client.get(f"/api/projects/{project['id']}/document").json()["document"]
+        document["media"]["video_filename"] = "video.mp4"
+        document["lyrics"]["lines"] = [{"id": "line", "units": [{"id": "unit", "surface": "雨", "ruby": None}]}]
+        saved = client.put(
+            f"/api/projects/{project['id']}/document",
+            json={"revision": 1, "document": document},
+        ).json()
+        pipeline = client.app.state.analysis_runner.pipeline
+        calls = []
+        pipeline._separate = lambda job_id, project_id, current, revision, payload, values: (calls.append("separation") or current, revision, {})
+        pipeline._transcribe = lambda job_id, project_id, current, revision, payload, values: (calls.append("transcription") or current, revision, {})
+        pipeline._pronounce = lambda job_id, project_id, current, revision, payload: (calls.append("pronunciation") or current, revision, {})
+        pipeline._fa_kara = lambda *args: calls.append("fa_kara")
+
+        queued = client.post(
+            f"/api/projects/{project['id']}/analysis",
+            json={
+                "revision": saved["revision"],
+                "alignment_backend": "fa_kara",
+                "steps": ["separation", "transcription", "pronunciation", "fa_kara"],
+            },
+        )
+        assert queued.status_code == 202
+        for _ in range(100):
+            job = client.get(f"/api/jobs/{queued.json()['id']}").json()
+            if job["status"] == "FAILED":
+                break
+            time.sleep(0.01)
+
+        assert job["error_code"] == "missing_ruby"
+        assert calls == ["separation", "transcription", "pronunciation"]
+        assert "雨" in job["error_message"]
+
+
+def test_ai_pronunciation_job_adds_whisper_prerequisites_only_when_missing(tmp_path, monkeypatch):
+    get_settings.cache_clear()
+    monkeypatch.setenv("NICOKARA_DATA_DIR", str(tmp_path))
+    with TestClient(create_app()) as client:
+        project = client.post("/api/projects", json={"name": "AI 注音前置"}).json()
+        document = client.get(f"/api/projects/{project['id']}/document").json()["document"]
+        document["media"]["video_filename"] = "video.mp4"
+        document["lyrics"]["lines"] = [{"id": "line", "units": [{"id": "unit", "surface": "雨", "ruby": None}]}]
+        saved = client.put(
+            f"/api/projects/{project['id']}/document",
+            json={"revision": 1, "document": document},
+        ).json()
+        calls = []
+        client.app.state.analysis_runner = SimpleNamespace(
+            enqueue=lambda *args: calls.append(args) or {"id": f"job-{len(calls)}", "request": args[3]}
+        )
+
+        fresh = client.post(
+            f"/api/projects/{project['id']}/pronunciation-job",
+            json={"revision": saved["revision"], "mode": "ai"},
+        )
+        assert fresh.status_code == 202
+        assert fresh.json()["request"]["steps"] == ["separation", "transcription", "pronunciation"]
+
+        derived = tmp_path / "projects" / project["id"] / "derived"
+        derived.mkdir(parents=True)
+        (derived / "vocals_asr.wav").write_bytes(b"audio")
+        (derived / "transcript.json").write_text('{"segments": []}', encoding="utf-8")
+        document.setdefault("analysis", {})["transcription"] = {"status": "completed"}
+        saved = client.app.state.database.save_document(project["id"], document, saved["revision"])
+
+        existing = client.post(
+            f"/api/projects/{project['id']}/pronunciation-job",
+            json={"revision": saved["revision"], "mode": "ai"},
+        )
+        local = client.post(
+            f"/api/projects/{project['id']}/pronunciation-job",
+            json={"revision": saved["revision"], "mode": "local"},
+        )
+        assert existing.status_code == 202
+        assert existing.json()["request"]["steps"] == ["pronunciation"]
+        assert local.status_code == 202
+        assert local.json()["request"]["steps"] == ["pronunciation"]
+
+
+def test_fresh_ai_pronunciation_job_runs_separation_whisper_and_ai_in_order(tmp_path, monkeypatch):
+    get_settings.cache_clear()
+    monkeypatch.setenv("NICOKARA_DATA_DIR", str(tmp_path))
+    with TestClient(create_app()) as client:
+        project = client.post("/api/projects", json={"name": "新工程 AI 注音"}).json()
+        document = client.get(f"/api/projects/{project['id']}/document").json()["document"]
+        document["media"]["video_filename"] = "video.mp4"
+        document["lyrics"]["lines"] = [{"id": "line", "units": [{"id": "unit", "surface": "雨", "ruby": None}]}]
+        saved = client.put(
+            f"/api/projects/{project['id']}/document",
+            json={"revision": 1, "document": document},
+        ).json()
+        pipeline = client.app.state.analysis_runner.pipeline
+        calls = []
+        pipeline._separate = lambda job_id, project_id, current, revision, payload, values: (calls.append("separation") or current, revision, {})
+        pipeline._transcribe = lambda job_id, project_id, current, revision, payload, values: (calls.append("transcription") or current, revision, {})
+        pipeline._pronounce = lambda job_id, project_id, current, revision, payload: (calls.append("pronunciation") or current, revision, {})
+
+        queued = client.post(
+            f"/api/projects/{project['id']}/pronunciation-job",
+            json={"revision": saved["revision"], "mode": "ai"},
+        )
+        assert queued.status_code == 202
+        for _ in range(100):
+            job = client.get(f"/api/jobs/{queued.json()['id']}").json()
+            if job["status"] in {"SUCCEEDED", "FAILED"}:
+                break
+            time.sleep(0.01)
+
+        assert job["status"] == "SUCCEEDED"
+        assert calls == ["separation", "transcription", "pronunciation"]
 
 
 def test_fa_kara_settings_validate_backend_and_model(tmp_path, monkeypatch):

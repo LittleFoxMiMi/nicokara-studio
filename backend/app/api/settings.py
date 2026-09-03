@@ -4,14 +4,16 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from urllib.parse import urlparse
 from app.schemas.projects import AIProfilePayload, PromptPresetPayload, SettingsPayload
-from app.services.pronunciation import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_TEMPLATE
+from app.services.pronunciation import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_TEMPLATE, resolve_prompt_settings
 from app.services.ai_client import AIClient
 from app.services.secrets import SecretStore
 from app.services.separation import SUPPORTED_SEPARATOR_MODELS
 router = APIRouter(prefix="/settings", tags=["settings"])
 @router.get("")
 def get_settings(request: Request):
-    stored = request.app.state.database.settings()
+    database = request.app.state.database
+    stored = database.settings()
+    system_prompt, user_template, preset_id = resolve_prompt_settings(database, stored)
     legacy_separator_model = stored.get("separator_model") or request.app.state.settings.separator_model
     return {
         "alignment_backend": "fa_kara",
@@ -25,6 +27,9 @@ def get_settings(request: Request):
         "export_audio_bitrate_kbps": 192,
         "export_gop_seconds": 2,
         **stored,
+        "pronunciation_system_prompt": system_prompt,
+        "pronunciation_user_template": user_template,
+        "default_prompt_preset_id": preset_id,
     }
 @router.put("")
 def save_settings(payload: SettingsPayload, request: Request):
@@ -165,13 +170,24 @@ def list_prompt_presets(request: Request):
 @router.post("/prompt-presets")
 def create_prompt_preset(payload: PromptPresetPayload, request: Request):
     preset = {"id": str(uuid4()), **payload.model_dump()}
-    return request.app.state.database.save_prompt_preset(preset)
+    return _save_default_prompt(preset, request)
 
 @router.put("/prompt-presets/{preset_id}")
 def update_prompt_preset(preset_id: str, payload: PromptPresetPayload, request: Request):
     if preset_id == "builtin-default" or not request.app.state.database.get_prompt_preset(preset_id):
         raise HTTPException(404, "提示词预设不存在或不可编辑")
-    return request.app.state.database.save_prompt_preset({"id": preset_id, **payload.model_dump()})
+    return _save_default_prompt({"id": preset_id, **payload.model_dump()}, request)
+
+
+def _save_default_prompt(preset: dict, request: Request):
+    database = request.app.state.database
+    saved = database.save_prompt_preset(preset)
+    database.save_settings({
+        "default_prompt_preset_id": saved["id"],
+        "pronunciation_system_prompt": saved["system_prompt"],
+        "pronunciation_user_template": saved["user_template"],
+    })
+    return saved
 
 @router.delete("/prompt-presets/{preset_id}", status_code=204)
 def delete_prompt_preset(preset_id: str, request: Request):

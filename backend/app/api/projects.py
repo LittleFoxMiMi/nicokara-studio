@@ -12,7 +12,7 @@ from app.domain.lyrics import detect_lyrics_format, parse_lyrics
 from app.media.probe import probe, thumbnail
 from app.media.waveform import generate_waveform
 from app.services.audio import prepare_source_audio
-from app.schemas.projects import AnalysisRequest, DocumentSave, ExportRequest, FAKaraRequest, FullAnalysisRequest, LyricsDetect, LyricsImport, ProjectCreate, ProjectPatch, ProjectResponse, SeparationRequest
+from app.schemas.projects import AnalysisRequest, DocumentSave, ExportRequest, FAKaraRequest, FullAnalysisRequest, LyricsDetect, LyricsImport, ProjectCreate, ProjectPatch, ProjectResponse, PronunciationRequest, SeparationRequest
 from app.services.kirakara_export import build_worker_html, export_output_path, export_raw_output_path
 from app.services.fa_kara_text import missing_japanese_ruby, normalize_language
 from app.services.separation import SUPPORTED_SEPARATOR_MODELS
@@ -289,11 +289,6 @@ def _validate_full_steps(
             missing = [item for item in previous if item not in steps and not complete[item]]
             if missing:
                 raise HTTPException(422, f"{key} 的前置流程尚未完成：{missing[0]}")
-    if any(step in {"fa_kara", "global_alignment", "alignment"} for step in steps):
-        if message := _missing_ruby_message(document):
-            raise HTTPException(422, message)
-
-
 @router.post("/{project_id}/analysis", status_code=202)
 def full_analysis(project_id: str, payload: FullAnalysisRequest, request: Request):
     settings, db = services(request)
@@ -363,17 +358,33 @@ def align(project_id: str, payload: AnalysisRequest, request: Request):
 
 
 @router.post("/{project_id}/pronunciation-job", status_code=202)
-def pronunciation_job(project_id: str, payload: dict, request: Request):
-    db = services(request)[1]
+def pronunciation_job(project_id: str, payload: PronunciationRequest, request: Request):
+    settings, db = services(request)
     project = project_or_404(db, project_id)
     document = db.document(project_id)
     if not document or not document.get("lyrics", {}).get("lines"):
         raise HTTPException(422, "请先添加歌词")
-    if project["revision"] != payload.get("revision"):
+    if project["revision"] != payload.revision:
         raise HTTPException(409, {"code": "revision_conflict"})
     if document_language(document) == "cn":
         raise HTTPException(422, "中文工程不需要注音")
-    body = {"revision": project["revision"], "line_ids": payload.get("line_ids", []), "unit_ids": payload.get("unit_ids", []), "overwrite_policy": payload.get("overwrite_policy", "unlocked_only"), "profile_id": payload.get("profile_id"), "mode": payload.get("mode", "ai"), "steps": ["pronunciation"]}
+
+    body = payload.model_dump()
+    steps = ["pronunciation"]
+    if payload.mode == "ai":
+        completion = _analysis_completion(document, project_id, settings)
+        if not completion["transcription"]:
+            if not document.get("media", {}).get("video_filename"):
+                raise HTTPException(422, "AI 注音需要 Whisper 粗识别结果，请先上传视频")
+            derived = settings.projects_dir / project_id / "derived"
+            steps = (["separation"] if not (derived / "vocals_asr.wav").is_file() else []) + ["transcription", "pronunciation"]
+            configured = db.settings()
+            legacy_model = str(configured.get("separator_model") or settings.separator_model)
+            body["separator_vocals_model"] = str(configured.get("separator_vocals_model") or legacy_model)
+            if body["separator_vocals_model"] not in SUPPORTED_SEPARATOR_MODELS:
+                raise HTTPException(422, "人声分离模型必须从 MDX 或 VR 下拉列表中选择")
+    body["revision"] = project["revision"]
+    body["steps"] = steps
     return request.app.state.analysis_runner.enqueue(project_id, "PRONUNCIATION", project["revision"], body)
 
 @router.post("/{project_id}/export", status_code=202)

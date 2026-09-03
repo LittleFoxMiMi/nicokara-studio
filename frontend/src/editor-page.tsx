@@ -196,6 +196,8 @@ function updateProjectLanguage(document: ProjectDocument, language: ProjectLangu
 }
 
 type MissingRubyReport = { unitIds: string[]; lines: { lineIndex: number; characters: string }[] };
+type FullAnalysisResume = { request: Record<string, unknown>; steps: string[] };
+type MissingRubyDialogState = MissingRubyReport & { resume?: FullAnalysisResume };
 
 function missingJapaneseRuby(document: ProjectDocument): MissingRubyReport {
   const unitIds: string[] = [];
@@ -674,7 +676,7 @@ export function EditorPage({ id }: { id: string }) {
   const [exportOpen, setExportOpen] = useState(false);
   const [workflowNotice, setWorkflowNotice] = useState<string | null>(null);
   const [pendingLanguage, setPendingLanguage] = useState<ProjectLanguage | null>(null);
-  const [missingRubyDialog, setMissingRubyDialog] = useState<MissingRubyReport | null>(null);
+  const [missingRubyDialog, setMissingRubyDialog] = useState<MissingRubyDialogState | null>(null);
   const [alignmentBackend, setAlignmentBackend] = useState<"fa_kara" | "stable_ts">("fa_kara");
   const [faKaraModel, setFaKaraModel] = useState<"mms" | "yohane">("mms");
   const [fullSteps, setFullSteps] = useState<Record<string, boolean>>({ separation: true, transcription: true, pronunciation: true, global_alignment: true, alignment: true });
@@ -684,6 +686,7 @@ export function EditorPage({ id }: { id: string }) {
     videoRef = useRef<HTMLVideoElement>(null);
   const appliedJobs = useRef(new Set<string>());
   const appliedVocalWaveforms = useRef(new Set<string>());
+  const pendingFullResume = useRef<{ pronunciationJobId: string; resume: FullAnalysisResume } | null>(null);
 
   const subtitleStyle = useMemo(() => normalizeSubtitleStyle((document?.styles || {}) as Record<string, unknown>), [document?.styles]);
   const stylePresets = useMemo<StylePreset[]>(() => {
@@ -745,6 +748,36 @@ export function EditorPage({ id }: { id: string }) {
         }
         if (terminal && await reloadFromServer()) {
           appliedJobs.current.add(terminal.id);
+          const currentDocument = documentRef.current;
+          const pending = pendingFullResume.current;
+          if (pending?.pronunciationJobId === terminal.id) {
+            pendingFullResume.current = null;
+            if (terminal.status === "SUCCEEDED" && currentDocument) {
+              const report = missingJapaneseRuby(currentDocument);
+              if (report.lines.length) {
+                setMissingRubyDialog({ ...report, resume: pending.resume });
+              } else {
+                try {
+                  const revision = projectRef.current?.revision;
+                  if (!revision) throw new Error("missing_revision");
+                  const resumed = await api<AnalysisJob>(`/projects/${id}/analysis`, {
+                    method: "POST",
+                    body: JSON.stringify({ ...pending.resume.request, revision, steps: pending.resume.steps }),
+                  });
+                  setJobs((current) => [resumed, ...current.filter((item) => item.id !== resumed.id)]);
+                } catch {
+                  setError("本地注音已完成，但无法继续全曲分析，请重新打开全曲分析。 ");
+                }
+              }
+            }
+          } else if (terminal.type === "FULL_ANALYSIS" && terminal.error_code === "missing_ruby" && currentDocument) {
+            const report = missingJapaneseRuby(currentDocument);
+            const requestedSteps = Array.isArray(terminal.request?.steps) ? terminal.request.steps.filter((step): step is string => typeof step === "string") : [];
+            const steps = requestedSteps.filter((step) => ["global_alignment", "alignment", "fa_kara"].includes(step));
+            if (report.lines.length && steps.length) {
+              setMissingRubyDialog({ ...report, resume: { request: terminal.request || {}, steps } });
+            }
+          }
         }
       } catch {
         // Project loading already reports connectivity failures.
@@ -1073,8 +1106,8 @@ export function EditorPage({ id }: { id: string }) {
     }
   }
 
-  async function runPronunciation(mode: "local" | "ai", lineIds?: string[], targetUnitIds?: string[]) {
-    if (!documentRef.current?.lyrics.lines.length || documentRef.current.project.language === "cn") return;
+  async function runPronunciation(mode: "local" | "ai", lineIds?: string[], targetUnitIds?: string[]): Promise<AnalysisJob | null> {
+    if (!documentRef.current?.lyrics.lines.length || documentRef.current.project.language === "cn") return null;
     setPronunciationRunning(true);
     setError(null);
     try {
@@ -1085,11 +1118,23 @@ export function EditorPage({ id }: { id: string }) {
         body: JSON.stringify({ revision, line_ids: lineIds || [], unit_ids: unitIds, mode, overwrite_policy: "unlocked_only" }),
       });
       setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]);
+      return job;
     } catch (reason) {
       const status = (reason as Error & { status?: number })?.status;
       setError(status === 409 ? "工程版本已变化，请保存后重试。" : "注音失败，现有歌词和 Ruby 未被覆盖。 ");
+      return null;
     } finally {
       setPronunciationRunning(false);
+    }
+  }
+
+  async function fillMissingRubyAndResume() {
+    const dialog = missingRubyDialog;
+    if (!dialog) return;
+    setMissingRubyDialog(null);
+    const job = await runPronunciation("local", undefined, dialog.unitIds);
+    if (job && dialog.resume) {
+      pendingFullResume.current = { pronunciationJobId: job.id, resume: dialog.resume };
     }
   }
 
@@ -1221,7 +1266,6 @@ export function EditorPage({ id }: { id: string }) {
   }
 
   async function startFullAnalysis() {
-    if (!requireJapaneseRuby()) return;
     setFullAnalysisOpen(false);
     setAnalysisStarting(true);
     setError(null);
@@ -1247,7 +1291,6 @@ export function EditorPage({ id }: { id: string }) {
   }
 
   async function openFullAnalysis() {
-    if (!requireJapaneseRuby()) return;
     setAnalysisStarting(true);
     setError(null);
     try {
@@ -1342,6 +1385,7 @@ export function EditorPage({ id }: { id: string }) {
   );
   const hasVideo = Boolean(document.media.video_filename),
     lines = document.lyrics.lines;
+  const hasLyrics = lines.some((line) => line.units.some((unit) => Boolean(unit.surface)));
   const language: ProjectLanguage = document.project.language === "cn" ? "cn" : "jp";
   const effectiveAlignmentBackend = language === "cn" ? "fa_kara" : alignmentBackend;
   const activeJob = jobs.find((job) => ["QUEUED", "PREPARING", "RUNNING"].includes(job.status));
@@ -1414,11 +1458,11 @@ export function EditorPage({ id }: { id: string }) {
               <FileText size={17} />
               {lines.length ? "替换歌词" : "添加歌词"}
             </button>
-            <button className="button tonal" disabled={language === "cn" || !lines.length || pronunciationRunning} onClick={() => void runPronunciation("local")} title={language === "cn" ? "中文工程不需要注音" : "为未锁定单元生成本地日语读音"}>
+            <button className="button tonal" disabled={language === "cn" || !hasLyrics || pronunciationRunning || Boolean(activeJob) || analysisStarting} onClick={() => void runPronunciation("local")} title={language === "cn" ? "中文工程不需要注音" : "为未锁定单元生成本地日语读音"}>
               <WandSparkles size={17} />
               {pronunciationRunning ? "注音中" : "本地注音"}
             </button>
-            <button className="button tonal" disabled={language === "cn" || !lines.length || pronunciationRunning} onClick={() => void runPronunciation("ai")} title={language === "cn" ? "中文工程不需要注音" : "使用当前 AI profile 生成读音，失败时保留现有歌词和 Ruby"}>
+            <button className="button tonal" disabled={language === "cn" || !hasLyrics || pronunciationRunning || Boolean(activeJob) || analysisStarting} onClick={() => void runPronunciation("ai")} title={language === "cn" ? "中文工程不需要注音" : "使用 Whisper 粗识别结果生成读音；缺少结果时会先完成人声分离和粗识别"}>
               <WandSparkles size={17} />AI 注音
             </button>
             <button className="button tonal" disabled={!hasVideo || !lines.length || Boolean(activeJob) || analysisStarting} onClick={() => void startTranscription()} title="仅运行 Whisper 人声粗识别">
@@ -1472,7 +1516,7 @@ export function EditorPage({ id }: { id: string }) {
               {activeJob ? <LoaderCircle className="spin" size={18} /> : visibleJob.status === "FAILED" ? <AlertCircle size={18} /> : <AudioLines size={18} />}
             </span>
             <div className="analysis-copy">
-              <strong>{visibleJob.type === "EXPORT" ? "Kirakara 服务端导出" : visibleJob.type === "VOCAL_SEPARATION" ? "人声分离" : visibleJob.type === "FA_KARA_ALIGNMENT" ? "FA-Kara 对齐" : visibleJob.type === "FULL_ANALYSIS" && visibleJob.request?.alignment_backend === "fa_kara" ? "人声分离 + Whisper + FA-Kara" : "人声分离 + Whisper 对齐"}</strong>
+              <strong>{visibleJob.type === "EXPORT" ? "Kirakara 服务端导出" : visibleJob.type === "VOCAL_SEPARATION" ? "人声分离" : visibleJob.type === "PRONUNCIATION" ? (Array.isArray(visibleJob.request?.steps) && visibleJob.request.steps.includes("transcription") ? "人声分离 + Whisper + AI 注音" : "注音") : visibleJob.type === "FA_KARA_ALIGNMENT" ? "FA-Kara 对齐" : visibleJob.type === "FULL_ANALYSIS" && visibleJob.request?.alignment_backend === "fa_kara" ? "人声分离 + Whisper + FA-Kara" : "人声分离 + Whisper 对齐"}</strong>
               <span>{visibleJob.error_message || visibleJob.message || visibleJob.stage}</span>
             </div>
             <div className="analysis-steps">
@@ -1843,10 +1887,10 @@ export function EditorPage({ id }: { id: string }) {
       {missingRubyDialog && (
         <div className="scrim">
           <section className="dialog workflow-notice" role="alertdialog" aria-modal="true" aria-labelledby="missing-ruby-title">
-            <div className="dialog-head"><h2 id="missing-ruby-title">无法开始对齐</h2><button className="icon-button" title="关闭" onClick={() => setMissingRubyDialog(null)}><X size={18} /></button></div>
-            <p className="workflow-notice-copy">以下日文汉字尚未注音：</p>
+            <div className="dialog-head"><h2 id="missing-ruby-title">{missingRubyDialog.resume ? "全曲分析需要补充注音" : "无法开始对齐"}</h2><button className="icon-button" title="关闭" onClick={() => setMissingRubyDialog(null)}><X size={18} /></button></div>
+            <p className="workflow-notice-copy">{missingRubyDialog.resume ? "AI 注音完成后，以下日文汉字仍未注音。取消将中断本次全曲分析；使用本地注音后会继续对齐。" : "以下日文汉字尚未注音："}</p>
             <ul className="missing-ruby-list">{missingRubyDialog.lines.map((item) => <li key={item.lineIndex}>第 {item.lineIndex + 1} 行：{item.characters}</li>)}</ul>
-            <div className="dialog-actions"><button className="button tonal" onClick={() => { const ids = missingRubyDialog.unitIds; setMissingRubyDialog(null); void runPronunciation("local", undefined, ids); }}><WandSparkles size={17} />使用本地注音</button><button className="button filled" onClick={() => setMissingRubyDialog(null)}>确定</button></div>
+            <div className="dialog-actions"><button className="button text" onClick={() => setMissingRubyDialog(null)}>{missingRubyDialog.resume ? "取消全曲分析" : "取消"}</button><button className="button filled" onClick={() => void fillMissingRubyAndResume()}><WandSparkles size={17} />使用本地注音</button></div>
           </section>
         </div>
       )}

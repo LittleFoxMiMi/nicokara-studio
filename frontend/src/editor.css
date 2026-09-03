@@ -542,6 +542,7 @@
 .pipeline-step strong {
   color: #202124;
   font-size: 13px;
+  text-align: center;
 }
 .pipeline-step small {
   color: #5f6368;

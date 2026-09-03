@@ -11,11 +11,91 @@ from app.main import create_app
 from app.services.pronunciation import PronunciationSelection, PronunciationValidationError, apply_ai, chunk_lines, validate_ai_result
 
 
+def prepare_whisper_result(client: TestClient, tmp_path, project_id: str, imported: dict) -> dict:
+    derived = tmp_path / "projects" / project_id / "derived"
+    derived.mkdir(parents=True, exist_ok=True)
+    (derived / "transcript.json").write_text('{"segments": [{"text": "歌詞"}]}', encoding="utf-8")
+    document = imported["document"]
+    document.setdefault("analysis", {})["transcription"] = {"status": "completed"}
+    return client.app.state.database.save_document(project_id, document, imported["revision"])
+
+
+def wait_for_job(client: TestClient, job_id: str) -> dict:
+    for _ in range(200):
+        job = client.get(f"/api/jobs/{job_id}").json()
+        if job["status"] in {"SUCCEEDED", "FAILED", "CANCELED"}:
+            return job
+        time.sleep(0.01)
+    raise AssertionError("analysis job did not finish")
+
+
 def test_chunk_lines_preserves_line_boundaries_and_long_lines():
     lines = [{"line_index": 0, "text": "雨"}, {"line_index": 1, "text": "青空"}, {"line_index": 2, "text": "長い歌詞"}]
     batches = chunk_lines(lines, 3)
     assert [[item["line_index"] for item in batch] for batch in batches] == [[0, 1], [2]]
     assert batches[1][0]["text"] == "長い歌詞"
+
+
+def test_saved_prompt_preset_becomes_default_and_is_used_by_ai_job(tmp_path, monkeypatch):
+    get_settings.cache_clear()
+    monkeypatch.setenv("NICOKARA_DATA_DIR", str(tmp_path))
+    with TestClient(create_app()) as client:
+        builtin = client.get("/api/settings/prompt-presets").json()[0]
+        assert "取り戻す" in builtin["system_prompt"]
+        assert "未封闭的括号" in builtin["user_template"]
+
+        client.app.state.database.save_settings({
+            "pronunciation_system_prompt": "STALE SYSTEM",
+            "pronunciation_user_template": "STALE TEMPLATE",
+        })
+        client.app.state.database.save_prompt_preset({
+            "id": "legacy-preset",
+            "name": "Legacy active",
+            "system_prompt": "LEGACY SAVED SYSTEM",
+            "user_template": "LEGACY SAVED TEMPLATE {{current_lines}}",
+        })
+        legacy_settings = client.get("/api/settings").json()
+        assert legacy_settings["default_prompt_preset_id"] == "legacy-preset"
+        assert legacy_settings["pronunciation_system_prompt"] == "LEGACY SAVED SYSTEM"
+
+        custom_system = "CUSTOM SYSTEM PROMPT"
+        custom_template = "CUSTOM TEMPLATE\n{{current_lines}}\n{{whisper_segments}}"
+        preset = client.post(
+            "/api/settings/prompt-presets",
+            json={"name": "Active", "system_prompt": custom_system, "user_template": custom_template},
+        ).json()
+        stored_settings = client.get("/api/settings").json()
+        assert stored_settings["default_prompt_preset_id"] == preset["id"]
+        assert stored_settings["pronunciation_system_prompt"] == custom_system
+        assert stored_settings["pronunciation_user_template"] == custom_template
+
+        profile = client.post(
+            "/api/settings/ai-profiles",
+            json={"name": "Prompt check", "base_url": "http://localhost:1234/v1", "model": "demo", "api_key": "secret"},
+        ).json()
+        project = client.post("/api/projects", json={"name": "Prompt check"}).json()
+        imported = client.post(
+            f"/api/projects/{project['id']}/lyrics/import",
+            json={"revision": 1, "format": "text", "content": "雨"},
+        ).json()
+        prepared = prepare_whisper_result(client, tmp_path, project["id"], imported)
+        prompts = []
+
+        def fake_complete(self, system_prompt, user_prompt):
+            prompts.append((system_prompt, user_prompt))
+            return {"result": [{"line_index": 0, "raw": "雨", "pronunciation": [[0, "雨", "あめ"]]}]}
+
+        monkeypatch.setattr("app.services.pronunciation.AIClient.complete", fake_complete)
+        response = client.post(
+            f"/api/projects/{project['id']}/pronunciation-job",
+            json={"revision": prepared["revision"], "mode": "ai", "profile_id": profile["id"]},
+        )
+        assert response.status_code == 202
+        job = wait_for_job(client, response.json()["id"])
+        assert job["status"] == "SUCCEEDED"
+        assert prompts[0][0] == custom_system
+        assert prompts[0][1].startswith("CUSTOM TEMPLATE")
+        assert '"text": "雨"' in prompts[0][1]
 
 
 def test_ai_pronunciation_batches_and_retries_structural_failure(tmp_path, monkeypatch):
@@ -27,6 +107,7 @@ def test_ai_pronunciation_batches_and_retries_structural_failure(tmp_path, monke
         assert profile["retry_count"] == 1
         project = client.post("/api/projects", json={"name": "Batching"}).json()
         imported = client.post(f"/api/projects/{project['id']}/lyrics/import", json={"revision": 1, "format": "text", "content": "a" * 80 + "\n" + "b" * 80}).json()
+        prepared = prepare_whisper_result(client, tmp_path, project["id"], imported)
         calls = []
 
         def fake_complete(self, system_prompt, user_prompt):
@@ -37,11 +118,13 @@ def test_ai_pronunciation_batches_and_retries_structural_failure(tmp_path, monke
             text = "a" * 80 if line_index == 0 else "b" * 80
             return {"result": [{"line_index": line_index, "raw": text, "pronunciation": []}]}
 
-        monkeypatch.setattr("app.api.pronunciation.AIClient.complete", fake_complete)
-        response = client.post(f"/api/projects/{project['id']}/pronunciation/ai", json={"revision": imported["revision"], "mode": "ai", "profile_id": profile["id"]})
-        assert response.status_code == 200
-        assert response.json()["summary"]["batch_count"] == 2
-        assert response.json()["summary"]["retry_count"] == 1
+        monkeypatch.setattr("app.services.pronunciation.AIClient.complete", fake_complete)
+        response = client.post(f"/api/projects/{project['id']}/pronunciation-job", json={"revision": prepared["revision"], "mode": "ai", "profile_id": profile["id"]})
+        assert response.status_code == 202
+        job = wait_for_job(client, response.json()["id"])
+        assert job["status"] == "SUCCEEDED"
+        assert job["result"]["pronunciation"]["batch_count"] == 2
+        assert job["result"]["pronunciation"]["retry_count"] == 1
         assert len(calls) == 3
 
 
@@ -52,6 +135,7 @@ def test_ai_pronunciation_rejects_noncanonical_raw_protocol(tmp_path, monkeypatc
         profile = client.post("/api/settings/ai-profiles", json={"name": "Partial", "base_url": "http://localhost:1234/v1", "model": "demo", "api_key": "secret", "max_chars_per_request": 100, "retry_count": 0}).json()
         project = client.post("/api/projects", json={"name": "Partial"}).json()
         imported = client.post(f"/api/projects/{project['id']}/lyrics/import", json={"revision": 1, "format": "text", "content": "雨\n青空"}).json()
+        prepared = prepare_whisper_result(client, tmp_path, project["id"], imported)
 
         def fake_complete(self, system_prompt, user_prompt):
             return {"result": [
@@ -59,11 +143,13 @@ def test_ai_pronunciation_rejects_noncanonical_raw_protocol(tmp_path, monkeypatc
                 {"line_index": 1, "raw": "青空", "pronunciation": [[0, "青空", "あおぞら"]]},
             ]}
 
-        monkeypatch.setattr("app.api.pronunciation.AIClient.complete", fake_complete)
-        response = client.post(f"/api/projects/{project['id']}/pronunciation/ai", json={"revision": imported["revision"], "mode": "ai", "profile_id": profile["id"]})
-        assert response.status_code == 502
+        monkeypatch.setattr("app.services.pronunciation.AIClient.complete", fake_complete)
+        response = client.post(f"/api/projects/{project['id']}/pronunciation-job", json={"revision": prepared["revision"], "mode": "ai", "profile_id": profile["id"]})
+        assert response.status_code == 202
+        job = wait_for_job(client, response.json()["id"])
+        assert job["status"] == "FAILED"
         stored = client.get(f"/api/projects/{project['id']}/document").json()
-        assert stored["revision"] == imported["revision"]
+        assert stored["revision"] == prepared["revision"]
 
 
 def test_ai_pronunciation_validation_failure_does_not_write_local_fallback(tmp_path, monkeypatch):
@@ -73,6 +159,7 @@ def test_ai_pronunciation_validation_failure_does_not_write_local_fallback(tmp_p
         profile = client.post("/api/settings/ai-profiles", json={"name": "Reading fallback", "base_url": "http://localhost:1234/v1", "model": "demo", "api_key": "secret", "max_chars_per_request": 100, "retry_count": 0}).json()
         project = client.post("/api/projects", json={"name": "Reading fallback"}).json()
         imported = client.post(f"/api/projects/{project['id']}/lyrics/import", json={"revision": 1, "format": "text", "content": "雨\n青空"}).json()
+        prepared = prepare_whisper_result(client, tmp_path, project["id"], imported)
 
         def fake_complete(self, system_prompt, user_prompt):
             return {"result": [
@@ -80,11 +167,13 @@ def test_ai_pronunciation_validation_failure_does_not_write_local_fallback(tmp_p
                 {"line_index": 1, "raw": "青空", "pronunciation": [[1, "青", "あお"]]},
             ]}
 
-        monkeypatch.setattr("app.api.pronunciation.AIClient.complete", fake_complete)
-        response = client.post(f"/api/projects/{project['id']}/pronunciation/ai", json={"revision": imported["revision"], "mode": "ai", "profile_id": profile["id"]})
-        assert response.status_code == 502
+        monkeypatch.setattr("app.services.pronunciation.AIClient.complete", fake_complete)
+        response = client.post(f"/api/projects/{project['id']}/pronunciation-job", json={"revision": prepared["revision"], "mode": "ai", "profile_id": profile["id"]})
+        assert response.status_code == 202
+        job = wait_for_job(client, response.json()["id"])
+        assert job["status"] == "FAILED"
         stored = client.get(f"/api/projects/{project['id']}/document").json()
-        assert stored["revision"] == imported["revision"]
+        assert stored["revision"] == prepared["revision"]
         assert all(unit["ruby"] is None for line in stored["document"]["lyrics"]["lines"] for unit in line["units"])
 
 
@@ -173,15 +262,18 @@ def test_remote_protocol_disconnect_returns_error_without_local_fallback(tmp_pat
         profile = client.post("/api/settings/ai-profiles", json={"name": "Broken", "base_url": "http://127.0.0.1:9/v1", "model": "demo", "api_key": "secret"}).json()
         project = client.post("/api/projects", json={"name": "Fallback"}).json()
         imported = client.post(f"/api/projects/{project['id']}/lyrics/import", json={"revision": 1, "format": "text", "content": "雨"}).json()
+        prepared = prepare_whisper_result(client, tmp_path, project["id"], imported)
 
         def disconnect(self, system_prompt, user_prompt):
             raise httpx.RemoteProtocolError("Server disconnected without sending a response")
 
-        monkeypatch.setattr("app.api.pronunciation.AIClient.complete", disconnect)
-        response = client.post(f"/api/projects/{project['id']}/pronunciation/ai", json={"revision": imported["revision"], "mode": "ai", "profile_id": profile["id"]})
-        assert response.status_code == 502
+        monkeypatch.setattr("app.services.pronunciation.AIClient.complete", disconnect)
+        response = client.post(f"/api/projects/{project['id']}/pronunciation-job", json={"revision": prepared["revision"], "mode": "ai", "profile_id": profile["id"]})
+        assert response.status_code == 202
+        job = wait_for_job(client, response.json()["id"])
+        assert job["status"] == "FAILED"
         stored = client.get(f"/api/projects/{project['id']}/document").json()
-        assert stored["revision"] == imported["revision"]
+        assert stored["revision"] == prepared["revision"]
         assert stored["document"]["lyrics"]["lines"][0]["units"][0]["ruby"] is None
 
 
@@ -214,7 +306,15 @@ def test_full_analysis_stops_when_ai_pronunciation_fails(tmp_path, monkeypatch):
         monkeypatch.setattr("app.services.pronunciation.AIClient.complete", disconnect)
         pipeline = client.app.state.analysis_runner.pipeline
         pipeline._separate = lambda job_id, project_id, current, revision, payload, values: (current, revision, {})
-        pipeline._transcribe = lambda job_id, project_id, current, revision, payload, values: (current, revision, {})
+        derived = tmp_path / "projects" / project["id"] / "derived"
+        derived.mkdir(parents=True, exist_ok=True)
+
+        def complete_transcription(job_id, project_id, current, revision, payload, values):
+            (derived / "transcript.json").write_text('{"segments": []}', encoding="utf-8")
+            current.setdefault("analysis", {})["transcription"] = {"status": "completed"}
+            return current, revision, {}
+
+        pipeline._transcribe = complete_transcription
         alignment_started = []
         pipeline._fa_kara = lambda *args: alignment_started.append(True)
 

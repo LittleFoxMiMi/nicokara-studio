@@ -16,7 +16,7 @@ from app.services.alignment import AlignmentQualityError
 from app.services.audio import AudioProcessingError, convert_audio, extract_audio_clip, prepare_source_audio
 from app.services.cancellation import OperationCanceled
 from app.services.pronunciation import PronunciationSelection, PronunciationValidationError, apply_local, run_ai_pronunciation
-from app.services.fa_kara_text import normalize_language
+from app.services.fa_kara_text import missing_japanese_ruby, normalize_language
 from app.services.separation import VocalSeparator
 from app.services.stable_ts import StableTSAligner, StableTSAlignmentError, rough_line_ranges
 from app.services.fa_kara import FAKaraAligner
@@ -33,6 +33,10 @@ def timestamp() -> str:
 
 
 class JobCanceled(RuntimeError):
+    pass
+
+
+class MissingRubyError(AlignmentQualityError):
     pass
 
 
@@ -73,6 +77,18 @@ class AnalysisPipeline:
     def _should_cancel(self, job_id: str) -> bool:
         job = self.database.get_job(job_id)
         return not job or bool(job["cancel_requested"])
+
+    @staticmethod
+    def _require_alignment_ruby(document: dict) -> None:
+        if normalize_language(document.get("project", {}).get("language")) != "jp":
+            return
+        missing = missing_japanese_ruby(document.get("lyrics", {}).get("lines", []))
+        if not missing:
+            return
+        labels = [f"第 {item['line_index'] + 1} 行：{item['characters']}" for item in missing]
+        raise MissingRubyError(
+            "AI 注音完成后仍有日文汉字未注音：" + "；".join(labels) + "。请选择本地注音后继续，或取消全曲分析。"
+        )
 
     def _paths(self, project_id: str) -> tuple[Path, Path, Path]:
         directory = self.settings.projects_dir / project_id
@@ -210,6 +226,10 @@ class AnalysisPipeline:
             updated, summary = apply_local(document, selection)
             self._step(job_id, "pronunciation", 1.0, "本地注音完成")
         else:
+            _, _, transcript_path = self._paths(project_id)
+            transcription = document.get("analysis", {}).get("transcription", {})
+            if not transcript_path.is_file() or transcription.get("status") != "completed":
+                raise PronunciationValidationError("AI 注音需要先完成 Whisper 粗识别")
             updated, summary = run_ai_pronunciation(database=self.database, settings=self.settings, project_id=project_id, document=document, selection=selection, profile_id=payload.get("profile_id"), progress_callback=lambda value, message: self._step(job_id, "pronunciation", value, message))
         updated.setdefault("analysis", {})["pronunciation"] = {"status": "completed", "job_id": job_id, **summary}
         updated, revision = self._save(project_id, updated, revision)
@@ -418,7 +438,19 @@ class AnalysisPipeline:
         if job["type"] == "TRANSCRIPTION":
             return self._transcribe(job_id, project_id, document, revision, payload, values)[2]
         if job["type"] == "PRONUNCIATION":
-            return self._pronounce(job_id, project_id, document, revision, payload)[2]
+            result: dict = {}
+            for step in payload.get("steps", ["pronunciation"]):
+                if step == "separation":
+                    document, revision, step_result = self._separate(job_id, project_id, document, revision, payload, values)
+                elif step == "transcription":
+                    document, revision, step_result = self._transcribe(job_id, project_id, document, revision, payload, values)
+                elif step == "pronunciation":
+                    document, revision, step_result = self._pronounce(job_id, project_id, document, revision, payload)
+                else:
+                    raise ValueError("unknown_pronunciation_step")
+                result[step] = step_result
+            result["output_revision"] = revision
+            return result
         if job["type"] == "STABLE_GLOBAL_ALIGNMENT":
             return self._global_align(job_id, project_id, document, revision, payload, values)[2]
         if job["type"] == "STABLE_ALIGNMENT":
@@ -432,6 +464,8 @@ class AnalysisPipeline:
         result: dict = {}
         default_steps = ["separation", "transcription", "pronunciation", "fa_kara"]
         for step in payload.get("steps", default_steps):
+            if step in {"global_alignment", "alignment", "fa_kara"}:
+                self._require_alignment_ruby(document)
             if step == "separation":
                 document, revision, step_result = self._separate(job_id, project_id, document, revision, payload, values)
             elif step == "transcription":
@@ -470,6 +504,8 @@ class AnalysisRunner:
             self.database.update_job(job_id, status="CANCELED", message="任务已取消", completed_at=timestamp())
         except ExportCanceled:
             self.database.update_job(job_id, status="CANCELED", message="导出已取消", completed_at=timestamp())
+        except MissingRubyError as exc:
+            self.database.update_job(job_id, status="FAILED", error_code="missing_ruby", error_message=str(exc), message="等待选择注音方式", completed_at=timestamp())
         except (AudioProcessingError, AlignmentQualityError, PronunciationValidationError, ExportError) as exc:
             self.database.update_job(job_id, status="FAILED", error_code="analysis_failed", error_message=str(exc), message="处理失败", completed_at=timestamp())
         except RuntimeError as exc:

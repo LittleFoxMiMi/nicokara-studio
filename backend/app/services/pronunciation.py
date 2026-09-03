@@ -22,7 +22,7 @@ DEFAULT_SYSTEM_PROMPT = r'''你是日语卡拉 OK 歌词注音器。你的任务
       "raw": "雨が降った",
       "pronunciation": [
         [0, "雨", "あめ"],
-        [2, "降", "ふ"]
+        [2,  "降", "ふ"]
       ]
     }
   ]
@@ -30,12 +30,24 @@ DEFAULT_SYSTEM_PROMPT = r'''你是日语卡拉 OK 歌词注音器。你的任务
 
 协议规则：
 1. line_index 必须是输入歌词行的 0-based 行号，按输入顺序返回，不得新增、删除、重复或调换行。
-2. raw 必须是原始歌词行的完整字符串，不是分词数组；必须逐字符等于输入歌词，不得修改空白、标点、假名、拉丁字母或歌词正文。
-3. pronunciation 的每项必须严格是 [start, surface, reading]。start 是原始歌词行的 Unicode 字符位置，结束位置由 surface 长度推导。
-4. surface 必须严格匹配从 start 开始的原始歌词文字，不能越界、不能重叠，按 start 升序排列。
-5. reading 只填写实际日语读音，使用平假名为主；多汉字词、当て字和特殊读音作为整体返回，例如 昨日 -> きのう、九十九折 -> つづらおり。
-6. 只为汉字或包含汉字的特殊表记返回 pronunciation；假名、助词和标点不要重复返回。没有注音时 pronunciation 返回 []。
-7. 不要生成工程内部 id、时间、置信度或其他字段。'''
+2. raw 是歌词原文，不得改变歌词原文。
+3. pronunciation 的每项必须严格是 [start, surface, reading]。start是raw里面原始歌词的下标，代表注音汉字的起始位置。
+4. reading 只填写实际日语读音，使用平假名；多汉字词作为整体返回，例如 昨日 -> きのう、九十九折 -> つづらおり。
+5. 只为汉字或包含汉字的特殊表记返回 pronunciation；假名、助词和标点不要重复返回，surface里面不允许出现汉字以外的内容，例如“降った”只返回“降”和它的注音。没有注音时 pronunciation 返回 []。
+6. 不要生成工程内部 id、时间、置信度或其他字段。
+7. 连续汉字组成一个完整词、复合词或专有名词时，按整体收录，例如：
+   ["着信音", "ちゃくしんおん"]
+   ["熊本市", "くまもとし"]
+   ["競馬場", "けいばじょう"]
+8. 汉字与假名混写时，surface只保留原文中的连续汉字部分，pronunciation只填写该汉字部分在当前词中的读音，不包含送假名。例如：
+   押した → ["押", "お"]
+   聞こえる → ["聞", "き"]
+   集めている → ["集", "あつ"]
+   走っている → ["走", "はし"]
+9. 一个词中若有多段被假名隔开的汉字，应分别覆盖各段，并按原文顺序输出。例如：
+   取り戻す → ["取", "と"], ["戻", "もど"]
+10. surface必须与原文实际出现的汉字形式完全一致，不得改写汉字，不得加入送假名。
+11. 不收录纯平假名、纯片假名、数字或英文；但其中只要包含汉字，就必须覆盖汉字部分。'''
 DEFAULT_USER_TEMPLATE = r'''请严格按照系统协议，为下面的完整歌词生成注音 JSON。歌词正文是唯一真值，Whisper 文本仅用于判断读音，不得据此修改歌词。
 
 歌曲名：{{song_title}}
@@ -44,10 +56,10 @@ DEFAULT_USER_TEMPLATE = r'''请严格按照系统协议，为下面的完整歌�
 输入歌词行（必须逐行保留 line_index 和 text）：
 {{current_lines}}
 
-Whisper 顺序参考（只有 segment_index 和 text，没有歌词行号，也没有可写回的时间）：
+Whisper 顺序参考（这是语音转文本模型的输出，根据这里的输出来确定多音字的读音，你可能需要进行一定程度的猜测，这里的文本仅供参考，不得用这里的文本代替原有歌词的文本）：
 {{whisper_segments}}
 
-再次检查：raw 必须等于每行原文字符串；pronunciation 必须使用 [start,surface,reading]；surface 必须匹配原文；只注音日语汉字；最后只输出 JSON。'''
+再次检查：raw 必须等于每行原文；pronunciation 必须使用 [start,surface,reading]；surface 必须匹配原文；只注音汉字；最后只输出 JSON。返回之前仔细检查json的格式是否有未封闭的括号。'''
 READING_RE = re.compile(r"^[ぁ-ゖァ-ヺー・ゔヴーA-Za-z0-9'\- ]+$")
 
 
@@ -56,6 +68,23 @@ class PronunciationValidationError(ValueError):
 
 
 AI_REQUEST_ERRORS = (PronunciationValidationError, ValueError, OSError, TimeoutError, httpx.HTTPError, json.JSONDecodeError)
+
+
+def resolve_prompt_settings(database: Any, app_settings: dict[str, Any] | None = None) -> tuple[str, str, str | None]:
+    """Resolve the active preset, including databases created before preset IDs were stored."""
+    values = app_settings if app_settings is not None else database.settings()
+    preset_id = values.get("default_prompt_preset_id")
+    preset = database.get_prompt_preset(str(preset_id)) if preset_id else None
+    if not preset:
+        presets = database.list_prompt_presets()
+        preset = presets[0] if presets else None
+    if preset:
+        return str(preset["system_prompt"]), str(preset["user_template"]), str(preset["id"])
+    return (
+        str(values.get("pronunciation_system_prompt") or DEFAULT_SYSTEM_PROMPT),
+        str(values.get("pronunciation_user_template") or DEFAULT_USER_TEMPLATE),
+        None,
+    )
 
 
 @dataclass
@@ -388,15 +417,21 @@ def run_ai_pronunciation(
         raise PronunciationValidationError("AI profile 未配置密钥")
     lines = document.get("lyrics", {}).get("lines", [])
     current_lines = [{"line_index": index, "text": "".join(unit.get("surface", "") for unit in line.get("units", []))} for index, line in enumerate(lines)]
-    whisper_segments: list[dict] = []
     transcript_path = settings.projects_dir / project_id / "derived" / "transcript.json"
-    if transcript_path.is_file():
-        try:
-            whisper_segments = [{"segment_index": index, "text": item.get("text", "")} for index, item in enumerate(json.loads(transcript_path.read_text(encoding="utf-8")).get("segments", []))]
-        except (OSError, ValueError):
-            whisper_segments = []
-    system_prompt = str(app_settings.get("pronunciation_system_prompt") or DEFAULT_SYSTEM_PROMPT)
-    user_template = str(app_settings.get("pronunciation_user_template") or DEFAULT_USER_TEMPLATE)
+    if not transcript_path.is_file():
+        raise PronunciationValidationError("AI 注音需要先完成 Whisper 粗识别")
+    try:
+        transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
+        segments = transcript.get("segments") if isinstance(transcript, dict) else None
+        if not isinstance(segments, list) or any(not isinstance(item, dict) for item in segments):
+            raise ValueError("invalid_segments")
+        whisper_segments = [
+            {"segment_index": index, "text": str(item.get("text", ""))}
+            for index, item in enumerate(segments)
+        ]
+    except (OSError, ValueError) as exc:
+        raise PronunciationValidationError("Whisper 粗识别结果无效，请重新运行粗识别") from exc
+    system_prompt, user_template, _ = resolve_prompt_settings(database, app_settings)
     line_batches = chunk_lines(current_lines, profile.get("max_chars_per_request", 1200))
     proxy = str(app_settings.get("proxy_url") or "") if app_settings.get("proxy_enabled", True) else None
     try:
