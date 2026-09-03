@@ -31,6 +31,8 @@ import type {
 } from "./editor-types";
 import { api, formatTime, parseTime } from "./editor-types";
 import { LyricsImportDialog } from "./lyrics-import-dialog";
+import { RubyRangeEditor } from "./ruby-range-editor";
+import { lineCharacterCount, rubyRanges, unitCharacterRange, updateRubyRange } from "./ruby-range";
 import { TimelineCanvas } from "./timeline-canvas";
 import { SubtitleDomRenderer } from "./subtitle/dom-renderer";
 import { normalizeSubtitleStyle, type SubtitleStyle } from "./subtitle/style-schema";
@@ -141,6 +143,7 @@ function updateRubyGroup(
   lineId: string,
   selectedIds: string[],
   ruby: string,
+  ruby2: string,
   rubySpan: number,
   clearIds: string[],
 ): ProjectDocument {
@@ -156,9 +159,9 @@ function updateRubyGroup(
         return {
           ...line,
           units: line.units.map((unit) => {
-            if (unit.id === firstId) return { ...unit, ruby, ruby_span: rubySpan, ruby_source: "manual" };
-            if (selected.has(unit.id)) return { ...unit, ruby: null, ruby_span: undefined, ruby_source: "manual" };
-            if (cleared.has(unit.id)) return { ...unit, ruby: null, ruby_span: undefined, ruby_source: "none" };
+            if (unit.id === firstId) return { ...unit, ruby, ruby_2: ruby2 || null, ruby_span: rubySpan, ruby_source: "manual" };
+            if (selected.has(unit.id)) return { ...unit, ruby: null, ruby_2: null, ruby_span: undefined, ruby_source: "manual" };
+            if (cleared.has(unit.id)) return { ...unit, ruby: null, ruby_2: null, ruby_span: undefined, ruby_source: "none" };
             return unit;
           }),
         };
@@ -198,6 +201,9 @@ function updateProjectLanguage(document: ProjectDocument, language: ProjectLangu
 type MissingRubyReport = { unitIds: string[]; lines: { lineIndex: number; characters: string }[] };
 type FullAnalysisResume = { request: Record<string, unknown>; steps: string[] };
 type MissingRubyDialogState = MissingRubyReport & { resume?: FullAnalysisResume };
+type RubyEditorTarget =
+  | { kind: "line"; lineId: string }
+  | { kind: "unit"; lineId: string; unitId: string; start: number; end: number };
 
 function missingJapaneseRuby(document: ProjectDocument): MissingRubyReport {
   const unitIds: string[] = [];
@@ -464,6 +470,11 @@ function UnitEditDialog({
   const [surface, setSurface] = useState(unit.surface);
   const [ruby, setRuby] = useState(unit.ruby || "");
   const [ruby2, setRuby2] = useState(unit.ruby_2 || "");
+  const [start, setStart] = useState(formatTime(unit.start_ms));
+  const [end, setEnd] = useState(formatTime(unit.end_ms));
+  const startMs = parseTime(start);
+  const endMs = parseTime(end);
+  const timingValid = startMs !== null && endMs !== null && endMs > startMs;
   return (
     <div className="scrim">
       <section className="dialog unit-dialog" role="dialog" aria-modal="true">
@@ -495,13 +506,31 @@ function UnitEditDialog({
             onChange={(event) => setRuby2(event.target.value)}
           />
         </label>}
+        <div className="time-fields">
+          <label className="field-label">
+            开始
+            <input
+              inputMode="decimal"
+              value={start}
+              onChange={(event) => setStart(event.target.value)}
+            />
+          </label>
+          <label className="field-label">
+            结束
+            <input
+              inputMode="decimal"
+              value={end}
+              onChange={(event) => setEnd(event.target.value)}
+            />
+          </label>
+        </div>
         <div className="dialog-actions">
           <button className="button text" onClick={onClose}>
             取消
           </button>
           <button
             className="button filled"
-            disabled={!surface}
+            disabled={!surface || !timingValid}
             onClick={() =>
               onSave({
                 surface,
@@ -509,6 +538,10 @@ function UnitEditDialog({
                 ruby_2: rubyEnabled && ruby2 ? ruby2 : null,
                 ruby_source: rubyEnabled && (ruby || ruby2) ? "manual" : "none",
                 alignment_reading: undefined,
+                start_ms: startMs,
+                end_ms: endMs,
+                timing_source: "manual",
+                timing_confidence: 1,
               })
             }
           >
@@ -518,98 +551,6 @@ function UnitEditDialog({
         </div>
       </section>
     </div>
-  );
-}
-
-function UnitInspector({
-  unit,
-  rubyEnabled,
-  onCommit,
-}: {
-  unit: LyricUnit;
-  rubyEnabled: boolean;
-  onCommit: (patch: Partial<LyricUnit>) => void;
-}) {
-  const [start, setStart] = useState(formatTime(unit.start_ms));
-  const [end, setEnd] = useState(formatTime(unit.end_ms));
-  const [surface, setSurface] = useState(unit.surface);
-  const [ruby, setRuby] = useState(unit.ruby || "");
-  useEffect(() => {
-    setStart(formatTime(unit.start_ms));
-    setEnd(formatTime(unit.end_ms));
-    setSurface(unit.surface);
-    setRuby(unit.ruby || "");
-  }, [unit]);
-  function apply() {
-    const startMs = parseTime(start),
-      endMs = parseTime(end);
-    if (startMs === null || endMs === null || endMs <= startMs || !surface)
-      return;
-    onCommit({
-      start_ms: startMs,
-      end_ms: endMs,
-      surface,
-      ruby: rubyEnabled && ruby ? ruby : null,
-      ruby_source: rubyEnabled && ruby ? "manual" : "none",
-      alignment_reading: undefined,
-      timing_source: "manual",
-      timing_confidence: 1,
-    });
-  }
-  return (
-    <section className="unit-inspector">
-      <div className="section-title">
-        <h3>所选单元</h3>
-        <span>
-          {unit.start_ms === null || unit.end_ms === null
-            ? "未设置时间"
-            : unit.timing_source === "estimated"
-              ? "估算时间"
-              : "精确时间"}
-          {rubyEnabled ? (unit.ruby ? ` · Ruby ${unit.ruby_source || "manual"}` : " · 未注音") : ""}
-        </span>
-      </div>
-      <label className="field-label">
-        正文
-        <input
-          value={surface}
-          onChange={(event) => setSurface(event.target.value)}
-          onKeyDown={(event) => event.key === "Enter" && apply()}
-        />
-      </label>
-      {rubyEnabled && <label className="field-label">
-        Ruby
-        <input
-          value={ruby}
-          onChange={(event) => setRuby(event.target.value)}
-          onKeyDown={(event) => event.key === "Enter" && apply()}
-        />
-      </label>}
-      <div className="time-fields">
-        <label className="field-label">
-          开始
-          <input
-            inputMode="decimal"
-            value={start}
-            onChange={(event) => setStart(event.target.value)}
-            onKeyDown={(event) => event.key === "Enter" && apply()}
-          />
-        </label>
-        <label className="field-label">
-          结束
-          <input
-            inputMode="decimal"
-            value={end}
-            onChange={(event) => setEnd(event.target.value)}
-            onKeyDown={(event) => event.key === "Enter" && apply()}
-          />
-        </label>
-      </div>
-      <button className="button tonal full" onClick={apply}>
-        <Check size={16} />
-        应用精确值
-      </button>
-    </section>
   );
 }
 
@@ -664,6 +605,7 @@ export function EditorPage({ id }: { id: string }) {
     [error, setError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null),
     [editingId, setEditingId] = useState<string | null>(null);
+  const [rubyEditorTarget, setRubyEditorTarget] = useState<RubyEditorTarget | null>(null);
   const [importOpen, setImportOpen] = useState(false),
     [isPlaying, setIsPlaying] = useState(false);
   const [currentMs, setCurrentMs] = useState(0);
@@ -947,6 +889,28 @@ export function EditorPage({ id }: { id: string }) {
     if (current)
       replaceDocument(updateUnit(current, lineId, unitId, patch), record);
   }
+  function selectUnit(unitId: string | null, lineLevel = false) {
+    setSelectedId(unitId);
+    if (!unitId) {
+      setRubyEditorTarget(null);
+      return;
+    }
+    const line = documentRef.current?.lyrics.lines.find((candidate) => candidate.units.some((unit) => unit.id === unitId));
+    if (!line) {
+      setRubyEditorTarget(null);
+      return;
+    }
+    if (lineLevel) {
+      setRubyEditorTarget({ kind: "line", lineId: line.id });
+      return;
+    }
+    const range = unitCharacterRange(line, unitId);
+    setRubyEditorTarget(range ? { kind: "unit", lineId: line.id, unitId, ...range } : null);
+  }
+  function selectLine(line: LyricLine) {
+    setSelectedId(line.units[0]?.id || null);
+    setRubyEditorTarget({ kind: "line", lineId: line.id });
+  }
   function updateSubtitleStyle(patch: Partial<SubtitleStyle>) {
     const current = documentRef.current;
     if (!current) return;
@@ -1006,7 +970,7 @@ export function EditorPage({ id }: { id: string }) {
     const line = current.lyrics.lines.find((candidate) => candidate.id === lineId);
     if (!line?.units.length) return;
     replaceDocument(placeLineAt(current, lineId, startMs, durationMs), true);
-    setSelectedId(line.units[0].id);
+    selectLine(line);
     seek(startMs);
   }
   async function importLyrics(
@@ -1030,7 +994,9 @@ export function EditorPage({ id }: { id: string }) {
     documentRef.current = result.document;
     setDocument(result.document);
     markDirty(false);
-    setSelectedId(result.document.lyrics.lines[0]?.units[0]?.id || null);
+    const firstLine = result.document.lyrics.lines[0];
+    setSelectedId(firstLine?.units[0]?.id || null);
+    setRubyEditorTarget(firstLine ? { kind: "line", lineId: firstLine.id } : null);
     if (projectRef.current) {
       const next = { ...projectRef.current, revision: result.revision };
       projectRef.current = next;
@@ -1230,7 +1196,8 @@ export function EditorPage({ id }: { id: string }) {
     if (!current) return;
     beginEdit();
     replaceDocument(collapseLineTiming(current, lineId), false);
-    setSelectedId(current.lyrics.lines.find((line) => line.id === lineId)?.units[0]?.id || null);
+    const line = current.lyrics.lines.find((candidate) => candidate.id === lineId);
+    if (line) selectLine(line);
   }
 
   async function startFaKara(lineIds?: string[]) {
@@ -1398,15 +1365,52 @@ export function EditorPage({ id }: { id: string }) {
   const effectiveAlignmentBackend = language === "cn" ? "fa_kara" : alignmentBackend;
   const activeJob = jobs.find((job) => ["QUEUED", "PREPARING", "RUNNING"].includes(job.status));
   const visibleJob = activeJob || jobs[0] || null;
-  const selected =
-    lines
-      .flatMap((line) => line.units.map((unit) => ({ line, unit })))
-      .find(({ unit }) => unit.id === selectedId) || null;
   const editing = editingId
     ? lines
         .flatMap((line) => line.units)
         .find((unit) => unit.id === editingId) || null
     : null;
+  const rubyTargetLine = rubyEditorTarget
+    ? lines.find((line) => line.id === rubyEditorTarget.lineId) || null
+    : null;
+  const rubyTargetRange = rubyTargetLine && rubyEditorTarget
+    ? rubyEditorTarget.kind === "line"
+      ? { start: 0, end: lineCharacterCount(rubyTargetLine), title: "整行 Ruby" }
+      : (() => {
+          const total = lineCharacterCount(rubyTargetLine);
+          const baseStart = Math.max(0, Math.min(total, rubyEditorTarget.start));
+          const baseEnd = Math.max(baseStart, Math.min(total, rubyEditorTarget.end));
+          const overlappingGroups = rubyRanges(rubyTargetLine).filter((group) => group.start < baseEnd && group.end > baseStart);
+          return {
+            start: overlappingGroups.reduce((value, group) => Math.min(value, group.start), baseStart),
+            end: overlappingGroups.reduce((value, group) => Math.max(value, group.end), baseEnd),
+            title: "所选 Unit 的 Ruby",
+          };
+        })()
+    : null;
+  const rubyTargetStatus = rubyTargetLine && rubyEditorTarget
+    ? (() => {
+        const targetUnit = rubyEditorTarget.kind === "unit"
+          ? rubyTargetLine.units.find((unit) => unit.id === rubyEditorTarget.unitId) || null
+          : null;
+        const timing = rubyEditorTarget.kind === "line"
+          ? rubyTargetLine.start_ms === null || rubyTargetLine.end_ms === null
+            ? "未设置时间"
+            : rubyTargetLine.timing_precision === "line" ? "行级时间" : "精确时间"
+          : targetUnit?.start_ms === null || targetUnit?.end_ms === null
+            ? "未设置时间"
+            : targetUnit?.timing_source === "estimated" ? "估算时间" : "精确时间";
+        const rangeGroups = rubyRanges(rubyTargetLine).filter((group) => rubyTargetRange && group.start < rubyTargetRange.end && group.end > rubyTargetRange.start);
+        const sources = new Set<string>();
+        let offset = 0;
+        rubyTargetLine.units.forEach((unit) => {
+          if (rangeGroups.some((group) => group.start === offset)) sources.add(unit.ruby_source || "manual");
+          offset += Array.from(unit.surface).length;
+        });
+        const ruby = sources.size === 0 ? "未注音" : sources.size === 1 ? `Ruby ${[...sources][0]}` : "Ruby 混合来源";
+        return `${timing} · ${ruby}`;
+      })()
+    : "";
   const sourceLabel =
     document.lyrics.source_type === "krl"
       ? "逐字 KRL"
@@ -1716,9 +1720,9 @@ export function EditorPage({ id }: { id: string }) {
                         line.id,
                       );
                       event.dataTransfer.setData("text/plain", line.id);
-                      setSelectedId(line.units[0]?.id || null);
+                      selectLine(line);
                     }}
-                    onClick={() => setSelectedId(line.units[0]?.id || null)}
+                    onClick={() => selectLine(line)}
                   >
                     <span className="line-index">
                       {String(line.order + 1).padStart(2, "0")}
@@ -1742,18 +1746,18 @@ export function EditorPage({ id }: { id: string }) {
                 </div>
               )}
             </div>
-            {selected && (
-              <UnitInspector
-                unit={selected.unit}
-                rubyEnabled={language === "jp"}
-                onCommit={(patch) =>
-                  updateSelected(
-                    selected.line.id,
-                    selected.unit.id,
-                    patch,
-                    true,
-                  )
-                }
+            {language === "jp" && rubyTargetLine && rubyTargetRange && rubyTargetRange.end > rubyTargetRange.start && (
+              <RubyRangeEditor
+                line={rubyTargetLine}
+                rangeStart={rubyTargetRange.start}
+                rangeEnd={rubyTargetRange.end}
+                title={rubyTargetRange.title}
+                status={rubyTargetStatus}
+                onApply={(start, end, ruby, ruby2, replacedRange) => {
+                  const current = documentRef.current;
+                  if (!current) return;
+                  replaceDocument(updateRubyRange(current, rubyTargetLine.id, start, end, ruby, ruby2, replacedRange, createClientId), true);
+                }}
               />
             )}
             <SubtitleStylePanel style={subtitleStyle} presets={stylePresets} onChange={updateSubtitleStyle} onApplyPreset={(preset) => updateSubtitleStyle(preset.style)} onSavePreset={(name) => void saveStylePreset(name)} onDeletePreset={(preset) => void deleteStylePreset(preset)} />
@@ -1768,7 +1772,7 @@ export function EditorPage({ id }: { id: string }) {
           hasVideo={hasVideo}
           isPlaying={isPlaying}
           selectedId={selectedId}
-          onSelect={setSelectedId}
+          onSelect={selectUnit}
           onSeek={seek}
           onSeekBy={seekBy}
           onTogglePlayback={togglePlayback}
@@ -1780,9 +1784,9 @@ export function EditorPage({ id }: { id: string }) {
             const current = documentRef.current;
             if (current) replaceDocument(updateLineTiming(current, lineId, startMs, endMs), false);
           }}
-          onUpdateRubyGroup={(lineId, unitIds, ruby, rubySpan, clearUnitIds) => {
+          onUpdateRubyGroup={(lineId, unitIds, ruby, ruby2, rubySpan, clearUnitIds) => {
             const current = documentRef.current;
-            if (current) replaceDocument(updateRubyGroup(current, lineId, unitIds, ruby, rubySpan, clearUnitIds), true);
+            if (current) replaceDocument(updateRubyGroup(current, lineId, unitIds, ruby, ruby2, rubySpan, clearUnitIds), true);
           }}
           rubyEnabled={language === "jp"}
           onOpenEditor={setEditingId}
@@ -1826,7 +1830,7 @@ export function EditorPage({ id }: { id: string }) {
             throw new Error("工程内容已发生变化，请关闭后重新打开拆分页面。");
           }
           replaceDocument(splitLyricUnit(current, splitTarget.lineId, splitTarget.unitId, ranges), true);
-          setSelectedId(splitTarget.unitId);
+          selectUnit(splitTarget.unitId);
           setSplitTarget(null);
         }} />;
       })()}

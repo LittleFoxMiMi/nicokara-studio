@@ -13,13 +13,24 @@ function groupUnits(units: LyricUnit[]): LyricUnit[] {
   const groups: LyricUnit[] = [];
   for (let index = 0; index < units.length;) {
     const first = units[index];
-    let span = Math.max(1, Number(first.ruby_span || 1));
+    const surfaceLength = Array.from(first.surface).length;
+    let span = Math.max(surfaceLength, Number(first.ruby_span || 1));
     // Compatibility for projects created before ruby_span was persisted:
     // collapse adjacent units carrying the same full-word reading.
     if (!first.ruby_span && first.ruby) {
-      while (index + span < units.length && units[index + span].ruby === first.ruby) span += 1;
+      let nextIndex = index + 1;
+      while (nextIndex < units.length && units[nextIndex].ruby === first.ruby) {
+        span += Array.from(units[nextIndex].surface).length;
+        nextIndex += 1;
+      }
     }
-    const members = units.slice(index, index + span);
+    let covered = surfaceLength;
+    let memberEnd = index + 1;
+    while (covered < span && memberEnd < units.length) {
+      covered += Array.from(units[memberEnd].surface).length;
+      memberEnd += 1;
+    }
+    const members = units.slice(index, memberEnd);
     groups.push({ ...first, surface: members.map((unit) => unit.surface).join(""), end_ms: members[members.length - 1]?.end_ms ?? first.end_ms, ruby_span: span, __groupUnits: members } as LyricUnit & { __groupUnits: LyricUnit[] });
     index += members.length;
   }

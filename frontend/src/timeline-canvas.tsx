@@ -26,6 +26,7 @@ type Hit = {
 type RubyGroup = {
   lineId: string;
   ruby: string;
+  ruby2: string;
   startIndex: number;
   endIndex: number;
   start: number;
@@ -109,7 +110,7 @@ export function TimelineCanvas({
   hasVideo: boolean;
   isPlaying: boolean;
   selectedId: string | null;
-  onSelect: (id: string | null) => void;
+  onSelect: (id: string | null, lineLevel?: boolean) => void;
   onSeek: (ms: number) => void;
   onSeekBy: (deltaMs: number) => void;
   onTogglePlayback: () => void;
@@ -120,7 +121,7 @@ export function TimelineCanvas({
     patch: Partial<LyricUnit>,
   ) => void;
   onUpdateLine: (lineId: string, startMs: number, endMs: number) => void;
-  onUpdateRubyGroup: (lineId: string, unitIds: string[], ruby: string, rubySpan: number, clearUnitIds: string[]) => void;
+  onUpdateRubyGroup: (lineId: string, unitIds: string[], ruby: string, ruby2: string, rubySpan: number, clearUnitIds: string[]) => void;
   rubyEnabled: boolean;
   onOpenEditor: (id: string) => void;
   onDropLine: (lineId: string, startMs: number) => void;
@@ -274,8 +275,13 @@ export function TimelineCanvas({
     const groups: RubyGroup[] = [];
     for (let index = 0; index < line.units.length;) {
       const first = line.units[index];
-      const span = Math.max(1, Number(first.ruby_span || 1));
-      let endIndex = Math.min(line.units.length, index + span);
+      const span = Math.max(Array.from(first.surface).length, Number(first.ruby_span || 1));
+      let covered = Array.from(first.surface).length;
+      let endIndex = index + 1;
+      while (covered < span && endIndex < line.units.length) {
+        covered += Array.from(line.units[endIndex].surface).length;
+        endIndex += 1;
+      }
       if (!first.ruby_span && first.ruby) {
         while (endIndex < line.units.length && line.units[endIndex].ruby === first.ruby) endIndex += 1;
       }
@@ -283,7 +289,7 @@ export function TimelineCanvas({
         const timed = line.units.slice(index, endIndex).filter((unit) => unit.start_ms !== null && unit.end_ms !== null);
         const start = Math.min(...timed.map((unit) => unit.start_ms as number));
         const end = Math.max(...timed.map((unit) => unit.end_ms as number));
-        groups.push({ lineId: line.id, ruby: first.ruby, startIndex: index, endIndex, start, end, x1: 0, x2: 0, y1: 0, y2: 0, units: line.units });
+        groups.push({ lineId: line.id, ruby: first.ruby, ruby2: first.ruby_2 || "", startIndex: index, endIndex, start, end, x1: 0, x2: 0, y1: 0, y2: 0, units: line.units });
       }
       index = Math.max(index + 1, endIndex);
     }
@@ -592,7 +598,7 @@ export function TimelineCanvas({
       onSeek(Math.max(0, Math.min(durationMs, (x / zoom) * 1000)));
       return;
     }
-    onSelect(hit.unit.id);
+    onSelect(hit.unit.id, hit.lineLevel);
     event.currentTarget.setPointerCapture(event.pointerId);
     const edge = 7;
     dragRef.current = {
@@ -687,7 +693,8 @@ export function TimelineCanvas({
         const selectedIds = line.units.slice(startIndex, endIndex).map((unit) => unit.id);
         const oldIds = line.units.slice(drag.rubyGroup.startIndex, drag.rubyGroup.endIndex).map((unit) => unit.id);
         const clearIds = oldIds.filter((id) => !selectedIds.includes(id));
-        onUpdateRubyGroup(line.id, selectedIds, drag.rubyGroup.ruby, endIndex - startIndex, clearIds);
+        const rubySpan = line.units.slice(startIndex, endIndex).reduce((total, unit) => total + Array.from(unit.surface).length, 0);
+        onUpdateRubyGroup(line.id, selectedIds, drag.rubyGroup.ruby, drag.rubyGroup.ruby2, rubySpan, clearIds);
       }
       return;
     }
@@ -709,7 +716,7 @@ export function TimelineCanvas({
     );
     const hit = hitAt(x, y);
     if (hit && !hit.lineLevel) {
-      onSelect(hit.unit.id);
+      onSelect(hit.unit.id, false);
       onOpenEditor(hit.unit.id);
     }
   }
@@ -719,7 +726,7 @@ export function TimelineCanvas({
     const hit = hitAt(x, y);
     if (!hit) return;
     event.preventDefault();
-    onSelect(hit.unit.id);
+    onSelect(hit.unit.id, hit.lineLevel);
     onOpenContextMenu(hit.lineId, hit.unit.id, hit.lineLevel, event.clientX, event.clientY);
   }
 
