@@ -7,10 +7,32 @@ if not exist "%ROOT%python\python.exe" (
   pause
   exit /b 1
 )
-if not exist "%ROOT%frontend\node_modules" (
-  echo [ERROR] Frontend dependencies are missing. Run npm install in frontend first.
+
+where node >nul 2>nul
+if errorlevel 1 (
+  echo [ERROR] Node.js is required to start the frontend.
+  echo Please install the LTS version of Node.js from https://nodejs.org/ and run this script again.
   pause
   exit /b 1
+)
+where npm >nul 2>nul
+if errorlevel 1 (
+  echo [ERROR] npm was not found. Please reinstall Node.js from https://nodejs.org/.
+  pause
+  exit /b 1
+)
+
+if not exist "%ROOT%frontend\node_modules" (
+  echo Frontend dependencies are missing. Installing them now...
+  pushd "%ROOT%frontend"
+  call npm install
+  if errorlevel 1 (
+    popd
+    echo [ERROR] Failed to install frontend dependencies.
+    pause
+    exit /b 1
+  )
+  popd
 )
 
 echo Starting Nicokara Studio backend and frontend...
