@@ -21,7 +21,11 @@ echo Nicokara Python %PYTHON_VERSION% installer
 echo Target: "%TARGET_DIR%"
 echo.
 
-choice /C YN /N /M "Use the USTC PyPI mirror"
+echo.
+echo Select the package download source:
+echo   Y = Use the USTC PyPI mirror (recommended for users in mainland China)
+echo   N = Use the official PyPI source
+choice /C YN /N /M "Enter Y or N"
 if errorlevel 2 (
   set "PIP_INDEX_URL=https://pypi.org/simple"
   echo Using the official PyPI index: https://pypi.org/simple
