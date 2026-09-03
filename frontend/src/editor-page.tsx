@@ -33,7 +33,7 @@ import { api, formatTime, parseTime } from "./editor-types";
 import { LyricsImportDialog } from "./lyrics-import-dialog";
 import { TimelineCanvas } from "./timeline-canvas";
 import { SubtitleDomRenderer } from "./subtitle/dom-renderer";
-import { DEFAULT_SUBTITLE_STYLE, normalizeSubtitleStyle, type SubtitleStyle } from "./subtitle/style-schema";
+import { normalizeSubtitleStyle, type SubtitleStyle } from "./subtitle/style-schema";
 import { SubtitleStylePanel, type StylePreset } from "./subtitle/style-panel";
 import "./editor.css";
 
@@ -679,6 +679,7 @@ export function EditorPage({ id }: { id: string }) {
   const [missingRubyDialog, setMissingRubyDialog] = useState<MissingRubyDialogState | null>(null);
   const [alignmentBackend, setAlignmentBackend] = useState<"fa_kara" | "stable_ts">("fa_kara");
   const [faKaraModel, setFaKaraModel] = useState<"mms" | "yohane">("mms");
+  const [stylePresets, setStylePresets] = useState<StylePreset[]>([]);
   const [fullSteps, setFullSteps] = useState<Record<string, boolean>>({ separation: true, transcription: true, pronunciation: true, global_alignment: true, alignment: true });
   const [lineMenu, setLineMenu] = useState<{ lineId: string; unitId: string | null; x: number; y: number } | null>(null);
   const [splitTarget, setSplitTarget] = useState<{ lineId: string; unitId: string } | null>(null);
@@ -689,11 +690,6 @@ export function EditorPage({ id }: { id: string }) {
   const pendingFullResume = useRef<{ pronunciationJobId: string; resume: FullAnalysisResume } | null>(null);
 
   const subtitleStyle = useMemo(() => normalizeSubtitleStyle((document?.styles || {}) as Record<string, unknown>), [document?.styles]);
-  const stylePresets = useMemo<StylePreset[]>(() => {
-    const stored = (document?.styles as { presets?: StylePreset[] } | undefined)?.presets || [];
-    return [{ id: "default", name: "Kirakara 默认", style: DEFAULT_SUBTITLE_STYLE }, ...stored];
-  }, [document?.styles]);
-
   useEffect(() => {
     void Promise.all([
       api<Project>(`/projects/${id}`),
@@ -701,14 +697,16 @@ export function EditorPage({ id }: { id: string }) {
         `/projects/${id}/document`,
       ),
       api<Record<string, unknown>>("/settings"),
+      api<StylePreset[]>("/settings/subtitle-style-presets"),
     ])
-      .then(([loadedProject, loaded, settings]) => {
+      .then(([loadedProject, loaded, settings, loadedStylePresets]) => {
         projectRef.current = loadedProject;
         documentRef.current = loaded.document;
         setProject(loadedProject);
         setDocument(loaded.document);
         setAlignmentBackend(settings.alignment_backend === "stable_ts" ? "stable_ts" : "fa_kara");
         setFaKaraModel(settings.fa_kara_model === "yohane" ? "yohane" : "mms");
+        setStylePresets(loadedStylePresets);
       })
       .catch(() => setError("无法打开工程，请确认后端服务已启动。"));
   }, [id]);
@@ -975,12 +973,22 @@ export function EditorPage({ id }: { id: string }) {
     }
     return true;
   }
-  function saveStylePreset(name: string) {
-    const current = documentRef.current;
-    if (!current) return;
-    const existing = ((current.styles as { presets?: StylePreset[] } | undefined)?.presets || []).filter((preset) => preset.name !== name);
-    const preset: StylePreset = { id: createClientId(), name, style: { ...subtitleStyle } };
-    replaceDocument({ ...current, styles: { ...(current.styles || {}), presets: [...existing, preset] } }, true);
+  async function saveStylePreset(name: string) {
+    try {
+      const saved = await api<StylePreset>("/settings/subtitle-style-presets", { method: "POST", body: JSON.stringify({ name, style: { ...subtitleStyle } }) });
+      setStylePresets((current) => [saved, ...current.filter((preset) => preset.id !== saved.id)]);
+    } catch {
+      setError("无法保存字幕样式预设，请确认后端已启动。");
+    }
+  }
+  async function deleteStylePreset(preset: StylePreset) {
+    if (!window.confirm(`删除字幕样式预设“${preset.name}”？`)) return;
+    try {
+      await api(`/settings/subtitle-style-presets/${preset.id}`, { method: "DELETE" });
+      setStylePresets((current) => current.filter((item) => item.id !== preset.id));
+    } catch {
+      setError("无法删除字幕样式预设，请稍后重试。");
+    }
   }
   function seek(ms: number) {
     const video = videoRef.current;
@@ -1748,7 +1756,7 @@ export function EditorPage({ id }: { id: string }) {
                 }
               />
             )}
-            <SubtitleStylePanel style={subtitleStyle} presets={stylePresets} onChange={updateSubtitleStyle} onApplyPreset={(preset) => updateSubtitleStyle(preset.style)} onSavePreset={saveStylePreset} />
+            <SubtitleStylePanel style={subtitleStyle} presets={stylePresets} onChange={updateSubtitleStyle} onApplyPreset={(preset) => updateSubtitleStyle(preset.style)} onSavePreset={(name) => void saveStylePreset(name)} onDeletePreset={(preset) => void deleteStylePreset(preset)} />
           </aside>
         </div>
         <TimelineCanvas

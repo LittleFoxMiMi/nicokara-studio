@@ -4,6 +4,7 @@ import { ArrowLeft, Cpu, KeyRound, MemoryStick, Save, Send } from "lucide-react"
 import { api } from "./editor-types";
 import { EditorPage } from "./editor-page";
 import { ProjectList } from "./project-list";
+import { normalizeSubtitleFontFamily, SUBTITLE_FONT_OPTIONS } from "./subtitle/style-schema";
 import "./styles.css";
 import "./upload.css";
 import "./material-overrides.css";
@@ -15,6 +16,8 @@ type Capabilities = {
 type AIProfile = { id: string; name: string; api_format: string; base_url: string; model: string; temperature: number; max_tokens: number; timeout_seconds: number; max_chars_per_request: number; retry_count: number; thinking_effort: "off" | "minimal" | "low" | "medium" | "high" | "xhigh"; thinking_enabled: boolean; custom_payload: Record<string, unknown>; has_api_key: boolean; api_key_suffix: string | null };
 type PromptPreset = { id: string; name: string; system_prompt: string; user_template: string; builtin?: boolean };
 type EditableProfile = Omit<Partial<AIProfile>, "thinking_effort"> & { thinking_effort?: string; api_key?: string };
+
+const DEFAULT_EDITABLE_PROFILE: EditableProfile = { name: "", api_format: "openai_responses", base_url: "", model: "gpt-5.6-sol", temperature: 0.2, max_tokens: 30000, timeout_seconds: 45, max_chars_per_request: 150, retry_count: 2, thinking_effort: "high", thinking_enabled: true, custom_payload: {}, api_key: "" };
 
 const thinkingOptions = [
   ["off", "关闭"],
@@ -38,13 +41,13 @@ function AIProfilesSection({ profiles, profile, setProfile, saveProfile, testPro
     setProfile({ ...profile, thinking_effort: effort, thinking_enabled: effort !== "off" });
   };
   return <>
-    <div className="settings-section"><div className="section-title"><h2>AI profiles</h2><button className="button tonal" onClick={() => setProfile({ name: "新 profile", api_format: "openai_chat", base_url: "", model: "", api_key: "", temperature: 0.3, max_tokens: 4096, timeout_seconds: 180, max_chars_per_request: 1200, retry_count: 2, thinking_effort: "off", thinking_enabled: false, custom_payload: {} })}>新建 profile</button></div><div className="profile-list">{profiles.map((item) => <button key={item.id} className={`profile-row ${profile.id === item.id ? "active" : ""}`} onClick={() => setProfile({ ...item, api_key: "" })}><KeyRound size={16} /><span><strong>{item.name}</strong><small>{item.api_format} · {item.model} · {item.has_api_key ? "已配置密钥" : "未配置密钥"}</small></span></button>)}</div></div>
+    <div className="settings-section"><div className="section-title"><h2>AI profiles</h2><button className="button tonal" onClick={() => setProfile({ ...DEFAULT_EDITABLE_PROFILE })}>新建 profile</button></div><div className="profile-list">{profiles.map((item) => <button key={item.id} className={`profile-row ${profile.id === item.id ? "active" : ""}`} onClick={() => setProfile({ ...item, api_key: "" })}><KeyRound size={16} /><span><strong>{item.name}</strong><small>{item.api_format} · {item.model} · {item.has_api_key ? "已配置密钥" : "未配置密钥"}</small></span></button>)}</div></div>
     <div className="settings-section"><h2>{profile.name || "新 profile"}</h2><div className="settings-grid">
       <label>名称<input value={String(profile.name || "")} onChange={(event) => setProfile({ ...profile, name: event.target.value })} /></label>
       <label>API 格式<select value={String(profile.api_format || "openai_chat")} onChange={(event) => setProfile({ ...profile, api_format: event.target.value })}><option value="openai_chat">OpenAI Chat Completions</option><option value="openai_responses">OpenAI Responses</option><option value="anthropic_messages">Anthropic Messages</option></select></label>
       <label>Model<input value={String(profile.model || "")} onChange={(event) => setProfile({ ...profile, model: event.target.value })} /></label>
       <label>Base URL<input value={String(profile.base_url || "")} placeholder="https://api.openai.com/v1" onChange={(event) => setProfile({ ...profile, base_url: event.target.value })} /></label>
-      <label>API Key（留空不替换）<input type="password" value={String(profile.api_key || "")} placeholder={profile.has_api_key ? "已配置 · 末尾 4 位已隐藏" : "sk-…"} onChange={(event) => setProfile({ ...profile, api_key: event.target.value })} /></label>
+      <label>API Key<input type="password" value={String(profile.api_key || "")} placeholder={profile.has_api_key ? "已配置" : "sk-…"} onChange={(event) => setProfile({ ...profile, api_key: event.target.value })} /></label>
       <label>Temperature<input type="number" min="0" max="2" step="0.1" value={String(profile.temperature ?? 0.3)} onChange={(event) => setProfile({ ...profile, temperature: Number(event.target.value) })} /></label>
       <label>Max tokens<input type="number" min="0" max="65535" value={String(profile.max_tokens ?? 4096)} onChange={(event) => setProfile({ ...profile, max_tokens: Number(event.target.value) })} /></label>
       <label>Timeout（秒）<input type="number" min="1" max="3600" value={String(profile.timeout_seconds ?? 180)} onChange={(event) => setProfile({ ...profile, timeout_seconds: Number(event.target.value) })} /></label>
@@ -67,20 +70,21 @@ function SettingsPage() {
   const [active, setActive] = useState("general");
   const [values, setValues] = useState<Record<string, unknown>>({
     autosave_interval_seconds: 15, theme: "system", font_family: "Noto Sans JP", font_size_max: 64,
-    separator_device: "auto", separator_vocals_model: "UVR_MDXNET_KARA_2.onnx", separator_instrumental_model: "UVR_MDXNET_KARA_2.onnx",
-    whisper_model: "small", whisper_device: "cpu", whisper_compute_type: "int8",
+    separator_device: "auto", separator_vocals_model: "UVR-MDX-NET-Voc_FT.onnx", separator_instrumental_model: "UVR_MDXNET_KARA_2.onnx",
+    whisper_model: "large-v3", whisper_device: "cpu", whisper_compute_type: "int8",
     alignment_backend: "fa_kara", fa_kara_model: "mms",
-    stable_ts_token_step: 100, stable_ts_segment_padding_seconds: 2,
-    export_mp4_crf: 20, export_webm_crf: 32, export_h264_preset: "medium", export_vp9_cpu_used: 2, export_audio_bitrate_kbps: 192, export_gop_seconds: 2,
+    stable_ts_token_step: 100, stable_ts_segment_padding_seconds: 0,
+    export_mp4_crf: 18, export_webm_crf: 32, export_h264_preset: "slow", export_vp9_cpu_used: 2, export_audio_bitrate_kbps: 192, export_gop_seconds: 2,
     proxy_enabled: true, proxy_url: "http://127.0.0.1:10808",
   });
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [profiles, setProfiles] = useState<AIProfile[]>([]);
-  const [profile, setProfile] = useState<EditableProfile>({ name: "默认注音", api_format: "openai_chat", base_url: "http://127.0.0.1:1234/v1", model: "local-model", temperature: 0.2, max_tokens: 2000, timeout_seconds: 45, max_chars_per_request: 1200, retry_count: 2, thinking_effort: "off", thinking_enabled: false, custom_payload: {}, api_key: "" });
+  const [profile, setProfile] = useState<EditableProfile>({ ...DEFAULT_EDITABLE_PROFILE });
   const [prompts, setPrompts] = useState<PromptPreset[]>([]);
   const [prompt, setPrompt] = useState<PromptPreset>({ id: "", name: "我的注音提示词", system_prompt: "", user_template: "" });
   const [profileMessage, setProfileMessage] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const selectedSettingsFont = normalizeSubtitleFontFamily(values.font_family);
   function showSaved() { setSaved(true); window.setTimeout(() => setSaved(false), 1800); }
   useEffect(() => {
     void Promise.all([api<Record<string, unknown>>("/settings"), api<Capabilities>("/settings/capabilities"), api<AIProfile[]>("/settings/ai-profiles"), api<PromptPreset[]>("/settings/prompt-presets")])
@@ -115,7 +119,7 @@ function SettingsPage() {
   }
   async function saveProfile() { const effort = (profile.thinking_effort || "off") as AIProfile["thinking_effort"]; const payload = { name: profile.name || "未命名 profile", api_format: profile.api_format || "openai_chat", base_url: profile.base_url || "", model: profile.model || "", api_key: profile.api_key || null, temperature: Number(profile.temperature ?? 0.2), max_tokens: Number(profile.max_tokens ?? 2000), timeout_seconds: Number(profile.timeout_seconds ?? 45), thinking_effort: effort, thinking_enabled: effort !== "off", custom_payload: profile.custom_payload || {} }; const savedProfile = profile.id ? await api<AIProfile>(`/settings/ai-profiles/${profile.id}`, { method: "PUT", body: JSON.stringify(payload) }) : await api<AIProfile>("/settings/ai-profiles", { method: "POST", body: JSON.stringify(payload) }); setProfiles((current) => [savedProfile, ...current.filter((item) => item.id !== savedProfile.id)]); setProfile({ ...savedProfile, api_key: "" }); setValues((current) => ({ ...current, default_ai_profile_id: savedProfile.id })); await api("/settings", { method: "PUT", body: JSON.stringify({ values: { default_ai_profile_id: savedProfile.id } }) }); setProfileMessage("profile 已保存并设为默认"); }
   async function testProfile() { if (!profile.id) { setProfileMessage("请先保存 profile"); return; } const result = await api<{ elapsed_ms: number }>(`/settings/ai-profiles/${profile.id}/test`, { method: "POST" }); setProfileMessage(`连接成功 · ${result.elapsed_ms} ms`); }
-  async function removeProfile() { if (!profile.id || !window.confirm("删除这个 AI profile？")) return; await api(`/settings/ai-profiles/${profile.id}`, { method: "DELETE" }); const remaining = profiles.filter((item) => item.id !== profile.id); setProfiles(remaining); setProfile(remaining[0] ? { ...remaining[0], api_key: "" } : { name: "默认注音", api_format: "openai_chat", base_url: "", model: "", api_key: "" }); }
+  async function removeProfile() { if (!profile.id || !window.confirm("删除这个 AI profile？")) return; await api(`/settings/ai-profiles/${profile.id}`, { method: "DELETE" }); const remaining = profiles.filter((item) => item.id !== profile.id); setProfiles(remaining); setProfile(remaining[0] ? { ...remaining[0], api_key: "" } : { ...DEFAULT_EDITABLE_PROFILE }); }
   async function savePrompt() { const payload = { name: prompt.name, system_prompt: prompt.system_prompt, user_template: prompt.user_template }; const savedPrompt = prompt.id && prompt.id !== "builtin-default" ? await api<PromptPreset>(`/settings/prompt-presets/${prompt.id}`, { method: "PUT", body: JSON.stringify(payload) }) : await api<PromptPreset>("/settings/prompt-presets", { method: "POST", body: JSON.stringify(payload) }); setPrompts((current) => [savedPrompt, ...current.filter((item) => item.id !== savedPrompt.id)]); setPrompt(savedPrompt); setValues((current) => ({ ...current, default_prompt_preset_id: savedPrompt.id, pronunciation_system_prompt: savedPrompt.system_prompt, pronunciation_user_template: savedPrompt.user_template })); showSaved(); }
   const label = settingsSections.find(([id]) => id === active)?.[1] || "设置";
   return <>
@@ -137,7 +141,7 @@ function SettingsPage() {
           <div className="settings-section"><h2>视频编码</h2><div className="settings-grid"><label>MP4 · H.264 CRF<input type="number" min="0" max="51" step="1" value={String(values.export_mp4_crf)} onChange={(event) => setValues({ ...values, export_mp4_crf: Number(event.target.value) })} /><small>0–51；数值越低画质越高、文件越大</small></label><label>H.264 preset<select value={String(values.export_h264_preset)} onChange={(event) => setValues({ ...values, export_h264_preset: event.target.value })}><option value="ultrafast">ultrafast</option><option value="superfast">superfast</option><option value="veryfast">veryfast</option><option value="faster">faster</option><option value="fast">fast</option><option value="medium">medium</option><option value="slow">slow</option><option value="slower">slower</option><option value="veryslow">veryslow</option></select><small>越慢通常压缩率越高</small></label><label>WebM · VP9 CRF<input type="number" min="0" max="63" step="1" value={String(values.export_webm_crf)} onChange={(event) => setValues({ ...values, export_webm_crf: Number(event.target.value) })} /><small>0–63；数值越低画质越高、文件越大</small></label><label>VP9 编码速度<select value={String(values.export_vp9_cpu_used)} onChange={(event) => setValues({ ...values, export_vp9_cpu_used: Number(event.target.value) })}>{[0, 1, 2, 3, 4, 5, 6, 7, 8].map((value) => <option value={value} key={value}>{value}{value === 0 ? " · 最慢" : value === 8 ? " · 最快" : ""}</option>)}</select><small>较低数值通常带来更好的压缩效果</small></label></div></div>
           <div className="settings-section"><h2>音频与关键帧</h2><div className="settings-grid"><label>音频码率（kbps）<input type="number" min="64" max="512" step="16" value={String(values.export_audio_bitrate_kbps)} onChange={(event) => setValues({ ...values, export_audio_bitrate_kbps: Number(event.target.value) })} /><small>AAC 与 Opus 共用此默认值</small></label><label>关键帧间隔（秒）<input type="number" min="0.5" max="10" step="0.5" value={String(values.export_gop_seconds)} onChange={(event) => setValues({ ...values, export_gop_seconds: Number(event.target.value) })} /><small>FFmpeg 会根据输出帧率换算为 GOP 长度</small></label></div></div>
         </>}
-        {active === "subtitles" && <div className="settings-section"><h2>字幕与样式</h2><div className="settings-grid"><label>字体<input value={String(values.font_family)} onChange={(event) => setValues({ ...values, font_family: event.target.value })} /><small>新工程默认字体</small></label><label>最大字号<input type="number" min="12" max="180" value={String(values.font_size_max)} onChange={(event) => setValues({ ...values, font_size_max: Number(event.target.value) })} /><small>范围 12–180 px</small></label></div></div>}
+        {active === "subtitles" && <div className="settings-section"><h2>字幕与样式</h2><div className="settings-grid"><label>字体<select value={selectedSettingsFont} onChange={(event) => setValues({ ...values, font_family: event.target.value })}>{!SUBTITLE_FONT_OPTIONS.some((option) => option.value === selectedSettingsFont) && <option value={selectedSettingsFont}>{selectedSettingsFont}</option>}{SUBTITLE_FONT_OPTIONS.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select><small>新工程默认字体</small></label><label>最大字号<input type="number" min="12" max="180" value={String(values.font_size_max)} onChange={(event) => setValues({ ...values, font_size_max: Number(event.target.value) })} /><small>范围 12–180 px</small></label></div></div>}
         {!(["general", "ai", "prompts", "separation", "whisper", "subtitles", "export"].includes(active)) && <div className="settings-section settings-placeholder"><h2>{label}</h2><p>该分类将在对应开发阶段开放，当前不会写入占位配置。</p></div>}
         {active === "ai" && <AIProfilesSection profiles={profiles} profile={profile} setProfile={setProfile} saveProfile={() => void saveProfileWithBatchSettings()} testProfile={() => void testProfile()} removeProfile={() => void removeProfile()} message={profileMessage} />}
         {active === "prompts" && <div className="settings-section"><h2>注音提示词预设</h2><label>系统提示词<textarea rows={6} value={prompt.system_prompt} onChange={(event) => setPrompt({ ...prompt, system_prompt: event.target.value })} /></label><label>用户模板<textarea rows={8} value={prompt.user_template} onChange={(event) => setPrompt({ ...prompt, user_template: event.target.value })} /></label><button className="button filled" onClick={() => void savePrompt()} disabled={!prompt.system_prompt || !prompt.user_template}><Save size={16} />保存提示词</button></div>}

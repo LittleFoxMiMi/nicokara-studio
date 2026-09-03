@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable
 
 from app.core.config import Settings
+from app.core.defaults import DEFAULT_SUBTITLE_STYLE
 
 
 class ExportError(RuntimeError):
@@ -94,30 +95,31 @@ def document_to_lrc(document: dict) -> str:
 
 def document_to_config(document: dict) -> dict:
     raw = document.get("styles") if isinstance(document.get("styles"), dict) else {}
+    defaults = DEFAULT_SUBTITLE_STYLE
     def number(key: str, fallback: float) -> float:
         try:
             value = float(raw.get(key, fallback))
             return value if value == value else fallback
         except (TypeError, ValueError):
             return fallback
-    font_size = number("fontSizeMax", 64)
+    font_size = number("fontSizeMax", defaults["fontSizeMax"])
     profiles = {}
     for line in document.get("lyrics", {}).get("lines", []):
         for unit in line.get("units", []):
             for role in unit.get("roles", []):
-                profiles[str(role)] = {"colorBefore": raw.get("textColor", "#ffffff"), "colorAfter": raw.get("activeColor", "#a50000"), "strokeColorBefore": raw.get("outlineColor", "#000000"), "strokeColorAfter": raw.get("outlineColor", "#000000")}
+                profiles[str(role)] = {"colorBefore": raw.get("textColor", defaults["textColor"]), "colorAfter": raw.get("activeColor", defaults["activeColor"]), "strokeColorBefore": raw.get("outlineColor", defaults["outlineColor"]), "strokeColorAfter": raw.get("outlineColor", defaults["outlineColor"])}
     return {
-        "fontSize": font_size, "letterSpacing": number("letterSpacing", .14) * font_size,
-        "fontFamily": str(raw.get("fontFamily", "Noto Sans JP, sans-serif")), "fontBold": number("fontWeight", 600) >= 600,
-        "safeAreaLeft": number("safeAreaLeft", .08), "safeAreaRight": number("safeAreaRight", .08),
-        "rubySize": font_size * number("rubyScale", .42), "rubyOffset": number("rubyGap", .18) * font_size,
-        "rubyLetterSpacing": number("letterSpacing", .14) * font_size, "rubyBold": False,
-        "ruby2Size": font_size * number("ruby2Scale", .32), "ruby2Offset": number("rubyGap", .18) * font_size,
-        "ruby2LetterSpacing": number("letterSpacing", .14) * font_size, "ruby2Bold": False, "rubyIsolateEnabled": True,
-        "colorBefore": str(raw.get("textColor", "#ffffff")), "colorAfter": str(raw.get("activeColor", "#a50000")),
-        "strokeColorBefore": str(raw.get("outlineColor", "#000000")), "strokeColorAfter": str(raw.get("outlineColor", "#000000")),
-        "strokeWidth": number("outlineWidth", 3), "line1X": number("line1X", .1) * 1280, "line1Y": number("line1Y", .597) * 720,
-        "line2Right": number("line2Right", .1) * 1280, "line2Y": number("line2Y", .782) * 720,
+        "fontSize": font_size, "letterSpacing": number("letterSpacing", defaults["letterSpacing"]) * font_size,
+        "fontFamily": str(raw.get("fontFamily", defaults["fontFamily"])), "fontBold": number("fontWeight", defaults["fontWeight"]) >= 600,
+        "safeAreaLeft": number("safeAreaLeft", defaults["safeAreaLeft"]), "safeAreaRight": number("safeAreaRight", defaults["safeAreaRight"]),
+        "rubySize": font_size * number("rubyScale", defaults["rubyScale"]), "rubyOffset": number("rubyGap", defaults["rubyGap"]) * font_size,
+        "rubyLetterSpacing": number("letterSpacing", defaults["letterSpacing"]) * font_size, "rubyBold": False,
+        "ruby2Size": font_size * number("ruby2Scale", defaults["ruby2Scale"]), "ruby2Offset": number("rubyGap", defaults["rubyGap"]) * font_size,
+        "ruby2LetterSpacing": number("letterSpacing", defaults["letterSpacing"]) * font_size, "ruby2Bold": False, "rubyIsolateEnabled": True,
+        "colorBefore": str(raw.get("textColor", defaults["textColor"])), "colorAfter": str(raw.get("activeColor", defaults["activeColor"])),
+        "strokeColorBefore": str(raw.get("outlineColor", defaults["outlineColor"])), "strokeColorAfter": str(raw.get("outlineColor", defaults["outlineColor"])),
+        "strokeWidth": number("outlineWidth", defaults["outlineWidth"]), "line1X": number("line1X", defaults["line1X"]) * 1280, "line1Y": number("line1Y", defaults["line1Y"]) * 720,
+        "line2Right": number("line2Right", defaults["line2Right"]) * 1280, "line2Y": number("line2Y", defaults["line2Y"]) * 720,
         "fadeEnabled": True, "fadeParagraphOnly": False, "fadeDurationMs": number("fadeInMs", 100),
         "indicatorEnabled": raw.get("showProgressDots", True), "indicatorDuration": 3, "indicatorSize": 34,
         "indicatorSpacing": 12, "indicatorStrokeWidth": 3, "indicatorStrokeColor": "#000000", "indicatorFillColor": "#ffffff",

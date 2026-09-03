@@ -1,0 +1,65 @@
+from __future__ import annotations
+
+from typing import Any
+
+
+DEFAULT_APP_SETTINGS: dict[str, Any] = {
+    "alignment_backend": "fa_kara",
+    "autosave_interval_seconds": 15,
+    "export_audio_bitrate_kbps": 192,
+    "export_gop_seconds": 2,
+    "export_h264_preset": "slow",
+    "export_mp4_crf": 18,
+    "export_vp9_cpu_used": 2,
+    "export_webm_crf": 32,
+    "fa_kara_model": "mms",
+    "font_family": "Noto Sans JP",
+    "font_size_max": 64,
+    "proxy_enabled": True,
+    "proxy_url": "http://127.0.0.1:10808",
+    "separator_device": "auto",
+    "separator_instrumental_model": "UVR_MDXNET_KARA_2.onnx",
+    "separator_model": "UVR_MDXNET_KARA_2.onnx",
+    "separator_vocals_model": "UVR-MDX-NET-Voc_FT.onnx",
+    "stable_ts_segment_padding_seconds": 0,
+    "stable_ts_token_step": 100,
+    "theme": "system",
+    "whisper_compute_type": "int8",
+    "whisper_device": "cpu",
+    "whisper_model": "large-v3",
+}
+
+
+# Snapshot of the normalized subtitle style from the Kohakutou project.
+DEFAULT_SUBTITLE_STYLE: dict[str, Any] = {
+    "fontFamily": "Noto Sans JP, Google Sans, sans-serif",
+    "fontSizeMin": 24,
+    "fontSizeMax": 60,
+    "fontWeight": 600,
+    "maxLines": 1,
+    "safeAreaLeft": 0.08,
+    "safeAreaRight": 0.08,
+    "safeAreaTop": 0.08,
+    "safeAreaBottom": 0.12,
+    "rubyScale": 0.42,
+    "ruby2Scale": 0.32,
+    "rubyGap": 0.18,
+    "lineGap": 0.18,
+    "letterSpacing": 0.14,
+    "textColor": "#ffffff",
+    "activeColor": "#c79af6",
+    "outlineColor": "#000000",
+    "outlineWidth": 3,
+    "shadowColor": "#00000099",
+    "shadowBlur": 8,
+    "slot": "bottom",
+    "positionY": 0.84,
+    "line1X": 0.04,
+    "line1Y": 0.597,
+    "line2Right": 0.04,
+    "line2Y": 0.782,
+    "wrapMode": "unit",
+    "fadeInMs": 100,
+    "fadeOutMs": 140,
+    "showProgressDots": True,
+}

@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     max_background_jobs: int = 1
     separator_model: str = "UVR_MDXNET_KARA_2.onnx"
     separator_device: str = "auto"
-    whisper_model: str = "small"
+    whisper_model: str = "large-v3"
     whisper_device: str = "auto"
     whisper_compute_type: str = "int8"
     @property

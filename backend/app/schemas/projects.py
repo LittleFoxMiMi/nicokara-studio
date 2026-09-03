@@ -88,3 +88,8 @@ class PromptPresetPayload(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     system_prompt: str = Field(min_length=1, max_length=20000)
     user_template: str = Field(min_length=1, max_length=50000)
+
+
+class SubtitleStylePresetPayload(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    style: dict[str, Any]

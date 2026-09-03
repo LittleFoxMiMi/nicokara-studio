@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Iterator
 
+from app.core.defaults import DEFAULT_APP_SETTINGS
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', artist TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'blank', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT);
 CREATE TABLE IF NOT EXISTS project_revisions (project_id TEXT NOT NULL, revision INTEGER NOT NULL, document TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(project_id, revision), FOREIGN KEY(project_id) REFERENCES projects(id));
@@ -34,6 +36,14 @@ CREATE TABLE IF NOT EXISTS prompt_presets (
   user_template TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS subtitle_style_presets (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  style_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  deleted_at TEXT
 );
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
@@ -86,6 +96,32 @@ class Database:
                 c.execute("ALTER TABLE ai_profiles ADD COLUMN max_chars_per_request INTEGER NOT NULL DEFAULT 1200")
             if "retry_count" not in columns:
                 c.execute("ALTER TABLE ai_profiles ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 2")
+            self._migrate_project_style_presets(c)
+
+    @staticmethod
+    def _migrate_project_style_presets(c: sqlite3.Connection) -> None:
+        rows = c.execute(
+            """SELECT revisions.document FROM project_revisions revisions
+            JOIN (SELECT project_id, MAX(revision) AS revision FROM project_revisions GROUP BY project_id) latest
+            ON latest.project_id=revisions.project_id AND latest.revision=revisions.revision"""
+        ).fetchall()
+        timestamp = now()
+        for row in rows:
+            try:
+                document = json.loads(row[0])
+            except (TypeError, ValueError):
+                continue
+            styles = document.get("styles") if isinstance(document, dict) else None
+            presets = styles.get("presets") if isinstance(styles, dict) else None
+            if not isinstance(presets, list):
+                continue
+            for preset in presets:
+                if not isinstance(preset, dict) or not preset.get("id") or not preset.get("name") or not isinstance(preset.get("style"), dict):
+                    continue
+                c.execute(
+                    "INSERT OR IGNORE INTO subtitle_style_presets(id,name,style_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+                    (str(preset["id"]), str(preset["name"]), json.dumps(preset["style"], ensure_ascii=False), timestamp, timestamp),
+                )
     def create_project(self, project_id: str, name: str, document: dict) -> dict:
         t=now()
         with self.connect() as c:
@@ -135,7 +171,9 @@ class Database:
             result = c.execute("DELETE FROM jobs WHERE id=? AND project_id=?", (job_id, project_id))
             return result.rowcount > 0
     def settings(self) -> dict:
-        with self.connect() as c: return {r["key"]:json.loads(r["value"]) for r in c.execute("SELECT key,value FROM app_settings")}
+        with self.connect() as c:
+            stored = {r["key"]:json.loads(r["value"]) for r in c.execute("SELECT key,value FROM app_settings")}
+        return {**DEFAULT_APP_SETTINGS, **stored}
     def save_settings(self, values: dict) -> dict:
         t=now()
         with self.connect() as c:
@@ -288,4 +326,40 @@ class Database:
     def delete_prompt_preset(self, preset_id: str) -> bool:
         with self.connect() as c:
             result = c.execute("DELETE FROM prompt_presets WHERE id=?", (preset_id,))
+            return result.rowcount > 0
+
+    def list_subtitle_style_presets(self) -> list[dict]:
+        with self.connect() as c:
+            rows = c.execute("SELECT * FROM subtitle_style_presets WHERE deleted_at IS NULL ORDER BY updated_at DESC").fetchall()
+            return [self._subtitle_style_preset_dict(row) for row in rows]
+
+    def get_subtitle_style_preset_by_name(self, name: str) -> dict | None:
+        with self.connect() as c:
+            row = c.execute("SELECT * FROM subtitle_style_presets WHERE name=? ORDER BY updated_at DESC LIMIT 1", (name,)).fetchone()
+            return self._subtitle_style_preset_dict(row) if row else None
+
+    @staticmethod
+    def _subtitle_style_preset_dict(row: sqlite3.Row) -> dict:
+        result = dict(row)
+        result["style"] = json.loads(result.pop("style_json"))
+        return result
+
+    def save_subtitle_style_preset(self, preset: dict) -> dict:
+        timestamp = now()
+        with self.connect() as c:
+            c.execute(
+                """INSERT INTO subtitle_style_presets(id,name,style_json,created_at,updated_at,deleted_at)
+                VALUES(?,?,?,?,?,NULL) ON CONFLICT(id) DO UPDATE SET name=excluded.name,style_json=excluded.style_json,
+                updated_at=excluded.updated_at,deleted_at=NULL""",
+                (preset["id"], preset["name"], json.dumps(preset["style"], ensure_ascii=False), preset.get("created_at") or timestamp, timestamp),
+            )
+            row = c.execute("SELECT * FROM subtitle_style_presets WHERE id=?", (preset["id"],)).fetchone()
+            return self._subtitle_style_preset_dict(row)
+
+    def delete_subtitle_style_preset(self, preset_id: str) -> bool:
+        with self.connect() as c:
+            result = c.execute(
+                "UPDATE subtitle_style_presets SET deleted_at=?,updated_at=? WHERE id=? AND deleted_at IS NULL",
+                (now(), now(), preset_id),
+            )
             return result.rowcount > 0

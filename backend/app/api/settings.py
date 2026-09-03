@@ -3,7 +3,8 @@ from uuid import uuid4
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 from urllib.parse import urlparse
-from app.schemas.projects import AIProfilePayload, PromptPresetPayload, SettingsPayload
+from app.schemas.projects import AIProfilePayload, PromptPresetPayload, SettingsPayload, SubtitleStylePresetPayload
+from app.core.defaults import DEFAULT_APP_SETTINGS
 from app.services.pronunciation import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_TEMPLATE, resolve_prompt_settings
 from app.services.ai_client import AIClient
 from app.services.secrets import SecretStore
@@ -14,18 +15,8 @@ def get_settings(request: Request):
     database = request.app.state.database
     stored = database.settings()
     system_prompt, user_template, preset_id = resolve_prompt_settings(database, stored)
-    legacy_separator_model = stored.get("separator_model") or request.app.state.settings.separator_model
     return {
-        "alignment_backend": "fa_kara",
-        "fa_kara_model": "mms",
-        "separator_vocals_model": legacy_separator_model,
-        "separator_instrumental_model": legacy_separator_model,
-        "export_mp4_crf": 20,
-        "export_webm_crf": 32,
-        "export_h264_preset": "medium",
-        "export_vp9_cpu_used": 2,
-        "export_audio_bitrate_kbps": 192,
-        "export_gop_seconds": 2,
+        **DEFAULT_APP_SETTINGS,
         **stored,
         "pronunciation_system_prompt": system_prompt,
         "pronunciation_user_template": user_template,
@@ -193,6 +184,33 @@ def _save_default_prompt(preset: dict, request: Request):
 def delete_prompt_preset(preset_id: str, request: Request):
     if preset_id == "builtin-default" or not request.app.state.database.delete_prompt_preset(preset_id):
         raise HTTPException(404, "提示词预设不存在或不可删除")
+
+
+@router.get("/subtitle-style-presets")
+def list_subtitle_style_presets(request: Request):
+    return request.app.state.database.list_subtitle_style_presets()
+
+
+@router.post("/subtitle-style-presets")
+def save_subtitle_style_preset(payload: SubtitleStylePresetPayload, request: Request):
+    database = request.app.state.database
+    name = payload.name.strip()
+    existing = database.get_subtitle_style_preset_by_name(name)
+    preset = {
+        "id": existing["id"] if existing else str(uuid4()),
+        "name": name,
+        "style": payload.style,
+        "created_at": existing.get("created_at") if existing else None,
+    }
+    return database.save_subtitle_style_preset(preset)
+
+
+@router.delete("/subtitle-style-presets/{preset_id}", status_code=204)
+def delete_subtitle_style_preset(preset_id: str, request: Request):
+    if not request.app.state.database.delete_subtitle_style_preset(preset_id):
+        raise HTTPException(404, "字幕样式预设不存在或已删除")
+
+
 @router.get("/schema")
 def settings_schema():
-    return {"sections": [{"id": "general", "label": "常规", "fields": [{"key": "autosave_interval_seconds", "type": "number", "min": 5, "max": 300, "scope": "global"}, {"key": "theme", "type": "enum", "values": ["system", "light", "dark"], "scope": "global"}]}, {"id": "subtitles", "label": "字幕与样式", "fields": [{"key": "font_family", "type": "text", "scope": "global"}, {"key": "font_size_max", "type": "number", "min": 12, "max": 180, "scope": "global"}]}]}
+    return {"sections": [{"id": "general", "label": "常规", "fields": [{"key": "autosave_interval_seconds", "type": "number", "min": 5, "max": 300, "scope": "global"}, {"key": "theme", "type": "enum", "values": ["system", "light", "dark"], "scope": "global"}]}, {"id": "subtitles", "label": "字幕与样式", "fields": [{"key": "font_family", "type": "enum", "values": ["Noto Sans JP", "Noto Serif JP", "Yu Gothic", "Yu Mincho", "Meiryo", "MS Gothic"], "scope": "global"}, {"key": "font_size_max", "type": "number", "min": 12, "max": 180, "scope": "global"}]}]}

@@ -31,12 +31,27 @@ export type SubtitleStyle = {
   showProgressDots: boolean;
 };
 
+export const SUBTITLE_FONT_OPTIONS = [
+  { label: "Noto Sans JP", value: "Noto Sans JP, Google Sans, sans-serif" },
+  { label: "Noto Serif JP", value: "Noto Serif JP, serif" },
+  { label: "游ゴシック", value: '"Yu Gothic", YuGothic, sans-serif' },
+  { label: "游明朝", value: '"Yu Mincho", YuMincho, serif' },
+  { label: "メイリオ", value: "Meiryo, sans-serif" },
+  { label: "MS ゴシック", value: '"MS Gothic", monospace' },
+] as const;
+
+export function normalizeSubtitleFontFamily(value: unknown): string {
+  const family = String(value || "").trim();
+  if (family === "Noto Sans JP") return SUBTITLE_FONT_OPTIONS[0].value;
+  return family || SUBTITLE_FONT_OPTIONS[0].value;
+}
+
 export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
   fontFamily: "Noto Sans JP, Google Sans, sans-serif",
   fontSizeMin: 24,
-  fontSizeMax: 64,
+  fontSizeMax: 60,
   fontWeight: 600,
-  maxLines: 2,
+  maxLines: 1,
   safeAreaLeft: 0.08,
   safeAreaRight: 0.08,
   safeAreaTop: 0.08,
@@ -48,16 +63,16 @@ export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
   // Kirakara's 9px spacing at the default 64px font size, expressed as em.
   letterSpacing: 0.14,
   textColor: "#ffffff",
-  activeColor: "#a50000",
+  activeColor: "#c79af6",
   outlineColor: "#000000",
   outlineWidth: 3,
   shadowColor: "#00000099",
   shadowBlur: 8,
   slot: "bottom",
   positionY: 0.84,
-  line1X: 0.10,
+  line1X: 0.04,
   line1Y: 0.597,
-  line2Right: 0.10,
+  line2Right: 0.04,
   line2Y: 0.782,
   wrapMode: "unit",
   fadeInMs: 100,

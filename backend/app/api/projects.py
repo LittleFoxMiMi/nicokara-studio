@@ -8,6 +8,7 @@ from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from app.core.database import Database
 from app.core.config import Settings
+from app.core.defaults import DEFAULT_SUBTITLE_STYLE
 from app.domain.lyrics import detect_lyrics_format, parse_lyrics
 from app.media.probe import probe, thumbnail
 from app.media.waveform import generate_waveform
@@ -30,7 +31,7 @@ def project_or_404(db: Database, project_id: str) -> dict:
     return project
 
 def initial_document(project_id: str, name: str) -> dict:
-    return {"schema_version": 1, "project": {"id": project_id, "name": name, "title": "", "artist": "", "language": "jp", "revision": 1}, "media": {"video_asset_id": None, "duration_ms": None, "width": None, "height": None, "fps": None, "video_filename": None, "thumbnail_url": None}, "lyrics": {"source_type": "manual", "lines": []}, "styles": {}, "layout": {}, "export_presets": []}
+    return {"schema_version": 1, "project": {"id": project_id, "name": name, "title": "", "artist": "", "language": "jp", "revision": 1}, "media": {"video_asset_id": None, "duration_ms": None, "width": None, "height": None, "fps": None, "video_filename": None, "thumbnail_url": None}, "lyrics": {"source_type": "manual", "lines": []}, "styles": copy.deepcopy(DEFAULT_SUBTITLE_STYLE), "layout": {}, "export_presets": []}
 
 
 def document_language(document: dict) -> str:
