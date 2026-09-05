@@ -14,7 +14,7 @@ from app.services.pronunciation import PronunciationSelection, PronunciationVali
 def prepare_whisper_result(client: TestClient, tmp_path, project_id: str, imported: dict) -> dict:
     derived = tmp_path / "projects" / project_id / "derived"
     derived.mkdir(parents=True, exist_ok=True)
-    (derived / "transcript.json").write_text('{"segments": [{"text": "歌詞"}]}', encoding="utf-8")
+    (derived / "transcript.json").write_text('{"segments": [{"text": "歌詞", "phonemes": "ka shi"}]}', encoding="utf-8")
     document = imported["document"]
     document.setdefault("analysis", {})["transcription"] = {"status": "completed"}
     return client.app.state.database.save_document(project_id, document, imported["revision"])
@@ -43,6 +43,7 @@ def test_saved_prompt_preset_becomes_default_and_is_used_by_ai_job(tmp_path, mon
         builtin = client.get("/api/settings/prompt-presets").json()[0]
         assert "取り戻す" in builtin["system_prompt"]
         assert "未封闭的括号" in builtin["user_template"]
+        assert "读音和文字并不是严格对应的，可能会串行" in builtin["user_template"]
 
         client.app.state.database.save_settings({
             "pronunciation_system_prompt": "STALE SYSTEM",
@@ -96,6 +97,7 @@ def test_saved_prompt_preset_becomes_default_and_is_used_by_ai_job(tmp_path, mon
         assert prompts[0][0] == custom_system
         assert prompts[0][1].startswith("CUSTOM TEMPLATE")
         assert '"text": "雨"' in prompts[0][1]
+        assert '"phonemes": "ka shi"' in prompts[0][1]
 
 
 def test_ai_pronunciation_batches_and_retries_structural_failure(tmp_path, monkeypatch):

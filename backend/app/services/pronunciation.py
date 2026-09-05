@@ -56,7 +56,7 @@ DEFAULT_USER_TEMPLATE = r'''请严格按照系统协议，为下面的完整歌�
 输入歌词行（必须逐行保留 line_index 和 text）：
 {{current_lines}}
 
-Whisper 顺序参考（这是语音转文本模型的输出，根据这里的输出来确定多音字的读音，你可能需要进行一定程度的猜测，这里的文本仅供参考，不得用这里的文本代替原有歌词的文本）：
+Whisper 顺序参考（这是语音转文本模型的输出，根据这里的输出来确定多音字的读音，这里的读音和文字并不是严格对应的，可能会串行，你可能需要进行一定程度的猜测，这里的文本仅供参考，不得用这里的文本代替原有歌词的文本）：
 {{whisper_segments}}
 
 再次检查：raw 必须等于每行原文；pronunciation 必须使用 [start,surface,reading]；surface 必须匹配原文；只注音汉字；最后只输出 JSON。返回之前仔细检查json的格式是否有未封闭的括号。'''
@@ -195,6 +195,8 @@ def render_prompt(template: str, *, song_title: str, artist: str, current_lines:
     rendered = template
     for key, value in values.items():
         rendered = rendered.replace("{{" + key + "}}", value)
+    if whisper_segments and any(item.get("phonemes") for item in whisper_segments) and "HuBERT" not in rendered and "音素" not in rendered:
+        rendered += "\n\n补充参考字段说明：whisper_segments 每项的 phonemes 是日语 HuBERT CTC 拉丁音素，按该 segment 的 start 到下一 segment 的 start 切分；请与 text 一起用于判断多音字，但不要修改歌词正文。"
     return rendered
 
 
@@ -425,10 +427,13 @@ def run_ai_pronunciation(
         segments = transcript.get("segments") if isinstance(transcript, dict) else None
         if not isinstance(segments, list) or any(not isinstance(item, dict) for item in segments):
             raise ValueError("invalid_segments")
-        whisper_segments = [
-            {"segment_index": index, "text": str(item.get("text", ""))}
-            for index, item in enumerate(segments)
-        ]
+        whisper_segments = []
+        for index, item in enumerate(segments):
+            reference = {"segment_index": index, "text": str(item.get("text", ""))}
+            phonemes = item.get("phonemes")
+            if isinstance(phonemes, str) and phonemes.strip():
+                reference["phonemes"] = phonemes.strip()
+            whisper_segments.append(reference)
     except (OSError, ValueError) as exc:
         raise PronunciationValidationError("Whisper 粗识别结果无效，请重新运行粗识别") from exc
     system_prompt, user_template, _ = resolve_prompt_settings(database, app_settings)

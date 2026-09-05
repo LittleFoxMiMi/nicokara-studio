@@ -23,6 +23,7 @@ from app.services.fa_kara import FAKaraAligner
 from app.services.transcription import FasterWhisperTranscriber, Transcript, TranscriptSegment, TranscriptWord
 from app.services.kirakara_export import ExportCanceled, ExportError, run_kirakara_export
 from app.services.model_runtime import ResidentModelStore
+from app.services.japanese_phoneme import JapanesePhonemeRecognizer, MODEL_NAME as JAPANESE_PHONEME_MODEL, phoneme_result, split_phonemes_at_segment_starts
 
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,7 @@ class AnalysisPipeline:
         self.model_store = model_store or ResidentModelStore()
         self.separator = VocalSeparator(settings.models_dir / "separator", settings.ffmpeg_path, model_store=self.model_store)
         self.transcriber = FasterWhisperTranscriber(download_root=settings.models_dir / "whisper", model_store=self.model_store)
+        self.phoneme_recognizer = JapanesePhonemeRecognizer(cache_dir=settings.models_dir / "japanese-phoneme", model_store=self.model_store)
 
     def _step(self, job_id: str, key: str, progress: float, message: str, *, status: str | None = None) -> None:
         job = self.database.get_job(job_id)
@@ -196,12 +198,34 @@ class AnalysisPipeline:
             language=normalize_language(document.get("project", {}).get("language")),
             start_ms=max(0, start_ms - 3000) if isinstance(start_ms, int) else None,
             end_ms=end_ms + 3000 if isinstance(end_ms, int) else None,
-            progress_callback=lambda value, message: self._step(job_id, "transcription", 0.08 + value * 0.84, message),
+            progress_callback=lambda value, message: self._step(job_id, "transcription", 0.08 + value * 0.48, message),
             should_cancel=lambda: self._should_cancel(job_id),
         )
         derived.mkdir(parents=True, exist_ok=True)
-        transcript_path.write_text(json.dumps(transcript.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-        document.setdefault("analysis", {})["transcription"] = {"status": "completed", "job_id": job_id, "model": payload.get("whisper_model") or values.get("whisper_model") or self.settings.whisper_model, "scope": {"line_ids": payload.get("line_ids", []), "start_ms": start_ms, "end_ms": end_ms}, "segment_count": len(transcript.segments)}
+        transcript_data = transcript.to_dict()
+        language = normalize_language(document.get("project", {}).get("language"))
+        phoneme_count = 0
+        if language == "jp":
+            clip_start_ms = max(0, start_ms - 3000) if isinstance(start_ms, int) else None
+            clip_end_ms = end_ms + 3000 if isinstance(end_ms, int) else None
+            proxy_url = str(values.get("proxy_url") or "") if values.get("proxy_enabled", True) else None
+            self._step(job_id, "transcription", 0.58, "正在下载或加载日语 HuBERT 音素模型")
+            phones = self.phoneme_recognizer.recognize(
+                audio,
+                start_ms=clip_start_ms,
+                end_ms=clip_end_ms,
+                proxy_url=proxy_url,
+                progress_callback=lambda value, message: self._step(job_id, "transcription", 0.58 + value * 0.38, message),
+                should_cancel=lambda: self._should_cancel(job_id),
+            )
+            phoneme_count = len(phones)
+            split_phonemes_at_segment_starts(transcript_data, phones)
+            (derived / "japanese_phonemes.json").write_text(
+                json.dumps(phoneme_result(phones), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        transcript_path.write_text(json.dumps(transcript_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        document.setdefault("analysis", {})["transcription"] = {"status": "completed", "job_id": job_id, "model": payload.get("whisper_model") or values.get("whisper_model") or self.settings.whisper_model, "scope": {"line_ids": payload.get("line_ids", []), "start_ms": start_ms, "end_ms": end_ms}, "segment_count": len(transcript.segments), "phoneme_model": JAPANESE_PHONEME_MODEL if language == "jp" else None, "phoneme_count": phoneme_count}
         if document.get("lyrics", {}).get("lines"):
             ranges = rough_line_ranges(document, transcript)
             for line in document["lyrics"]["lines"]:
@@ -209,8 +233,8 @@ class AnalysisPipeline:
                     line["start_ms"], line["end_ms"] = ranges[line["id"]]
                     line["timing_source"], line["timing_precision"] = "whisper_coarse", "line"
         document, revision = self._save(project_id, document, revision)
-        self._step(job_id, "transcription", 1.0, "Whisper 人声粗识别完成")
-        return document, revision, {"segment_count": len(transcript.segments), "output_revision": revision}
+        self._step(job_id, "transcription", 1.0, "Whisper 与日语音素粗识别完成" if language == "jp" else "Whisper 人声粗识别完成")
+        return document, revision, {"segment_count": len(transcript.segments), "phoneme_count": phoneme_count, "output_revision": revision}
 
     def _pronounce(self, job_id: str, project_id: str, document: dict, revision: int, payload: dict) -> tuple[dict, int, dict]:
         if normalize_language(document.get("project", {}).get("language")) == "cn":
