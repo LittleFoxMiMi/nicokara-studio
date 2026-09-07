@@ -93,6 +93,13 @@ echo Installing backend dependencies from backend\pyproject.toml...
 if errorlevel 1 goto :pip_failed
 
 echo.
+echo Reinstalling ONNX Runtime DirectML after backend dependencies...
+"%PYTHON_EXE%" -m pip uninstall --yes onnxruntime-directml
+if errorlevel 1 goto :pip_failed
+"%PYTHON_EXE%" -m pip install --no-deps --force-reinstall "onnxruntime-directml>=1.24,<2"
+if errorlevel 1 goto :pip_failed
+
+echo.
 echo Python %PYTHON_VERSION% and backend dependencies are ready.
 echo Installed interpreter: "%PYTHON_EXE%"
 goto :done
