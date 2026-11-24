@@ -97,33 +97,26 @@ function drawLyricsOnCanvas(ctx, lyrics, time, config, entryBuf) {
         if (time < 0.1) console.warn('[Canvas] drawLyricsOnCanvas: lyrics 为空！');
         return;
     }
-    const EXIT_BUF = 2.0;
-
-    let l1 = null, l2 = null, l1Para = -1, l2Para = -1, l1Walk = false, l2Walk = false;
+    let l1 = null, l2 = null;
     for (const line of lyrics) {
-        const inW = time >= (line.entryTime ?? line.startTime - entryBuf) && time <= line.endTime + EXIT_BUF;
-        if (!inW) continue;
-        const isL1 = line.lineInParagraph % 2 === 0;
-        if (isL1) {
-            if (line.paragraph !== l1Para) { l1 = line; l1Para = line.paragraph; l1Walk = time < (line.walkDoneTime ?? line.endTime); }
-            else if (!l1Walk) { l1 = line; l1Para = line.paragraph; l1Walk = time < (line.walkDoneTime ?? line.endTime); }
-        } else {
-            if (line.paragraph !== l2Para) { l2 = line; l2Para = line.paragraph; l2Walk = time < (line.walkDoneTime ?? line.endTime); }
-            else if (!l2Walk) { l2 = line; l2Para = line.paragraph; l2Walk = time < (line.walkDoneTime ?? line.endTime); }
-        }
+        const entry = line.entryTime ?? line.startTime - entryBuf;
+        const exit = line.displayEndTime ?? line.endTime + 1;
+        if (time < entry || time >= exit) continue;
+        if (line.lineInParagraph % 2 === 0) l1 = line;
+        else l2 = line;
     }
 
     const getFadeOpacity = (line) => {
         if (!line || !config.fadeEnabled) return 1;
-        const dur = (config.fadeDurationMs || 666) / 1000;
-        const entryT = line.entryTime ?? (line.startTime - 2);
-        const exitT = line.endTime + EXIT_BUF;
-        const shouldFadeIn = config.fadeParagraphOnly ? (line.isFirstInParagraph ?? false) : true;
-        const shouldFadeOut = config.fadeParagraphOnly ? (line.isLastInParagraph ?? false) : true;
-        let opacity = 1;
-        if (shouldFadeIn && time < entryT + dur) opacity = Math.max(0, (time - entryT) / dur);
-        if (shouldFadeOut && time > exitT - dur) opacity = Math.min(opacity, Math.max(0, (exitT - time) / dur));
-        return Math.max(0, Math.min(1, opacity));
+        const fadeIn = (config.fadeDurationMs ?? 666) / 1000;
+        const entry = line.entryTime ?? line.startTime - entryBuf;
+        const exit = line.displayEndTime ?? line.endTime + 1;
+        const fadeOut = Math.min((config.fadeOutDurationMs ?? config.fadeDurationMs ?? 666) / 1000, Math.max(0, exit - line.endTime));
+        const shouldFadeIn = !config.fadeParagraphOnly || line.isFirstInParagraph;
+        const shouldFadeOut = !config.fadeParagraphOnly || line.isLastInParagraph;
+        const inOpacity = shouldFadeIn && fadeIn > 0 ? (time - entry) / fadeIn : 1;
+        const outOpacity = shouldFadeOut && fadeOut > 0 ? (exit - time) / fadeOut : 1;
+        return Math.max(0, Math.min(1, inOpacity, outOpacity));
     };
 
     const drawShadowStrokeText = (dcx, text, x, y, colorOrGrad, width, extraPx) => {
@@ -458,7 +451,7 @@ function drawLyricsOnCanvas(ctx, lyrics, time, config, entryBuf) {
                             }
                         };
 
-                        if (item.rubyChars && item.rubyChars.length > 1) {
+                        if (item.rubyChars?.length) {
                             const rfwStr = config.rubyBold ? 'bold' : 'normal';
                             const flatChars = [];
                             for (const rc of item.rubyChars) {
@@ -471,8 +464,7 @@ function drawLyricsOnCanvas(ctx, lyrics, time, config, entryBuf) {
                             let flatIdx = 0;
                             for (let ri = 0; ri < item.rubyChars.length; ri++) {
                                 const rc = item.rubyChars[ri];
-                                const rcStart = gStart + (rc.offsetSec || (gEnd - gStart) * ri / item.rubyChars.length);
-                                const rcEnd = (ri + 1 < item.rubyChars.length) ? gStart + (item.rubyChars[ri + 1].offsetSec || (gEnd - gStart) * (ri + 1) / item.rubyChars.length) : gEnd;
+                                const { start: rcStart, end: rcEnd } = rubySegmentBounds(item.rubyChars, ri, gStart, gEnd);
                                 const rcSpan = rcEnd - rcStart;
                                 const subChars = [...rc.char];
 
@@ -515,10 +507,10 @@ function drawLyricsOnCanvas(ctx, lyrics, time, config, entryBuf) {
                     for (let ci = 0; ci < item.chars.length; ci++) {
                         const c = item.chars[ci];
                         let pInfo;
-                        if (item.rubyChars && item.rubyChars.length > 1) {
+                        if (item.rubyChars?.length) {
                             const rawPct = calcGroupedProgress(item.chars, item.rubyChars, ci, time);
                             pInfo = calcProgress(c.text, time, c.startTime, c.endTime, false, config, rawPct);
-                        } else if (item.ruby2Chars && item.ruby2Chars.length > 1) {
+                        } else if (item.ruby2Chars?.length) {
                             const rawPct = calcGroupedProgress(item.chars, item.ruby2Chars, ci, time);
                             pInfo = calcProgress(c.text, time, c.startTime, c.endTime, false, config, rawPct);
                         } else {
@@ -609,7 +601,7 @@ function drawLyricsOnCanvas(ctx, lyrics, time, config, entryBuf) {
                             }
                         };
 
-                        if (item.ruby2Chars && item.ruby2Chars.length > 1) {
+                        if (item.ruby2Chars?.length) {
                             const r2fwStr = config.ruby2Bold ? 'bold' : 'normal';
                         
                         // 【对齐修正】预先算好每一个 token block 的总宽，和单字符的独立测量值
@@ -633,8 +625,7 @@ function drawLyricsOnCanvas(ctx, lyrics, time, config, entryBuf) {
 
                             for (let ri = 0; ri < item.ruby2Chars.length; ri++) {
                                 const syl = r2Syllables[ri];
-                                const rcStart = gStart + (syl.offsetSec || (gEnd - gStart) * ri / item.ruby2Chars.length);
-                                const rcEnd = (ri + 1 < item.ruby2Chars.length) ? gStart + (r2Syllables[ri + 1].offsetSec || (gEnd - gStart) * (ri + 1) / item.ruby2Chars.length) : gEnd;
+                                const { start: rcStart, end: rcEnd } = rubySegmentBounds(item.ruby2Chars, ri, gStart, gEnd);
                                 // calcProgress 的 ink-aware 进度（支持负值/超100），对齐 DOM 与主字/注音1
                                 const chInfo = calcProgress(item.ruby2Chars[ri].char, time, rcStart, rcEnd, true, config, undefined,
                                     { fs: r2fs, pad: r2lw, bold: config.ruby2Bold, letterSpacing: r2ls });

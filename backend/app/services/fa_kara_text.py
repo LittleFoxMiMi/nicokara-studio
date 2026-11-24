@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from uuid import uuid4
 
 from pykakasi import kakasi
 
@@ -254,6 +255,42 @@ def tokenize_fa_kara(text: str, *, language: str = "jp") -> list[tuple[int, int,
         ranges.append((index, index + 1, reading))
         index += 1
     return ranges
+
+
+def prepare_japanese_kana_units(lines: list[dict[str, Any]], *, overwrite_locked: bool = False) -> None:
+    """Repair old edited lines that stored an entire kana run in one unit."""
+    for line in lines:
+        units = line.get("units", [])
+        rebuilt = []
+        covered_chars = 0
+        for original in units:
+            surface = str(original.get("surface") or "")
+            annotated = bool(original.get("ruby") or original.get("ruby_2"))
+            if annotated:
+                covered_chars = max(covered_chars, int(original.get("ruby_span") or len(surface)))
+            if (covered_chars > 0 or len(surface) < 2 or not any(is_kana(char) for char in surface)
+                    or (original.get("locked") and not overwrite_locked)):
+                rebuilt.append(original)
+                covered_chars = max(0, covered_chars - len(surface))
+                continue
+            tokens = tokenize_fa_kara(surface)
+            if len(tokens) < 2:
+                rebuilt.append(original)
+                continue
+            for index, (left, right, reading) in enumerate(tokens):
+                unit = {**original, "surface": surface[left:right]}
+                if index:
+                    unit["id"] = str(uuid4())
+                if reading:
+                    unit["alignment_reading"] = reading
+                else:
+                    unit.pop("alignment_reading", None)
+                start, end = original.get("start_ms"), original.get("end_ms")
+                if start is not None and end is not None:
+                    unit["start_ms"] = round(start + (end - start) * left / len(surface))
+                    unit["end_ms"] = round(start + (end - start) * right / len(surface))
+                rebuilt.append(unit)
+        line["units"] = rebuilt
 
 
 def split_fa_kara_ranges(text: str, *, language: str = "jp") -> list[tuple[int, int]]:

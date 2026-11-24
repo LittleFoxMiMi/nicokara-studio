@@ -128,7 +128,7 @@ export function updateRubyRange(
             return unitStart >= group.start && unitStart < group.end && (overlapsNext || isReplaced);
           });
           if (!belongsToClearedGroup || (!unit.ruby && !unit.ruby_2 && !unit.ruby_span)) return unit;
-          return { ...unit, ruby: null, ruby_2: null, ruby_span: undefined, ruby_source: "none" };
+          return { ...unit, ruby: null, ruby_2: null, ruby_span: undefined, ruby_timing: undefined, ruby_source: "none" };
         });
         offset = 0;
         const reading = ruby.trim();
@@ -142,6 +142,7 @@ export function updateRubyRange(
             ruby: reading || null,
             ruby_2: secondReading || null,
             ruby_span: nextEnd - nextStart,
+            ruby_timing: undefined,
             ruby_source: "manual",
             alignment_reading: undefined,
           };

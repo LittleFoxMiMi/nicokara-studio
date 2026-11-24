@@ -60,6 +60,8 @@ def save_settings(payload: SettingsPayload, request: Request):
     if separator_device not in {None, "auto", "directml", "cpu"} or whisper_device not in {None, "auto", "cpu"}:
         raise HTTPException(422, "当前版本仅支持 DirectML/CPU 分离和 CPU Whisper")
     integer_ranges = {
+        "export_video_target_bitrate_kbps": (500, 200000, "目标视频码率"),
+        "export_video_max_bitrate_kbps": (500, 200000, "最大视频码率"),
         "export_mp4_crf": (0, 51, "MP4 CRF"),
         "export_webm_crf": (0, 63, "WebM CRF"),
         "export_vp9_cpu_used": (0, 8, "VP9 编码速度"),
@@ -69,6 +71,14 @@ def save_settings(payload: SettingsPayload, request: Request):
         value = values.get(key)
         if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < minimum or value > maximum):
             raise HTTPException(422, f"{label} 必须是 {minimum} 到 {maximum} 的整数")
+    if "export_video_rate_control" in values and values["export_video_rate_control"] not in ("two_pass", "crf"):
+        raise HTTPException(422, "视频编码模式无效")
+    bitrate_keys = ("export_video_target_bitrate_kbps", "export_video_max_bitrate_kbps")
+    if any(key in values for key in bitrate_keys):
+        configured = {**request.app.state.database.settings(), **values}
+        target, maximum = (configured.get(key) for key in bitrate_keys)
+        if target is None or maximum is None or maximum < target:
+            raise HTTPException(422, "最大视频码率必须大于或等于目标视频码率")
     gop_seconds = values.get("export_gop_seconds")
     if gop_seconds is not None and (
         isinstance(gop_seconds, bool) or not isinstance(gop_seconds, (int, float)) or gop_seconds < 0.5 or gop_seconds > 10

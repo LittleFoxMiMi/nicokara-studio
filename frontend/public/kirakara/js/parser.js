@@ -27,12 +27,13 @@ function parseKanaTimeAxis(rawKana, currentTime) {
     while ((km = kanaTimeRegex.exec(rawKana)) !== null) {
         hasTimestamps = true;
         const ch = rawKana.slice(lastIdx, km.index);
+        const nextTime = parseTimeToSeconds(km[0]);
         if (ch) {
             plainText += ch;
             if (baseTime === null) baseTime = kCurrentTime;
-            rubyChars.push({ char: ch, offsetSec: Math.max(0, kCurrentTime - baseTime) });
+            rubyChars.push({ char: ch, offsetSec: Math.max(0, kCurrentTime - baseTime), endOffsetSec: Math.max(0, nextTime - baseTime) });
         }
-        kCurrentTime = parseTimeToSeconds(km[0]);
+        kCurrentTime = nextTime;
         if (baseTime === null) baseTime = kCurrentTime;
         lastIdx = km.index + km[0].length;
     }
@@ -218,11 +219,11 @@ function parseLyrics(lrcRaw, entryBuf, config) {
                             }
                             if (ka1.plainText) { 
                                 kt.ruby = ka1.plainText; 
-                                kt.rubyChars = ka1.rubyChars && ka1.rubyChars.length > 1 ? ka1.rubyChars : null; 
+                                kt.rubyChars = ka1.hasTimestamps ? ka1.rubyChars : null;
                             }
                             if (ka2 && ka2.plainText) { 
                                 kt.ruby2 = ka2.plainText; 
-                                kt.ruby2Chars = ka2.rubyChars && ka2.rubyChars.length > 1 ? ka2.rubyChars : null; 
+                                kt.ruby2Chars = ka2.hasTimestamps ? ka2.rubyChars : null;
                             }
                             firstFound = true;
                         }
@@ -342,61 +343,27 @@ function parseLyrics(lrcRaw, entryBuf, config) {
         }
     }
 
-    // 段落检测
-    const EXIT_BUF = 2.0;
-    const ENTRY_BUF = 2.0;
-    const paraEntryBuf = config.indicatorEnabled ? entryBuf : ENTRY_BUF;
-    let paraIdx = 0, lineInPara = 0;
-    let paraStartTime = lyrics.length > 0 ? lyrics[0].startTime : 0;
+    let paragraph = 0;
+    let paragraphStart = 0;
+    const paragraphGap = entryBuf + 2;
     for (let i = 0; i < lyrics.length; i++) {
-        if (i > 0 && lyrics[i].startTime - lyrics[i - 1].endTime > paraEntryBuf + EXIT_BUF) {
-            paraIdx++; lineInPara = 0; paraStartTime = lyrics[i].startTime;
+        const line = lyrics[i];
+        const previous = lyrics[i - 1];
+        if (previous && line.startTime - previous.endTime > paragraphGap) {
+            paragraph++;
+            paragraphStart = i;
         }
-        lyrics[i].paragraph = paraIdx;
-        lyrics[i].lineInParagraph = lineInPara;
-        lyrics[i].paraStartTime = paraStartTime;
-        lyrics[i].entryTime = lyrics[i].startTime - entryBuf;
-        lyrics[i].walkDoneTime = lyrics[i].endTime;
-        lineInPara++;
-    }
-
-    // 首对行同步
-    for (let i = 0; i < lyrics.length; i++) {
-        if (lyrics[i].lineInParagraph === 1) {
-            lyrics[i].entryTime = lyrics[i].paraStartTime - entryBuf;
-        }
-    }
-
-    // 段内同行间隙
-    for (let i = 0; i < lyrics.length - 2; i++) {
-        const cur = lyrics[i], next = lyrics[i + 2];
-        if (next.paragraph !== cur.paragraph) continue;
-        if (next.entryTime > cur.endTime + EXIT_BUF) {
-            cur.walkDoneTime = cur.endTime + EXIT_BUF;
-            next.entryTime = cur.walkDoneTime;
-        }
-    }
-
-    // 走字延长保护（指示灯）
-    if (config.indicatorEnabled) {
-        const WALK_PROTECT = 1, PROTECT_MIN_MARGIN = 2.5;
-        for (let i = 0; i < lyrics.length - 2; i++) {
-            const cur = lyrics[i], next = lyrics[i + 2];
-            if (next.paragraph !== cur.paragraph) continue;
-            const proposed = cur.walkDoneTime + WALK_PROTECT;
-            if (next.startTime >= proposed + PROTECT_MIN_MARGIN) {
-                cur.walkDoneTime = proposed;
-            }
-        }
-    }
-
-    // 标记段首/尾行
-    for (let i = 0; i < lyrics.length; i++) {
         const next = lyrics[i + 1];
-        lyrics[i].isLastInParagraph = !next || next.paragraph !== lyrics[i].paragraph;
-        lyrics[i].isFirstInParagraph = lyrics[i].lineInParagraph <= 1;
+        const nextInParagraph = next && next.startTime - line.endTime <= paragraphGap;
+        const nextMidpoint = nextInParagraph ? (next.startTime + next.endTime) / 2 : Infinity;
+        line.paragraph = paragraph;
+        line.lineInParagraph = i - paragraphStart;
+        line.paraStartTime = lyrics[paragraphStart].startTime;
+        line.entryTime = line.lineInParagraph < 2 ? line.paraStartTime - entryBuf : lyrics[i - 2].displayEndTime;
+        line.displayEndTime = Math.max(line.endTime, Math.min(line.endTime + 1, nextMidpoint));
+        line.isFirstInParagraph = line.lineInParagraph < 2;
+        line.isLastInParagraph = !nextInParagraph;
     }
 
-    // 标记段首/尾行完毕，返回结果
     return lyrics;
 }

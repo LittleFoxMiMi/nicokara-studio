@@ -32,30 +32,27 @@ function calcProgress(text, time, startTime, endTime, isRuby, config, rawPctOver
 }
 
 // 多音节注音分组 → 分段走字（兼容注音1/2时序）
-function calcGroupedProgress(chars, rubyChars, charIndex, time) {
-    const N = rubyChars.length;
-    const K = chars.length;
-    const gStart = chars[0].startTime;
-    const gEnd = chars[K - 1].endTime;
-    const gSpan = gEnd - gStart;
+function rubySegmentBounds(rubyChars, index, groupStart, groupEnd) {
+    const span = groupEnd - groupStart;
+    const part = rubyChars[index];
+    const start = groupStart + (part.offsetSec ?? span * index / rubyChars.length);
+    const end = part.endOffsetSec != null ? groupStart + part.endOffsetSec
+        : index + 1 < rubyChars.length ? groupStart + (rubyChars[index + 1].offsetSec ?? span * (index + 1) / rubyChars.length)
+        : groupEnd;
+    return { start, end };
+}
 
-    let segIdx = 0;
-    for (let si = 0; si < N; si++) {
-        const segS = gStart + (rubyChars[si].offsetSec || 0);
-        const segE = (si < N - 1)
-            ? gStart + (rubyChars[si + 1].offsetSec || (gSpan * (si + 1) / N))
-            : gEnd;
-        if (time >= segS && time < segE) { segIdx = si; break; }
-        if (si === N - 1 && time >= segE) { segIdx = N - 1; break; }
-    }
-    const segS = gStart + (rubyChars[segIdx].offsetSec || 0);
-    const segE = (segIdx < N - 1)
-        ? gStart + (rubyChars[segIdx + 1].offsetSec || (gSpan * (segIdx + 1) / N))
-        : gEnd;
-    let segProg = 0;
-    if (time < gStart) segProg = 0;
-    else if (time >= gEnd) segProg = 1;
-    else segProg = Math.max(0, Math.min(1, (time - segS) / (segE - segS)));
-    const G = ((segIdx + segProg) / N) * K * 100;
-    return Math.max(0, Math.min(100, G - charIndex * 100));
+function calcGroupedProgress(chars, rubyChars, charIndex, time) {
+    const groupStart = chars[0].startTime;
+    const groupEnd = chars[chars.length - 1].endTime;
+    let total = 0;
+    let filled = 0;
+    rubyChars.forEach((part, index) => {
+        const width = [...part.char].length;
+        const { start, end } = rubySegmentBounds(rubyChars, index, groupStart, groupEnd);
+        const progress = end <= start ? Number(time >= end) : Math.max(0, Math.min(1, (time - start) / (end - start)));
+        filled += progress * width;
+        total += width;
+    });
+    return total ? Math.max(0, Math.min(100, (filled / total * chars.length - charIndex) * 100)) : 0;
 }

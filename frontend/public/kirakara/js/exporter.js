@@ -6,7 +6,7 @@ async function doExportCanvas({
     duration, totalTime,
     videoUrl, bgImageEnabled, bgImageUrl,
     titleBackgroundUrl,
-    audioUrl, expAudioBitrate, expAudioSampleRate, expAudioChannels,
+    audioUrl, expAudioBitrate, expAudioSampleRate, expAudioChannels, expVideoBitrate,
     parsedData, config, entryBuf,
     setExpProgress, setExpEta, setExporting,
     cancelRef,
@@ -84,7 +84,7 @@ async function doExportCanvas({
         // ========== 第4层：Encoder 初始化（PNG 序列模式跳过） ==========
         let actualCodec = null;
         if (!isPngSeq) {
-            encoder = KiraExport.Encoder({ width: w, height: h, fps, codec: expCodec, format: expFormat });
+            encoder = KiraExport.Encoder({ width: w, height: h, fps, codec: expCodec, format: expFormat, bitrate: expVideoBitrate });
             actualCodec = await encoder.start();
         }
 

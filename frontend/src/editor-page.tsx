@@ -9,6 +9,7 @@ import {
   FileVideo,
   GripVertical,
   LoaderCircle,
+  Pencil,
   RotateCcw,
   Redo2,
   Save,
@@ -30,9 +31,11 @@ import type {
   ProjectLanguage,
 } from "./editor-types";
 import { api, formatTime, parseTime } from "./editor-types";
+import { replaceLyricLineText } from "./lyric-line-edit";
 import { LyricsImportDialog } from "./lyrics-import-dialog";
 import { RubyRangeEditor } from "./ruby-range-editor";
 import { lineCharacterCount, rubyRanges, unitCharacterRange, updateRubyRange } from "./ruby-range";
+import { initialRubyTiming, retimeRubyGroup, rubyGroupEnd, timedBounds } from "./ruby-timing";
 import { TimelineCanvas } from "./timeline-canvas";
 import { SubtitleDomRenderer } from "./subtitle/dom-renderer";
 import { normalizeSubtitleStyle, type SubtitleStyle } from "./subtitle/style-schema";
@@ -72,9 +75,11 @@ function updateUnit(
       ...document.lyrics,
       lines: document.lyrics.lines.map((line) => {
         if (line.id !== lineId) return line;
-        const units = line.units.map((unit) =>
-          unit.id === unitId ? { ...unit, ...patch } : unit,
-        );
+        const units = line.units.map((unit) => {
+          if (unit.id !== unitId) return unit;
+          const rubyChanged = ("ruby" in patch && patch.ruby !== unit.ruby) || ("surface" in patch && patch.surface !== unit.surface);
+          return { ...unit, ...patch, ...(rubyChanged ? { ruby_timing: undefined } : {}) };
+        });
         const timed = units.filter(
           (unit) => unit.start_ms !== null && unit.end_ms !== null,
         );
@@ -159,9 +164,9 @@ function updateRubyGroup(
         return {
           ...line,
           units: line.units.map((unit) => {
-            if (unit.id === firstId) return { ...unit, ruby, ruby_2: ruby2 || null, ruby_span: rubySpan, ruby_source: "manual" };
-            if (selected.has(unit.id)) return { ...unit, ruby: null, ruby_2: null, ruby_span: undefined, ruby_source: "manual" };
-            if (cleared.has(unit.id)) return { ...unit, ruby: null, ruby_2: null, ruby_span: undefined, ruby_source: "none" };
+            if (unit.id === firstId) return { ...unit, ruby, ruby_2: ruby2 || null, ruby_span: rubySpan, ruby_timing: undefined, ruby_source: "manual" };
+            if (selected.has(unit.id)) return { ...unit, ruby: null, ruby_2: null, ruby_span: undefined, ruby_timing: undefined, ruby_source: "manual" };
+            if (cleared.has(unit.id)) return { ...unit, ruby: null, ruby_2: null, ruby_span: undefined, ruby_timing: undefined, ruby_source: "none" };
             return unit;
           }),
         };
@@ -190,6 +195,7 @@ function updateProjectLanguage(document: ProjectDocument, language: ProjectLangu
           ruby: null,
           ruby_2: null,
           ruby_span: undefined,
+          ruby_timing: undefined,
           ruby_source: "none",
           alignment_reading: undefined,
         })),
@@ -278,6 +284,11 @@ function placeLineAt(
             ...unit,
             start_ms: Math.round(startMs + placedSpan * relativeStart),
             end_ms: Math.round(startMs + placedSpan * relativeEnd),
+            ruby_timing: fullyTimed ? unit.ruby_timing?.map((part) => ({
+              ...part,
+              start_ms: Math.round(startMs + placedSpan * (part.start_ms - originalStart) / span),
+              end_ms: Math.round(startMs + placedSpan * (part.end_ms - originalStart) / span),
+            })) : undefined,
             timing_source: fullyTimed || line.units.length === 1 ? "manual" : "estimated",
             timing_confidence: fullyTimed || line.units.length === 1 ? 1 : null,
           };
@@ -346,6 +357,7 @@ function splitLyricUnit(
             timing_confidence: ranges.length > 1 ? null : original.timing_confidence,
             ruby: first ? original.ruby : null,
             ruby_2: first ? original.ruby_2 : null,
+            ruby_timing: first ? original.ruby_timing : undefined,
             ruby_source: first ? original.ruby_source : "none",
           };
           delete unit.alignment_reading;
@@ -453,6 +465,40 @@ function UnitSplitDialog({ unit, onClose, onConfirm }: {
         <button className="button text" type="button" onClick={onClose}>取消</button>
       </div>
     </section>
+  </div>;
+}
+
+function LineEditDialog({ line, onClose, onSave }: {
+  line: LyricLine;
+  onClose: () => void;
+  onSave: (text: string) => void;
+}) {
+  const original = line.units.map((unit) => unit.surface).join("");
+  const [text, setText] = useState(original);
+  const valid = Boolean(text.trim()) && text.trim() !== original;
+  return <div className="scrim">
+    <form className="dialog unit-dialog" role="dialog" aria-modal="true" aria-labelledby="line-edit-title"
+      onSubmit={(event) => { event.preventDefault(); if (valid) onSave(text); }}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") onClose();
+        if ((event.ctrlKey || event.metaKey) && ["z", "y"].includes(event.key.toLowerCase())) event.stopPropagation();
+      }}>
+      <div className="dialog-head">
+        <div>
+          <h2 id="line-edit-title">修改歌词</h2>
+          <p className="muted">保存后将使用整句时间，保留仍在句中的词组注音。</p>
+        </div>
+        <button type="button" className="icon-button" title="关闭" onClick={onClose}><X size={20} /></button>
+      </div>
+      <label className="field-label">
+        歌词正文
+        <input autoFocus value={text} onChange={(event) => setText(event.target.value)} />
+      </label>
+      <div className="dialog-actions">
+        <button type="button" className="button text" onClick={onClose}>取消</button>
+        <button type="submit" className="button filled" disabled={!valid}><Check size={17} />保存</button>
+      </div>
+    </form>
   </div>;
 }
 
@@ -605,6 +651,8 @@ export function EditorPage({ id }: { id: string }) {
     [error, setError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null),
     [editingId, setEditingId] = useState<string | null>(null);
+  const [expandedRubyId, setExpandedRubyId] = useState<string | null>(null);
+  const [rubyPartTarget, setRubyPartTarget] = useState<{ lineId: string; unitId: string; index: number } | null>(null);
   const [rubyEditorTarget, setRubyEditorTarget] = useState<RubyEditorTarget | null>(null);
   const [importOpen, setImportOpen] = useState(false),
     [isPlaying, setIsPlaying] = useState(false);
@@ -623,7 +671,8 @@ export function EditorPage({ id }: { id: string }) {
   const [faKaraModel, setFaKaraModel] = useState<"mms" | "yohane">("mms");
   const [stylePresets, setStylePresets] = useState<StylePreset[]>([]);
   const [fullSteps, setFullSteps] = useState<Record<string, boolean>>({ separation: true, transcription: true, pronunciation: true, global_alignment: true, alignment: true });
-  const [lineMenu, setLineMenu] = useState<{ lineId: string; unitId: string | null; x: number; y: number } | null>(null);
+  const [lineMenu, setLineMenu] = useState<{ lineId: string; unitId: string | null; fromLyrics?: boolean; x: number; y: number } | null>(null);
+  const [editingLineId, setEditingLineId] = useState<string | null>(null);
   const [splitTarget, setSplitTarget] = useState<{ lineId: string; unitId: string } | null>(null);
   const uploadRequest = useRef<XMLHttpRequest | null>(null),
     videoRef = useRef<HTMLVideoElement>(null);
@@ -1707,11 +1756,11 @@ export function EditorPage({ id }: { id: string }) {
                     key={line.id}
                     className={`lyric-line ${active ? "active" : ""}`}
                     draggable
-                    title="拖到时间轴设置时间"
+                    title="右键修改歌词，或拖到时间轴设置时间"
                     onContextMenu={(event) => {
                       event.preventDefault();
-                      if (!hasVideo || activeJob) return;
-                      setLineMenu({ lineId: line.id, unitId: null, x: event.clientX, y: event.clientY });
+                      if (activeJob) return;
+                      setLineMenu({ lineId: line.id, unitId: null, fromLyrics: true, x: event.clientX, y: event.clientY });
                     }}
                     onDragStart={(event) => {
                       event.dataTransfer.effectAllowed = "move";
@@ -1788,6 +1837,14 @@ export function EditorPage({ id }: { id: string }) {
             const current = documentRef.current;
             if (current) replaceDocument(updateRubyGroup(current, lineId, unitIds, ruby, ruby2, rubySpan, clearUnitIds), true);
           }}
+          expandedRubyId={expandedRubyId}
+          onUpdateRubyTiming={(lineId, unitId, start, end, timing) => {
+            const current = documentRef.current;
+            if (!current) return;
+            const updated = current.lyrics.lines.map((line) => line.id === lineId ? retimeRubyGroup(line, unitId, start, end, timing) : line);
+            replaceDocument({ ...current, lyrics: { ...current.lyrics, lines: updated } }, false);
+          }}
+          onOpenRubyPart={(lineId, unitId, index) => setRubyPartTarget({ lineId, unitId, index })}
           rubyEnabled={language === "jp"}
           onOpenEditor={setEditingId}
           onDropLine={placeLine}
@@ -1834,14 +1891,85 @@ export function EditorPage({ id }: { id: string }) {
           setSplitTarget(null);
         }} />;
       })()}
+      {rubyPartTarget && (() => {
+        const line = lines.find((item) => item.id === rubyPartTarget.lineId);
+        const unitIndex = line?.units.findIndex((item) => item.id === rubyPartTarget.unitId) ?? -1;
+        if (!line || unitIndex < 0) return null;
+        const unit = line.units[unitIndex];
+        const bounds = timedBounds(line.units.slice(unitIndex, rubyGroupEnd(line.units, unitIndex)));
+        if (!bounds) return null;
+        const timing = initialRubyTiming(unit, bounds.start_ms, bounds.end_ms);
+        const index = rubyPartTarget.index;
+        const part = timing[index];
+        if (!part) return null;
+        const min = timing[index - 1]?.end_ms ?? bounds.start_ms;
+        const max = timing[index + 1]?.start_ms ?? bounds.end_ms;
+        return <div className="scrim">
+          <form className="dialog" role="dialog" aria-modal="true" aria-labelledby="ruby-timing-title" onSubmit={(event) => {
+            event.preventDefault();
+            const data = new FormData(event.currentTarget);
+            const start = Number(data.get("start"));
+            const end = Number(data.get("end"));
+            if (end < start) {
+              const field = event.currentTarget.elements.namedItem("end") as HTMLInputElement;
+              field.setCustomValidity("结束时间不能早于开始时间");
+              field.reportValidity();
+              return;
+            }
+            const current = documentRef.current;
+            if (!current) return;
+            const edited = timing.map((item, i) => i === index ? { ...item, start_ms: start, end_ms: end } : item);
+            const updated = current.lyrics.lines.map((item) => item.id === line.id
+              ? retimeRubyGroup(item, unit.id, bounds.start_ms, bounds.end_ms, edited) : item);
+            replaceDocument({ ...current, lyrics: { ...current.lyrics, lines: updated } }, true);
+            setRubyPartTarget(null);
+          }} onInput={(event) => (event.currentTarget.elements.namedItem("end") as HTMLInputElement).setCustomValidity("")}>
+            <div className="dialog-head"><h2 id="ruby-timing-title">微调 Ruby「{part.text}」</h2></div>
+            <label className="field-label">开始时间（ms）<input type="number" name="start" autoFocus required min={min} max={max} defaultValue={part.start_ms} /></label>
+            <label className="field-label">结束时间（ms）<input type="number" name="end" required min={min} max={max} defaultValue={part.end_ms} /></label>
+            <div className="dialog-actions">
+              <button type="button" className="button outlined" onClick={() => setRubyPartTarget(null)}>取消</button>
+              <button className="button filled" type="submit">保存</button>
+            </div>
+          </form>
+        </div>;
+      })()}
+      {editingLineId && (() => {
+        const line = lines.find((item) => item.id === editingLineId);
+        if (!line) return null;
+        return <LineEditDialog key={line.id} line={line} onClose={() => setEditingLineId(null)} onSave={(text) => {
+          const current = documentRef.current;
+          if (!current) return;
+          const source = current.lyrics.lines.find((item) => item.id === line.id);
+          if (!source) return;
+          const updated = replaceLyricLineText(source, text, createClientId);
+          if (updated !== source) {
+            const lines = current.lyrics.lines.map((item) => item.id === updated.id ? updated : item);
+            replaceDocument({ ...current, lyrics: { ...current.lyrics, lines } }, true);
+            if (source.units.some((unit) => unit.id === expandedRubyId)) setExpandedRubyId(null);
+            selectLine(updated);
+          }
+          setEditingLineId(null);
+        }} />;
+      })()}
       {lineMenu && (() => {
-        const index = lines.findIndex((line) => line.id === lineMenu.lineId);
-        const menuLine = lines[index];
+        const menuLine = lines.find((line) => line.id === lineMenu.lineId);
+        if (!menuLine) return null;
         const menuUnit = lineMenu.unitId ? menuLine?.units.find((unit) => unit.id === lineMenu.unitId) : null;
-        return <div className="line-context-menu" style={{ left: lineMenu.x, top: lineMenu.y }} onPointerDown={(event) => event.stopPropagation()}>
-          <strong>时间单元</strong>
-          <button disabled={menuLine?.timing_precision === "line"} onClick={() => { setLineMenu(null); collapseLine(lineMenu.lineId); }}>还原为整句时间单元</button>
-          <button disabled={menuLine?.start_ms === null || menuLine?.end_ms === null} onClick={() => { setLineMenu(null); effectiveAlignmentBackend === "fa_kara" ? void startFaKara([lineMenu.lineId]) : void startAlignment([lineMenu.lineId]); }}>
+        return <div className="line-context-menu" style={{ left: Math.min(lineMenu.x, window.innerWidth - 250), top: Math.min(lineMenu.y, window.innerHeight - 176) }} onPointerDown={(event) => event.stopPropagation()}>
+          <strong>{lineMenu.fromLyrics ? "歌词" : "时间单元"}</strong>
+          {lineMenu.fromLyrics && <button onClick={() => {
+            setLineMenu(null);
+            setEditingLineId(menuLine.id);
+          }}><Pencil size={15} />修改歌词</button>}
+          {language === "jp" && menuUnit?.ruby && menuLine?.timing_precision !== "line" && (
+            <button onClick={() => {
+              setExpandedRubyId(expandedRubyId === menuUnit.id ? null : menuUnit.id);
+              setLineMenu(null);
+            }}>{expandedRubyId === menuUnit.id ? "还原为汉字词组" : "微调 Ruby 时间轴"}</button>
+          )}
+          <button disabled={menuLine.timing_precision === "line"} onClick={() => { setLineMenu(null); collapseLine(lineMenu.lineId); }}>还原为整句时间单元</button>
+          <button disabled={!hasVideo || menuLine.start_ms === null || menuLine.end_ms === null} onClick={() => { setLineMenu(null); effectiveAlignmentBackend === "fa_kara" ? void startFaKara([lineMenu.lineId]) : void startAlignment([lineMenu.lineId]); }}>
             {effectiveAlignmentBackend === "fa_kara" ? "用 FA-Kara 重新识别此句" : "用 stable-ts 重新识别此句"}
           </button>
           {menuUnit && Array.from(menuUnit.surface).length > 1 && <button onClick={() => { setLineMenu(null); setSplitTarget({ lineId: lineMenu.lineId, unitId: menuUnit.id }); }}><Scissors size={15} />拆分此 Unit</button>}

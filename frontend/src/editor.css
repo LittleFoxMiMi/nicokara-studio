@@ -946,3 +946,14 @@
 .unit-dialog .field-label {
   font-size: 13px;
 }
+
+.timeline-ruby-parts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border-bottom: 1px solid #f2c398;
+  background: #fff7ed;
+  color: #854107;
+}

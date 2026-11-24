@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Callable
 
 from app.core.config import Settings
-from app.core.defaults import DEFAULT_SUBTITLE_STYLE
+from app.core.defaults import DEFAULT_APP_SETTINGS, DEFAULT_SUBTITLE_STYLE
+from app.services.punctuation_timing import punctuation_export_units, valid_ruby_timing
 
 
 class ExportError(RuntimeError):
@@ -26,6 +27,20 @@ def _timestamp(ms: int | float) -> str:
     return f"[{value // 60000:02d}:{(value % 60000) // 1000:02d}.{(value % 1000) // 10:02d}]"
 
 
+def _ruby_timestamp(ms: int | float) -> str:
+    value = max(0, round(ms))
+    return f"[{value // 60000:02d}:{(value % 60000) // 1000:02d}.{value % 1000:03d}]"
+
+
+def _timed_ruby(unit: dict, start: int, end: int) -> str | None:
+    if not valid_ruby_timing(unit, start, end):
+        return None
+    return "".join(
+        f"{_ruby_timestamp(part['start_ms'])}{_escape(part['text'])}{_ruby_timestamp(part['end_ms'])}"
+        for part in unit["ruby_timing"]
+    )
+
+
 def _escape(value: object) -> str:
     return str(value or "").replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
 
@@ -34,6 +49,25 @@ def document_to_lrc(document: dict) -> str:
     rows: list[str] = []
     for line in document.get("lyrics", {}).get("lines", []):
         units = [unit for unit in line.get("units", []) if unit.get("surface")]
+        punctuation_units = punctuation_export_units(line, units)
+        timestamp = _ruby_timestamp if punctuation_units is not None else _timestamp
+        line_start, line_end = line.get("start_ms"), line.get("end_ms")
+        if punctuation_units is not None:
+            units = punctuation_units
+        elif (units and line.get("timing_precision") == "line" and line_start is not None and line_end is not None
+                and all(unit.get("start_ms") is None for unit in units)):
+            # Edited lines only store line bounds. Distribute them by character
+            # for export, as the preview does for line-level highlighting.
+            character_count = sum(len(unit["surface"]) for unit in units)
+            cursor = line_start
+            offset = 0
+            timed_units = []
+            for unit in units:
+                offset += len(unit["surface"])
+                end = line_start + (line_end - line_start) * offset / character_count
+                timed_units.append({**unit, "start_ms": cursor, "end_ms": end})
+                cursor = end
+            units = timed_units
         current_role = ""
         body: list[str] = []
         index = 0
@@ -68,28 +102,40 @@ def document_to_lrc(document: dict) -> str:
                 while target_chars > 1 and char_count < target_chars and member_end < len(units):
                     char_count += len(str(units[member_end].get("surface") or ""))
                     member_end += 1
-                while target_chars <= 1 and member_end < len(units):
+                while not raw_span and member_end < len(units):
                     next_unit = units[member_end]
                     if next_unit.get("ruby") != unit.get("ruby") or next_unit.get("ruby_2") != unit.get("ruby_2"):
                         break
                     member_end += 1
                 members = units[index:member_end]
                 grouped_surface = _escape("".join(str(member.get("surface") or "") for member in members))
-                body.append(f"{_timestamp(start)}{prefix}{{{grouped_surface}|{_escape(ruby_text)}}}")
-                member_ends = [member.get("end_ms") for member in members if member.get("end_ms") is not None]
-                timeline_cursor = max(timeline_cursor, max(member_ends) if member_ends else start)
+                member_ends = [member["end_ms"] for member in members if member.get("end_ms") is not None]
+                group_end = max(member_ends) if member_ends else start
+                timed_ruby = _timed_ruby(unit, start, group_end) if line.get("timing_precision") != "line" else None
+                if timed_ruby is not None:
+                    second = f">{_escape(unit['ruby_2'])}" if unit.get("ruby_2") else ""
+                    body.append(f"{_ruby_timestamp(start)}{prefix}{{{grouped_surface}|{timed_ruby}{second}}}{_ruby_timestamp(group_end)}")
+                else:
+                    body.append(f"{timestamp(start)}{prefix}{{{grouped_surface}|{_escape(ruby_text)}}}")
+                    if punctuation_units is not None:
+                        body.append(timestamp(group_end))
+                timeline_cursor = max(timeline_cursor, group_end)
                 index += len(members)
                 continue
             surface = _escape(unit.get("surface"))
             if len(str(unit.get("surface"))) == 1:
-                body.append(f"{_timestamp(start)}{prefix}{surface}")
+                body.append(f"{timestamp(start)}{prefix}{surface}")
             else:
                 chars = list(str(unit.get("surface")))
-                body.extend(f"{_timestamp(start + (end - start) * char_index / len(chars))}{prefix if char_index == 0 else ''}{_escape(char)}" for char_index, char in enumerate(chars))
+                body.extend(f"{timestamp(start + (end - start) * char_index / len(chars))}{prefix if char_index == 0 else ''}{_escape(char)}" for char_index, char in enumerate(chars))
+            if punctuation_units is not None:
+                body.append(timestamp(end))
             timeline_cursor = max(timeline_cursor, unit.get("end_ms") if unit.get("end_ms") is not None else start)
             index += 1
         fallback_end = line.get("end_ms") if line.get("end_ms") is not None else (line.get("start_ms") or 0) + 500
-        rows.append("".join(body) + _timestamp(fallback_end))
+        last_tag = timestamp(fallback_end)
+        encoded = "".join(body)
+        rows.append(encoded if punctuation_units is not None and encoded.endswith(last_tag) else encoded + last_tag)
     return "\n".join(rows)
 
 
@@ -120,7 +166,7 @@ def document_to_config(document: dict) -> dict:
         "strokeColorBefore": str(raw.get("outlineColor", defaults["outlineColor"])), "strokeColorAfter": str(raw.get("outlineColor", defaults["outlineColor"])),
         "strokeWidth": number("outlineWidth", defaults["outlineWidth"]), "line1X": number("line1X", defaults["line1X"]) * 1280, "line1Y": number("line1Y", defaults["line1Y"]) * 720,
         "line2Right": number("line2Right", defaults["line2Right"]) * 1280, "line2Y": number("line2Y", defaults["line2Y"]) * 720,
-        "fadeEnabled": True, "fadeParagraphOnly": False, "fadeDurationMs": number("fadeInMs", 100),
+        "fadeEnabled": True, "fadeParagraphOnly": False, "fadeDurationMs": number("fadeInMs", 100), "fadeOutDurationMs": number("fadeOutMs", defaults["fadeOutMs"]),
         "indicatorEnabled": raw.get("showProgressDots", True), "indicatorDuration": 3, "indicatorSize": 34,
         "indicatorSpacing": 12, "indicatorStrokeWidth": 3, "indicatorStrokeColor": "#000000", "indicatorFillColor": "#ffffff",
         "characterProfiles": profiles, "songTitle": {"enabled": False},
@@ -177,58 +223,107 @@ def build_worker_html(settings: Settings, project_id: str, job_id: str, document
     entry_buf = (float(config.get("fadeDurationMs", 100)) / 1000 + 3.5) if config.get("indicatorEnabled") else 2
     base = f"{settings.export_base_url.rstrip('/')}{settings.api_prefix}/projects/{project_id}"
     fmt = str(payload.get("format", "mp4"))
-    data = {"lrc": document_to_lrc(document), "config": config, "entryBuf": entry_buf, "w": width, "h": height, "fps": fps, "duration": duration, "format": fmt, "videoUrl": f"{base}/video", "audioUrl": None, "progressUrl": f"{base}/export-worker/{job_id}/progress", "cancelUrl": f"{base}/export-worker/{job_id}/cancel", "resultUrl": f"{base}/export-worker/{job_id}/result", "errorUrl": f"{base}/export-worker/{job_id}/error"}
+    # Leave headroom over the delivery bitrate in the browser-composited master.
+    maximum = int(payload.get("video_max_bitrate_kbps") or DEFAULT_APP_SETTINGS["export_video_max_bitrate_kbps"])
+    intermediate_bitrate = min(240_000_000, max(50_000_000, 2 * maximum * 1000, round(width * height * fps * 0.8)))
+    data = {"intermediateBitrate": intermediate_bitrate, "lrc": document_to_lrc(document), "config": config, "entryBuf": entry_buf, "w": width, "h": height, "fps": fps, "duration": duration, "format": fmt, "videoUrl": f"{base}/video", "audioUrl": None, "progressUrl": f"{base}/export-worker/{job_id}/progress", "cancelUrl": f"{base}/export-worker/{job_id}/cancel", "resultUrl": f"{base}/export-worker/{job_id}/result", "errorUrl": f"{base}/export-worker/{job_id}/error"}
     encoded = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
     return f'''<!doctype html><meta charset="utf-8"><script src="/kirakara/vendor/mp4box.all.min.js"></script><script src="/kirakara/js/shared/title.js"></script><script src="/kirakara/js/shared/config.js"></script><script src="/kirakara/js/shared/measure.js"></script><script src="/kirakara/js/shared/progress.js"></script><script src="/kirakara/js/shared/utils.js"></script><script src="/kirakara/js/parser.js"></script><script src="/kirakara/js/muxer.js"></script><script src="/kirakara/js/codec.js"></script><script src="/kirakara/js/canvas-renderer.js"></script><script src="/kirakara/js/export/muxer.js"></script><script src="/kirakara/js/export/container-reader.js"></script><script src="/kirakara/js/export/decoder-provider.js"></script><script src="/kirakara/js/export/renderer.js"></script><script src="/kirakara/js/export/encoder.js"></script><script src="/kirakara/js/export/audio-encoder.js"></script><script src="/kirakara/js/exporter.js"></script><script>
 const d={encoded}; const cancelRef={{current:false}};
 setInterval(async()=>{{try{{const s=await fetch(d.cancelUrl).then(r=>r.json()); cancelRef.current=!!s.cancel_requested;}}catch{{}}}},500);
-(async()=>{{try{{const config=d.config; const parsedData=parseLyrics(d.lrc,d.entryBuf,config); const measure=document.createElement('canvas').getContext('2d'); const maxWidth=1280*(1-Number(config.safeAreaLeft||.08)-Number(config.safeAreaRight||.08)); parsedData.forEach(line=>{{let low=10,high=Number(config.fontSize||64),best=low; while(low<=high){{const size=Math.floor((low+high)/2); measure.font=(config.fontBold?'bold ':'')+size+'px '+config.fontFamily; const width=line.chars.reduce((sum,ch)=>sum+measure.measureText(ch.text||'').width+Number(config.letterSpacing||0),0); if(width<=maxWidth){{best=size;low=size+1;}}else high=size-1;}} line.fontSize=best;}}); await doExportCanvas({{w:d.w,h:d.h,fps:d.fps,expCodec:d.format==='mp4'?'h264':'vp9',expFormat:d.format,duration:d.duration,totalTime:d.duration,videoUrl:d.videoUrl,audioUrl:d.audioUrl,bgImageEnabled:false,bgImageUrl:null,titleBackgroundUrl:null,parsedData,config,entryBuf:d.entryBuf,cancelRef,setExpProgress:v=>fetch(d.progressUrl,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{progress:v/100,message:'正在逐帧渲染 Kirakara'}})}}),setExpEta:m=>fetch(d.progressUrl,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{progress:.5,message:m}})}}),setExporting:()=>{{}},onComplete:async(blob,filename)=>fetch(d.resultUrl,{{method:'POST',headers:{{'X-Output-Filename':filename}},body:blob}}),onError:e=>fetch(d.errorUrl,{{method:'POST',body:String(e?.message||e)}})}});}}catch(e){{await fetch(d.errorUrl,{{method:'POST',body:String(e?.message||e)}});}}}})();
+(async()=>{{try{{const config=d.config; const parsedData=parseLyrics(d.lrc,d.entryBuf,config); const measure=document.createElement('canvas').getContext('2d'); const maxWidth=1280*(1-Number(config.safeAreaLeft||.08)-Number(config.safeAreaRight||.08)); parsedData.forEach(line=>{{let low=10,high=Number(config.fontSize||64),best=low; while(low<=high){{const size=Math.floor((low+high)/2); measure.font=(config.fontBold?'bold ':'')+size+'px '+config.fontFamily; const width=line.chars.reduce((sum,ch)=>sum+measure.measureText(ch.text||'').width+Number(config.letterSpacing||0),0); if(width<=maxWidth){{best=size;low=size+1;}}else high=size-1;}} line.fontSize=best;}}); await doExportCanvas({{w:d.w,h:d.h,fps:d.fps,expCodec:d.format==='mp4'?'h264':'vp9',expFormat:d.format,expVideoBitrate:d.intermediateBitrate,duration:d.duration,totalTime:d.duration,videoUrl:d.videoUrl,audioUrl:d.audioUrl,bgImageEnabled:false,bgImageUrl:null,titleBackgroundUrl:null,parsedData,config,entryBuf:d.entryBuf,cancelRef,setExpProgress:v=>fetch(d.progressUrl,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{progress:v/100,message:'正在逐帧渲染 Kirakara'}})}}),setExpEta:m=>fetch(d.progressUrl,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{progress:.5,message:m}})}}),setExporting:()=>{{}},onComplete:async(blob,filename)=>fetch(d.resultUrl,{{method:'POST',headers:{{'X-Output-Filename':filename}},body:blob}}),onError:e=>fetch(d.errorUrl,{{method:'POST',body:String(e?.message||e)}})}});}}catch(e){{await fetch(d.errorUrl,{{method:'POST',body:String(e?.message||e)}});}}}})();
 </script>'''
 
 
+def _rate_control(payload: dict) -> str:
+    return payload.get("video_rate_control") or ("crf" if payload.get("video_crf") is not None else DEFAULT_APP_SETTINGS["export_video_rate_control"])
+
+
 def _encoding_args(fmt: str, fps: float, payload: dict) -> tuple[list[str], list[str]]:
+    defaults = DEFAULT_APP_SETTINGS
     output_fps = max(1.0, float(fps or 30))
-    crf = int(payload.get("video_crf", 32 if fmt == "webm" else 20))
-    audio_bitrate = int(payload.get("audio_bitrate_kbps", 192))
-    gop = str(max(1, round(output_fps * float(payload.get("gop_seconds", 2)))))
+    mode = _rate_control(payload)
+    if mode == "crf":
+        crf = int(payload.get("video_crf", defaults["export_webm_crf" if fmt == "webm" else "export_mp4_crf"]))
+        rate_args = ["-crf", str(crf)] + (["-b:v", "0"] if fmt == "webm" else [])
+    else:
+        target = int(payload.get("video_target_bitrate_kbps") or defaults["export_video_target_bitrate_kbps"])
+        maximum = int(payload.get("video_max_bitrate_kbps") or defaults["export_video_max_bitrate_kbps"])
+        rate_args = ["-b:v", f"{target}k", "-maxrate", f"{maximum}k", "-bufsize", f"{2 * maximum}k"]
+    audio_bitrate = int(payload.get("audio_bitrate_kbps", defaults["export_audio_bitrate_kbps"]))
+    gop = str(max(1, round(output_fps * float(payload.get("gop_seconds", defaults["export_gop_seconds"])))))
     if fmt == "webm":
-        cpu_used = int(payload.get("vp9_cpu_used", 2))
-        video_args = ["-c:v", "libvpx-vp9", "-crf", str(crf), "-b:v", "0", "-deadline", "good", "-cpu-used", str(cpu_used), "-g", gop]
+        cpu_used = int(payload.get("vp9_cpu_used", defaults["export_vp9_cpu_used"]))
+        video_args = ["-c:v", "libvpx-vp9", *rate_args, "-deadline", "good", "-cpu-used", str(cpu_used), "-g", gop]
         audio_args = ["-c:a", "libopus", "-b:a", f"{audio_bitrate}k"]
     else:
-        preset = str(payload.get("h264_preset") or "medium")
-        video_args = ["-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-g", gop, "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+        preset = str(payload.get("h264_preset") or defaults["export_h264_preset"])
+        video_args = ["-c:v", "libx264", "-preset", preset, *rate_args, "-g", gop, "-pix_fmt", "yuv420p"]
         audio_args = ["-c:a", "aac", "-b:a", f"{audio_bitrate}k", "-ar", "44100", "-ac", "2"]
     return video_args, audio_args
+
+
+def _run_encoding_pass(command: list[str], duration_ms: int, progress_range: tuple[float, float], message: str, progress_callback, should_cancel) -> None:
+    if should_cancel and should_cancel():
+        raise ExportCanceled("导出已取消")
+    if progress_callback:
+        progress_callback(progress_range[0], message)
+    with tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, text=True, encoding="utf-8", errors="replace")
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                if should_cancel and should_cancel():
+                    raise ExportCanceled("导出已取消")
+                if line.startswith("out_time_us=") and duration_ms:
+                    try:
+                        elapsed = int(line.split("=", 1)[1])
+                    except ValueError:
+                        continue
+                    if progress_callback:
+                        fraction = min(1.0, max(0.0, elapsed / (duration_ms * 1000)))
+                        progress_callback(progress_range[0] + fraction * (progress_range[1] - progress_range[0]), message)
+            if process.wait() != 0:
+                errors.seek(0, os.SEEK_END)
+                errors.seek(max(0, errors.tell() - 2048))
+                details = errors.read().decode("utf-8", errors="replace").strip()
+                raise ExportError(f"{message}失败（退出码 {process.returncode}）\n{details}")
+            if should_cancel and should_cancel():
+                raise ExportCanceled("导出已取消")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            if process.stdout is not None:
+                process.stdout.close()
 
 
 def _encode_with_ffmpeg(raw: Path, output: Path, audio: Path, fmt: str, ffmpeg: str, fps: float, duration_ms: int, payload: dict, *, progress_callback: Callable[[float, str], None] | None = None, should_cancel: Callable[[], bool] | None = None) -> None:
     output_fps = max(1.0, float(fps or 30))
     video_args, audio_args = _encoding_args(fmt, output_fps, payload)
-    # Force constant frame pacing in the final file. The browser-generated raw
-    # container can carry fractional or slightly irregular timestamps; leaving
-    # sync to the muxer makes some players present it as visibly lower FPS.
+    mode = _rate_control(payload)
     frame_args = ["-r", f"{output_fps:.6f}", "-fps_mode", "cfr"]
-    command = [ffmpeg, "-y", "-hide_banner", "-nostats", "-progress", "pipe:1", "-i", str(raw), "-i", str(audio), "-map", "0:v:0", "-map", "1:a:0", *frame_args, *video_args, *audio_args, "-shortest", str(output)]
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
+    duration_args = ["-t", f"{duration_ms / 1000:.3f}"] if duration_ms > 0 else []
+    base = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1", "-i", str(raw)]
+    mux_args = ["-movflags", "+faststart"] if fmt == "mp4" else []
+    partial = output.with_name(f"{output.stem}.partial{output.suffix}")
     try:
-        assert process.stdout is not None
-        for line in process.stdout:
-            if should_cancel and should_cancel():
-                process.terminate()
-                raise ExportCanceled("导出已取消")
-            if line.startswith("out_time_ms=") and duration_ms:
-                try:
-                    elapsed = int(line.split("=", 1)[1].strip())
-                except ValueError:
-                    continue
-                if progress_callback:
-                    progress_callback(min(.98, max(.82, .82 + elapsed / (duration_ms * 1000) * .16)), "正在用 FFmpeg 编码视频")
-        if process.wait() != 0:
-            raise ExportError(f"FFmpeg 编码失败（退出码 {process.returncode}）")
+        with tempfile.TemporaryDirectory(prefix="encode-", dir=output.parent) as log_dir:
+            pass_args = []
+            progress_start = .82
+            if mode == "two_pass":
+                log = ["-passlogfile", str(Path(log_dir) / "video")]
+                analyze = [*base, "-map", "0:v:0", *frame_args, *duration_args, *video_args, "-pass", "1", *log, "-an", "-f", "null", "-"]
+                _run_encoding_pass(analyze, duration_ms, (.82, .89), "FFmpeg 第一遍分析", progress_callback, should_cancel)
+                pass_args = ["-pass", "2", *log]
+                progress_start = .89
+            encode = [*base, "-i", str(audio), "-map", "0:v:0", "-map", "1:a:0", *frame_args, *duration_args,
+                      *video_args, *pass_args, *audio_args, *mux_args, str(partial)]
+            message = "FFmpeg 第二遍编码" if mode == "two_pass" else "FFmpeg 恒定质量编码"
+            _run_encoding_pass(encode, duration_ms, (progress_start, .99), message, progress_callback, should_cancel)
+            partial.replace(output)
     finally:
-        if process.poll() is None:
-            process.kill()
+        partial.unlink(missing_ok=True)
 
 
 def run_kirakara_export(job_id: str, project_id: str, document: dict, payload: dict, settings: Settings, *, progress_callback: Callable[[float, str], None] | None = None, should_cancel: Callable[[], bool] | None = None) -> dict:
@@ -236,7 +331,7 @@ def run_kirakara_export(job_id: str, project_id: str, document: dict, payload: d
     output = export_output_path(settings, project_id, job_id, fmt)
     raw = export_raw_output_path(settings, project_id, job_id, fmt)
     output.parent.mkdir(parents=True, exist_ok=True)
-    for marker in (output, raw, output.with_suffix(".error"), raw.with_suffix(".partial")):
+    for marker in (output, raw, output.with_suffix(".error"), raw.with_suffix(raw.suffix + ".partial")):
         marker.unlink(missing_ok=True)
     if fmt == "krl":
         if should_cancel and should_cancel():
@@ -295,4 +390,6 @@ def run_kirakara_export(job_id: str, project_id: str, document: dict, payload: d
     finally:
         if process.poll() is None:
             process.kill()
+        process.wait()
+        raw.unlink(missing_ok=True)
         shutil.rmtree(profile, ignore_errors=True)

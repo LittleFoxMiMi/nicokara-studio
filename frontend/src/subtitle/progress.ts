@@ -13,3 +13,22 @@ export function lineProgress(units: { start_ms: number | null; end_ms: number | 
   const end = Math.max(...timed.map((unit) => unit.end_ms as number));
   return unitProgress(start, end, currentMs);
 }
+
+// Each Ruby unit advances only during its own window. Once it ends, its
+// width stays filled until the next unit starts, including across silent gaps.
+export function rubyProgress(parts: { text: string; start_ms: number; end_ms: number }[], currentMs: number): number {
+  let total = 0;
+  let filled = 0;
+  for (const part of parts) {
+    const width = Array.from(part.text).length;
+    total += width;
+    filled += width * unitProgress(part.start_ms, part.end_ms, currentMs);
+  }
+  return total ? filled / total : 0;
+}
+
+export function isSilentPunctuation(character: string, previous = "", next = ""): boolean {
+  if (/[’']/.test(character) && /^[A-Za-z]$/.test(previous) && /^[A-Za-z]$/.test(next)) return false;
+  if (/[.,]/.test(character) && /^\p{Nd}$/u.test(previous) && /^\p{Nd}$/u.test(next)) return false;
+  return /^[\p{P}~～]$/u.test(character);
+}

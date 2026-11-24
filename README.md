@@ -11,7 +11,7 @@
 
 ## 启动
 
-1. 双击 `install_python.bat`，自动安装项目所需的 Python 环境及后端依赖。
+1. 双击 `install_python.bat`，将 Python 和后端依赖安装到项目的 `python/` 目录。Python 不会写入 Windows 注册表或加入 `PATH`。
 2. 双击 `start-nicokara.bat` 启动项目。首次启动会自动安装前端依赖。
 3. 在浏览器打开 `http://127.0.0.1:5173`。
 

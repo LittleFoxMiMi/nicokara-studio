@@ -60,6 +60,9 @@ class ExportRequest(BaseModel):
     revision: int = Field(ge=1)
     format: Literal["mp4", "webm", "krl"] = "mp4"
     audio_track: Literal["on_vocal", "off_vocal"] = "on_vocal"
+    video_rate_control: Literal["two_pass", "crf"] | None = None
+    video_target_bitrate_kbps: int | None = Field(default=None, ge=500, le=200000)
+    video_max_bitrate_kbps: int | None = Field(default=None, ge=500, le=200000)
     video_crf: int | None = Field(default=None, ge=0, le=63)
     h264_preset: Literal["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"] | None = None
     vp9_cpu_used: int | None = Field(default=None, ge=0, le=8)

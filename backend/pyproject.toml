@@ -19,6 +19,8 @@ analysis = [
   "audioread>=3.0,<4",
   "audio-separator[cpu]>=0.44.5,<0.45",
   "faster-whisper>=1.2,<2",
+  # faster-whisper 1.2.1 passes metadata_errors to av.open; PyAV 19 removed it.
+  "av>=11,<19",
   "torch>=2.7,<3",
   "torchaudio>=2.7,<3",
   "librosa>=0.10,<0.11",

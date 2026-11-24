@@ -74,6 +74,7 @@ function SettingsPage() {
     whisper_model: "large-v3", whisper_device: "cpu", whisper_compute_type: "int8",
     alignment_backend: "fa_kara", fa_kara_model: "mms",
     stable_ts_token_step: 100, stable_ts_segment_padding_seconds: 0,
+    export_video_rate_control: "two_pass", export_video_target_bitrate_kbps: 24000, export_video_max_bitrate_kbps: 48000,
     export_mp4_crf: 18, export_webm_crf: 32, export_h264_preset: "slow", export_vp9_cpu_used: 2, export_audio_bitrate_kbps: 192, export_gop_seconds: 2,
     proxy_enabled: true, proxy_url: "http://127.0.0.1:10808",
   });
@@ -84,13 +85,29 @@ function SettingsPage() {
   const [prompt, setPrompt] = useState<PromptPreset>({ id: "", name: "我的注音提示词", system_prompt: "", user_template: "" });
   const [profileMessage, setProfileMessage] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const [settingsError, setSettingsError] = useState("");
+  const twoPass = values.export_video_rate_control === "two_pass";
   const selectedSettingsFont = normalizeSubtitleFontFamily(values.font_family);
   function showSaved() { setSaved(true); window.setTimeout(() => setSaved(false), 1800); }
   useEffect(() => {
     void Promise.all([api<Record<string, unknown>>("/settings"), api<Capabilities>("/settings/capabilities"), api<AIProfile[]>("/settings/ai-profiles"), api<PromptPreset[]>("/settings/prompt-presets")])
       .then(([loaded, detected, loadedProfiles, loadedPrompts]) => { setValues((current) => ({ ...current, ...loaded })); setCapabilities(detected); setProfiles(loadedProfiles); if (loadedProfiles[0]) setProfile({ ...loadedProfiles[0], api_key: "" }); setPrompts(loadedPrompts); const activePrompt = loadedPrompts.find((item) => item.id === loaded.default_prompt_preset_id) || loadedPrompts[0]; if (activePrompt) setPrompt(activePrompt); });
   }, []);
-  async function saveSettings() { await api("/settings", { method: "PUT", body: JSON.stringify({ values }) }); showSaved(); }
+  async function saveSettings() {
+    setSettingsError("");
+    const target = Number(values.export_video_target_bitrate_kbps);
+    const maximum = Number(values.export_video_max_bitrate_kbps);
+    if (![target, maximum].every((rate) => Number.isInteger(rate) && rate >= 500 && rate <= 200000) || maximum < target) {
+      setSettingsError("视频码率须为 500–200000 kbps，且最大码率不能低于目标码率。");
+      return;
+    }
+    try {
+      await api("/settings", { method: "PUT", body: JSON.stringify({ values }) });
+      showSaved();
+    } catch {
+      setSettingsError("无法保存设置，请检查输入或确认后端已启动。");
+    }
+  }
   async function saveProfileWithBatchSettings() {
     const effort = (profile.thinking_effort || "off") as AIProfile["thinking_effort"];
     const payload = {
@@ -128,6 +145,7 @@ function SettingsPage() {
       <nav className="settings-nav"><a className="back-link" href={`#${returnTo}`}><ArrowLeft size={18} />返回</a><p className="eyebrow">设置</p>{settingsSections.map(([id, text]) => <button className={active === id ? "nav-item active" : "nav-item"} key={id} onClick={() => setActive(id)}>{text}</button>)}</nav>
       <section className="settings-content">
         <div className="page-heading"><div><h1>{label}</h1></div><button className="button filled" onClick={() => void saveSettings()}><Save size={17} />{saved ? "已保存" : "保存更改"}</button></div>
+        {settingsError && <p role="alert">{settingsError}</p>}
         {active === "general" && <><div className="settings-section"><h2>应用行为</h2><div className="settings-grid"><label>自动保存间隔（秒）<input type="number" min="5" max="300" value={String(values.autosave_interval_seconds)} onChange={(event) => setValues({ ...values, autosave_interval_seconds: Number(event.target.value) })} /><small>范围 5–300 秒 · 全局设置</small></label><label>主题<select value={String(values.theme)} onChange={(event) => setValues({ ...values, theme: event.target.value })}><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select><small>全局设置</small></label></div></div><div className="settings-section"><h2>网络代理</h2><div className="settings-grid"><label className="checkbox-field"><input type="checkbox" checked={Boolean(values.proxy_enabled)} onChange={(event) => setValues({ ...values, proxy_enabled: event.target.checked })} />启用代理<small>用于下载人声分离、Whisper 模型和联网服务</small></label><label>代理地址<input value={String(values.proxy_url)} disabled={!values.proxy_enabled} placeholder="http://127.0.0.1:10808" onChange={(event) => setValues({ ...values, proxy_url: event.target.value })} /><small>支持 HTTP/HTTPS 代理地址，不会写入工程文件</small></label></div></div></>}
         {active === "separation" && <>
           <div className="capability-banner"><Cpu size={20} /><div><strong>{capabilities?.separator.available ? `audio-separator ${capabilities.separator.version}` : "分离运行时不可用"}</strong><span>设备能力由后端实时检测。</span></div></div>
@@ -138,7 +156,48 @@ function SettingsPage() {
           <div className="settings-section"><h2>识别与对齐默认值</h2><div className="settings-grid"><label>Whisper 模型<select value={String(values.whisper_model)} onChange={(event) => setValues({ ...values, whisper_model: event.target.value })}>{capabilities?.whisper.models.map((model) => <option key={model}>{model}</option>)}</select><small>{capabilities?.whisper.installed_models.length ? `本地缓存 ${capabilities.whisper.installed_models.length} 个模型` : "首次任务通过代理按需下载到工程存储"}</small></label><label>计算设备<select value="cpu" disabled><option value="cpu">CPU</option></select><small>当前版本固定使用 CPU</small></label><label>Compute type<select value={String(values.whisper_compute_type)} onChange={(event) => setValues({ ...values, whisper_compute_type: event.target.value })}><option value="int8">int8</option><option value="float32">float32</option></select><small>推荐 int8</small></label><label>对齐后端<select value={String(values.alignment_backend || "fa_kara")} onChange={(event) => setValues({ ...values, alignment_backend: event.target.value })}><option value="fa_kara">FA-Kara</option><option value="stable_ts">stable-ts</option></select><small>Whisper 粗识别在两种流程中都会运行</small></label>{String(values.alignment_backend || "fa_kara") === "fa_kara" ? <label>FA-Kara 模型<select value={String(values.fa_kara_model || "mms")} onChange={(event) => setValues({ ...values, fa_kara_model: event.target.value })}><option value="mms">MMS_FA 基座模型</option><option value="yohane">YoHane 日语卡拉 OK 微调模型</option></select><small>YoHane 首次使用时通过代理下载模型</small></label> : <><label>stable-ts token-step<input type="number" min="0" max="442" step="1" value={String(values.stable_ts_token_step ?? 100)} onChange={(event) => setValues({ ...values, stable_ts_token_step: Number(event.target.value) })} /><small>范围 0–442；0 使用最大窗口模式，仅用于全局 align()</small></label><label>词/短语精修 segment 扩展（秒）<input type="number" min="0" max="30" step="0.1" value={String(values.stable_ts_segment_padding_seconds ?? 2)} onChange={(event) => setValues({ ...values, stable_ts_segment_padding_seconds: Number(event.target.value) })} /><small>在每行首尾各扩展指定秒数后调用 align_words()</small></label></>}</div></div>
         </>}
         {active === "export" && <>
-          <div className="settings-section"><h2>视频编码</h2><div className="settings-grid"><label>MP4 · H.264 CRF<input type="number" min="0" max="51" step="1" value={String(values.export_mp4_crf)} onChange={(event) => setValues({ ...values, export_mp4_crf: Number(event.target.value) })} /><small>0–51；数值越低画质越高、文件越大</small></label><label>H.264 preset<select value={String(values.export_h264_preset)} onChange={(event) => setValues({ ...values, export_h264_preset: event.target.value })}><option value="ultrafast">ultrafast</option><option value="superfast">superfast</option><option value="veryfast">veryfast</option><option value="faster">faster</option><option value="fast">fast</option><option value="medium">medium</option><option value="slow">slow</option><option value="slower">slower</option><option value="veryslow">veryslow</option></select><small>越慢通常压缩率越高</small></label><label>WebM · VP9 CRF<input type="number" min="0" max="63" step="1" value={String(values.export_webm_crf)} onChange={(event) => setValues({ ...values, export_webm_crf: Number(event.target.value) })} /><small>0–63；数值越低画质越高、文件越大</small></label><label>VP9 编码速度<select value={String(values.export_vp9_cpu_used)} onChange={(event) => setValues({ ...values, export_vp9_cpu_used: Number(event.target.value) })}>{[0, 1, 2, 3, 4, 5, 6, 7, 8].map((value) => <option value={value} key={value}>{value}{value === 0 ? " · 最慢" : value === 8 ? " · 最快" : ""}</option>)}</select><small>较低数值通常带来更好的压缩效果</small></label></div></div>
+          <div className="settings-section">
+            <h2>视频编码</h2>
+            <div className="settings-grid">
+              <label>码率模式
+                <select value={String(values.export_video_rate_control)} onChange={(event) => setValues({ ...values, export_video_rate_control: event.target.value })}>
+                  <option value="two_pass">二遍可变码率</option>
+                  <option value="crf">恒定质量（CRF）</option>
+                </select>
+              </label>
+              {twoPass ? <>
+                <label>目标视频码率（kbps）
+                  <input type="number" min="500" max="200000" step="1" value={String(values.export_video_target_bitrate_kbps)} onChange={(event) => setValues({ ...values, export_video_target_bitrate_kbps: Number(event.target.value) })} />
+                  <small>成片视频的目标平均码率，MP4 与 WebM 共用</small>
+                </label>
+                <label>最大视频码率（kbps）
+                  <input type="number" min={Math.max(500, Number(values.export_video_target_bitrate_kbps))} max="200000" step="1" value={String(values.export_video_max_bitrate_kbps)} onChange={(event) => setValues({ ...values, export_video_max_bitrate_kbps: Number(event.target.value) })} />
+                  <small>给高运动和高细节画面留出码率空间</small>
+                </label>
+              </> : <>
+                <label>MP4 · H.264 CRF
+                  <input type="number" min="0" max="51" step="1" value={String(values.export_mp4_crf)} onChange={(event) => setValues({ ...values, export_mp4_crf: Number(event.target.value) })} />
+                  <small>0–51，数值越低画质越高</small>
+                </label>
+                <label>WebM · VP9 CRF
+                  <input type="number" min="0" max="63" step="1" value={String(values.export_webm_crf)} onChange={(event) => setValues({ ...values, export_webm_crf: Number(event.target.value) })} />
+                  <small>0–63，数值越低画质越高</small>
+                </label>
+              </>}
+              <label>H.264 preset
+                <select value={String(values.export_h264_preset)} onChange={(event) => setValues({ ...values, export_h264_preset: event.target.value })}>
+                  {["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"].map((value) => <option key={value}>{value}</option>)}
+                </select>
+                <small>越慢通常压缩效率越高</small>
+              </label>
+              <label>VP9 编码速度
+                <select value={String(values.export_vp9_cpu_used)} onChange={(event) => setValues({ ...values, export_vp9_cpu_used: Number(event.target.value) })}>
+                  {[0, 1, 2, 3, 4, 5, 6, 7, 8].map((value) => <option value={value} key={value}>{value}{value === 0 ? " · 最慢" : value === 8 ? " · 最快" : ""}</option>)}
+                </select>
+                <small>较低数值通常带来更好的压缩效率</small>
+              </label>
+            </div>
+          </div>
           <div className="settings-section"><h2>音频与关键帧</h2><div className="settings-grid"><label>音频码率（kbps）<input type="number" min="64" max="512" step="16" value={String(values.export_audio_bitrate_kbps)} onChange={(event) => setValues({ ...values, export_audio_bitrate_kbps: Number(event.target.value) })} /><small>AAC 与 Opus 共用此默认值</small></label><label>关键帧间隔（秒）<input type="number" min="0.5" max="10" step="0.5" value={String(values.export_gop_seconds)} onChange={(event) => setValues({ ...values, export_gop_seconds: Number(event.target.value) })} /><small>FFmpeg 会根据输出帧率换算为 GOP 长度</small></label></div></div>
         </>}
         {active === "subtitles" && <div className="settings-section"><h2>字幕与样式</h2><div className="settings-grid"><label>字体<select value={selectedSettingsFont} onChange={(event) => setValues({ ...values, font_family: event.target.value })}>{!SUBTITLE_FONT_OPTIONS.some((option) => option.value === selectedSettingsFont) && <option value={selectedSettingsFont}>{selectedSettingsFont}</option>}{SUBTITLE_FONT_OPTIONS.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select><small>新工程默认字体</small></label><label>最大字号<input type="number" min="12" max="180" value={String(values.font_size_max)} onChange={(event) => setValues({ ...values, font_size_max: Number(event.target.value) })} /><small>范围 12–180 px</small></label></div></div>}

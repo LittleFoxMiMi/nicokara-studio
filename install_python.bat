@@ -1,14 +1,13 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 
-rem Install the latest Python 3.12 Windows installer published by Python.org for this project.
+rem Extract the Python Software Foundation NuGet package as a project-local runtime.
 set "ROOT=%~dp0"
 set "TARGET_DIR=%ROOT%python"
 set "BACKEND_DIR=%ROOT%backend"
 set "PYTHON_VERSION=3.12.10"
 set "PYTHON_EXE=%TARGET_DIR%\python.exe"
-set "INSTALLER=%TEMP%\python-%PYTHON_VERSION%-installer.exe"
-set "PYTHON_URL=https://www.python.org/ftp/python/%PYTHON_VERSION%/python-%PYTHON_VERSION%-amd64.exe"
+set "PYTHON_PACKAGE=python"
 set "USTC_INDEX=https://pypi.mirrors.ustc.edu.cn/simple"
 
 if not exist "%BACKEND_DIR%\pyproject.toml" (
@@ -17,7 +16,7 @@ if not exist "%BACKEND_DIR%\pyproject.toml" (
 )
 
 echo.
-echo Nicokara Python %PYTHON_VERSION% installer
+echo Nicokara project-local Python %PYTHON_VERSION% setup
 echo Target: "%TARGET_DIR%"
 echo.
 
@@ -53,51 +52,53 @@ if exist "%TARGET_DIR%" (
 )
 
 if /I "%PROCESSOR_ARCHITECTURE%"=="x86" if not defined PROCESSOR_ARCHITEW6432 (
-  set "PYTHON_URL=https://www.python.org/ftp/python/%PYTHON_VERSION%/python-%PYTHON_VERSION%.exe"
+  set "PYTHON_PACKAGE=pythonx86"
 )
+set "PYTHON_URL=https://api.nuget.org/v3-flatcontainer/%PYTHON_PACKAGE%/%PYTHON_VERSION%/%PYTHON_PACKAGE%.%PYTHON_VERSION%.nupkg"
 
 echo.
-echo Downloading Python %PYTHON_VERSION% from python.org...
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -UseBasicParsing -Uri '%PYTHON_URL%' -OutFile '%INSTALLER%'"
-if errorlevel 1 (
-  echo [ERROR] The Python installer download failed.
-  goto :failed
-)
-
-echo Installing Python %PYTHON_VERSION% into the project folder...
-"%INSTALLER%" /quiet InstallAllUsers=0 TargetDir="%TARGET_DIR%" PrependPath=0 Include_pip=1 Include_test=0 Include_launcher=0 AssociateFiles=0 Shortcuts=0
-set "INSTALL_EXIT=%ERRORLEVEL%"
-del /q "%INSTALLER%" >nul 2>&1
-if not "%INSTALL_EXIT%"=="0" (
-  echo [ERROR] Python installation failed with exit code %INSTALL_EXIT%.
-  goto :failed
-)
-
-if not exist "%PYTHON_EXE%" (
-  echo [ERROR] Python was installed but "%PYTHON_EXE%" was not found.
+echo Downloading portable Python %PYTHON_VERSION% from NuGet...
+powershell.exe -NoProfile -Command ^
+  "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';" ^
+  "$target = [IO.Path]::GetFullPath($env:TARGET_DIR);" ^
+  "$parent = [IO.Path]::GetDirectoryName($target);" ^
+  "$stage = Join-Path $parent ('.python-install-' + [Guid]::NewGuid().ToString('N'));" ^
+  "New-Item -ItemType Directory -Path $stage | Out-Null;" ^
+  "try {" ^
+  "  $archive = Join-Path $stage 'python.zip'; $expanded = Join-Path $stage 'expanded';" ^
+  "  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12;" ^
+  "  Invoke-WebRequest -UseBasicParsing -Uri $env:PYTHON_URL -OutFile $archive;" ^
+  "  Write-Host 'Extracting and checking the project Python...';" ^
+  "  Expand-Archive -LiteralPath $archive -DestinationPath $expanded;" ^
+  "  $runtime = Join-Path $expanded 'tools';" ^
+  "  & (Join-Path $runtime 'python.exe') -I -B -m pip --version;" ^
+  "  if ($LASTEXITCODE -ne 0) { throw 'The extracted Python or pip could not start.' };" ^
+  "  if ([IO.Directory]::Exists($target)) { [IO.Directory]::Delete($target) };" ^
+  "  [IO.Directory]::Move($runtime, $target);" ^
+  "} finally {" ^
+  "  $stage = [IO.Path]::GetFullPath($stage);" ^
+  "  if ([IO.Path]::GetDirectoryName($stage) -eq $parent) { Remove-Item -LiteralPath $stage -Recurse -Force };" ^
+  "}"
+if not "%ERRORLEVEL%"=="0" (
+  echo [ERROR] Could not prepare the project-local Python. See the error above.
   goto :failed
 )
 
 :install_dependencies
 echo.
 echo Configuring pip for this project Python...
-"%PYTHON_EXE%" -m pip config --site set global.index-url "%PIP_INDEX_URL%"
-if errorlevel 1 goto :pip_failed
+"%PYTHON_EXE%" -I -m pip config --site set global.index-url "%PIP_INDEX_URL%" || goto :pip_failed
 
 echo Upgrading pip...
-"%PYTHON_EXE%" -m pip install --upgrade pip
-if errorlevel 1 goto :pip_failed
+"%PYTHON_EXE%" -I -m pip install --no-user --upgrade pip || goto :pip_failed
 
 echo Installing backend dependencies from backend\pyproject.toml...
-"%PYTHON_EXE%" -m pip install "%BACKEND_DIR%[analysis]"
-if errorlevel 1 goto :pip_failed
+"%PYTHON_EXE%" -I -m pip install --no-user "%BACKEND_DIR%[analysis]" || goto :pip_failed
 
 echo.
 echo Reinstalling ONNX Runtime DirectML after backend dependencies...
-"%PYTHON_EXE%" -m pip uninstall --yes onnxruntime-directml
-if errorlevel 1 goto :pip_failed
-"%PYTHON_EXE%" -m pip install --no-deps --force-reinstall "onnxruntime-directml>=1.24,<2"
-if errorlevel 1 goto :pip_failed
+"%PYTHON_EXE%" -I -m pip uninstall --yes onnxruntime-directml || goto :pip_failed
+"%PYTHON_EXE%" -I -m pip install --no-user --no-deps --force-reinstall "onnxruntime-directml>=1.24,<2" || goto :pip_failed
 
 echo.
 echo Python %PYTHON_VERSION% and backend dependencies are ready.
@@ -121,17 +122,15 @@ pause
 exit /b 0
 
 :check_existing_python
-set "INSTALLED_VERSION="
-for /f "tokens=2" %%V in ('"%PYTHON_EXE%" --version 2^>^&1') do set "INSTALLED_VERSION=%%V"
-if /I "%INSTALLED_VERSION%"=="%PYTHON_VERSION%" goto :existing_python_valid
+"%PYTHON_EXE%" -I -B -c "import sys; raise SystemExit('.'.join(map(str, sys.version_info[:3])) != '%PYTHON_VERSION%')"
+if not errorlevel 1 (
+  echo Using the existing Python %PYTHON_VERSION% in the project folder.
+  exit /b 0
+)
 echo.
-echo [ERROR] "%TARGET_DIR%" already contains Python %INSTALLED_VERSION%.
-echo Rename or remove that folder before installing Python %PYTHON_VERSION%.
+echo [ERROR] The existing Python in "%TARGET_DIR%" is not a working Python %PYTHON_VERSION%.
+echo Rename or remove that folder before running the setup again.
 exit /b 1
-
-:existing_python_valid
-echo Python %PYTHON_VERSION% is already installed in the project folder.
-exit /b 0
 
 :check_target_empty
 for /f "delims=" %%F in ('dir /a /b "%TARGET_DIR%" 2^>nul') do goto :target_not_empty

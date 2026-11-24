@@ -72,8 +72,11 @@ def test_fa_kara_uses_ai_ruby_and_converts_to_romaji(tmp_path, monkeypatch):
                 cursor = 0
                 result = []
                 for token_group in tokens:
-                    result.append([TokenSpan(1, cursor, cursor + len(token_group), 0.9)])
-                    cursor += len(token_group)
+                    group = []
+                    for token in token_group:
+                        group.append(TokenSpan(token, cursor, cursor + 1, 0.9))
+                        cursor += 2
+                    result.append(group)
                 return result
 
             return align
@@ -87,17 +90,38 @@ def test_fa_kara_uses_ai_ruby_and_converts_to_romaji(tmp_path, monkeypatch):
     assert summary["engine"] == "fa-kara"
     assert summary["selected_targets"] == 2
     assert updated["lyrics"]["lines"][0]["units"][0]["timing_source"] == "fa_kara"
-    assert updated["lyrics"]["lines"][0]["units"][0]["end_ms"] > 0
+    assert updated["lyrics"]["lines"][0]["units"][0]["ruby_timing"] == [
+        {"text": "き", "start_ms": 0, "end_ms": 60},
+        {"text": "の", "start_ms": 80, "end_ms": 140},
+        {"text": "う", "start_ms": 160, "end_ms": 180},
+    ]
 
     offset_updated, offset_summary = FAKaraAligner(lambda: (FakeModel(), FakeBundle())).align(
         document, audio, time_offset_ms=5000
     )
     assert offset_updated["lyrics"]["lines"][0]["units"][0]["start_ms"] >= 5000
+    assert offset_updated["lyrics"]["lines"][0]["units"][0]["ruby_timing"][1]["start_ms"] == 5080
     assert offset_summary["time_offset_ms"] == 5000
 
     missing = {"lyrics": {"lines": [{"id": "line", "units": [{"surface": "昨日", "ruby": None}]}]}}
     with pytest.raises(FAKaraAlignmentError, match="AI 注音"):
         FAKaraAligner(lambda: (FakeModel(), FakeBundle())).align(missing, audio)
+
+
+def test_old_edited_line_splits_kana_without_splitting_ruby_or_locked_units():
+    from app.services.fa_kara_text import prepare_japanese_kana_units
+
+    units = [
+        {"id": "kana", "surface": "きょっとね、また", "start_ms": None, "end_ms": None},
+        {"id": "word", "surface": "取", "ruby": "とりもど", "ruby_span": 4},
+        {"id": "covered-kana", "surface": "り戻す"},
+        {"id": "locked", "surface": "ここ", "locked": True},
+    ]
+    line = {"units": units}
+    prepare_japanese_kana_units([line])
+    assert [unit["surface"] for unit in line["units"]] == ["きょっ", "と", "ね", "、", "ま", "た", "取", "り戻す", "ここ"]
+    assert line["units"][0]["id"] == "kana"
+    assert line["units"][-3:] == units[-3:]
 
 
 def test_fa_kara_endpoint_is_independent_from_stable_ts(tmp_path, monkeypatch):

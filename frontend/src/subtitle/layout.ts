@@ -1,4 +1,5 @@
 import type { LyricLine, LyricUnit } from "../editor-types";
+import { rubyGroupEnd, timedBounds } from "../ruby-timing";
 import { measureUnit } from "./measure";
 import type { SubtitleStyle } from "./style-schema";
 
@@ -13,25 +14,8 @@ function groupUnits(units: LyricUnit[]): LyricUnit[] {
   const groups: LyricUnit[] = [];
   for (let index = 0; index < units.length;) {
     const first = units[index];
-    const surfaceLength = Array.from(first.surface).length;
-    let span = Math.max(surfaceLength, Number(first.ruby_span || 1));
-    // Compatibility for projects created before ruby_span was persisted:
-    // collapse adjacent units carrying the same full-word reading.
-    if (!first.ruby_span && first.ruby) {
-      let nextIndex = index + 1;
-      while (nextIndex < units.length && units[nextIndex].ruby === first.ruby) {
-        span += Array.from(units[nextIndex].surface).length;
-        nextIndex += 1;
-      }
-    }
-    let covered = surfaceLength;
-    let memberEnd = index + 1;
-    while (covered < span && memberEnd < units.length) {
-      covered += Array.from(units[memberEnd].surface).length;
-      memberEnd += 1;
-    }
-    const members = units.slice(index, memberEnd);
-    groups.push({ ...first, surface: members.map((unit) => unit.surface).join(""), end_ms: members[members.length - 1]?.end_ms ?? first.end_ms, ruby_span: span, __groupUnits: members } as LyricUnit & { __groupUnits: LyricUnit[] });
+    const members = units.slice(index, rubyGroupEnd(units, index));
+    groups.push({ ...first, ...timedBounds(members), surface: members.map((unit) => unit.surface).join(""), __groupUnits: members } as LyricUnit & { __groupUnits: LyricUnit[] });
     index += members.length;
   }
   return groups;
@@ -63,7 +47,7 @@ export function layoutSubtitleLine(line: LyricLine, style: SubtitleStyle, viewpo
   const key = [line.id, line.timing_precision, line.start_ms, line.end_ms, Math.round(maxWidth), viewport.height, style.fontFamily, style.fontSizeMin, style.fontSizeMax,
     style.fontWeight, style.maxLines, style.safeAreaLeft, style.safeAreaRight, style.rubyScale, style.ruby2Scale,
     style.rubyGap, style.lineGap, style.letterSpacing, style.wrapMode, style.positionY,
-    line.units.map((unit) => `${unit.id}:${unit.surface}:${unit.ruby || ""}:${unit.ruby_2 || ""}:${unit.ruby_span || 1}:${unit.start_ms ?? ""}:${unit.end_ms ?? ""}:${unit.timing_source}`).join("|")].join(";");
+    JSON.stringify(line.units.map((unit) => [unit.id, unit.surface, unit.ruby, unit.ruby_2, unit.ruby_span, unit.start_ms, unit.end_ms, unit.timing_source, unit.ruby_timing]))].join(";");
   let cached = layoutCache.get(key);
   if (!cached) {
     let low = style.fontSizeMin;
@@ -88,7 +72,9 @@ export function layoutSubtitleLine(line: LyricLine, style: SubtitleStyle, viewpo
   const timedStart = (line as LyricLine & { entry_ms?: number }).entry_ms ?? line.start_ms ?? 0;
   const timedEnd = (line as LyricLine & { display_end_ms?: number }).display_end_ms ?? line.end_ms ?? timedStart + 1;
   const fadeIn = style.fadeInMs ? Math.min(1, Math.max(0, (currentMs - timedStart) / style.fadeInMs)) : 1;
-  const fadeOut = style.fadeOutMs && currentMs <= timedEnd ? Math.min(1, Math.max(0, (timedEnd - currentMs) / style.fadeOutMs)) : 1;
+  const walkEnd = (line as LyricLine & { walk_end_ms?: number }).walk_end_ms ?? line.end_ms ?? timedEnd;
+  const fadeOutDuration = Math.min(style.fadeOutMs, Math.max(0, timedEnd - walkEnd));
+  const fadeOut = fadeOutDuration ? Math.min(1, Math.max(0, (timedEnd - currentMs) / fadeOutDuration)) : 1;
   return { ...cached, opacity: Math.min(fadeIn, fadeOut) };
 }
 

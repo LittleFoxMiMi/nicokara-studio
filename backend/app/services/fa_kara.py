@@ -11,7 +11,9 @@ from uuid import uuid4
 from pykakasi import kakasi
 
 from app.services.alignment import AlignmentQualityError
-from app.services.fa_kara_text import normalize_language, phonetic_for_surface, tokenize_fa_kara
+from app.services.fa_kara_text import normalize_language, phonetic_for_surface, prepare_japanese_kana_units, tokenize_fa_kara
+
+from app.services.punctuation_timing import is_silent_punctuation
 
 
 class FAKaraAlignmentError(AlignmentQualityError):
@@ -27,6 +29,54 @@ def _romaji(reading: str) -> str:
     """Convert an existing Japanese ruby/surface to MMS_FA's Latin alphabet."""
     converted = "".join(str(item.get("hepburn") or "") for item in _KANA_CONVERTER.convert(reading))
     return _MODEL_READING_RE.sub("", converted).lower()
+
+
+# Small kana form a single sung unit with the preceding kana (e.g. きょ).
+_MORA_RE = re.compile(r".[ゃゅょぁぃぅぇぉゎャュョァィゥェォヮ]*")
+
+
+def _ruby_token_groups(ruby: str, reading: str, tokenizer, tokens: list[int]) -> list[tuple[str, int]]:
+    """Map displayed mora to the tokens already used for whole-word alignment."""
+    morae = _MORA_RE.findall(ruby)
+    parts: list[str] = []
+    cursor = 0
+    for mora in morae:
+        sound = _romaji(mora)
+        tail = reading[cursor:]
+        if mora in "っッ" and not tail.startswith(sound):
+            # Hepburn writes the small tsu as the extra consonant in e.g. gakkou.
+            sound = tail[:1] if tail[:1] and tail[0] not in "aeiou" else ""
+        elif mora in "ーｰ":
+            sound = reading[cursor - 1:cursor] if cursor else ""
+        elif mora in "んン" and tail[:1] in ("n", "m"):
+            sound = tail[:2] if tail[1:2] == "'" else tail[:1]
+        if not sound or not tail.startswith(sound):
+            return []
+        parts.append(sound)
+        cursor += len(sound)
+    if cursor != len(reading) or not parts:
+        return []
+    token_groups = tokenizer(parts)
+    if [token for group in token_groups for token in group] != tokens:
+        return []
+    return [(mora, len(group)) for mora, group in zip(morae, token_groups)]
+
+
+def _ruby_timing(ruby, reading, tokenizer, tokens, spans, frame_duration_ms, time_offset_ms):
+    if len(tokens) != len(spans):
+        return []
+    groups = _ruby_token_groups(ruby, reading, tokenizer, tokens)
+    timings = []
+    offset = 0
+    # Keep both edges so blank CTC frames between morae remain silent gaps.
+    for text, size in groups:
+        if not size:
+            return []
+        start = time_offset_ms + round(float(spans[offset].start) * frame_duration_ms)
+        end = time_offset_ms + round(float(spans[offset + size - 1].end) * frame_duration_ms)
+        timings.append({"text": text, "start_ms": start, "end_ms": end})
+        offset += size
+    return timings
 
 
 def _unit_reading(unit: dict[str, Any], *, language: str = "jp") -> str:
@@ -64,7 +114,10 @@ def _groups(line: dict[str, Any], *, language: str = "jp") -> list[tuple[list[di
             reading = "".join(readings)
         if language == "jp":
             reading = _romaji(reading)
-        if reading:
+        if reading and (unit.get("ruby") or any(
+            not char.isspace() and not is_silent_punctuation(char)
+            for member in members for char in str(member.get("surface") or "")
+        )):
             result.append((members, reading))
         index += len(members)
     return result
@@ -88,6 +141,7 @@ def _prepare_chinese_units(lines: list[dict[str, Any]]) -> None:
                 unit["ruby_2"] = None
                 unit["ruby_source"] = "none"
                 unit.pop("ruby_span", None)
+                unit.pop("ruby_timing", None)
                 unit.pop("ruby_confidence", None)
                 if reading:
                     unit["alignment_reading"] = reading
@@ -132,9 +186,11 @@ class FAKaraAligner:
         lines = document.get("lyrics", {}).get("lines", [])
         language = normalize_language(document.get("project", {}).get("language"))
         selected = set(line_ids or [line["id"] for line in lines])
-        if language == "cn":
-            _prepare_chinese_units([line for line in lines if line["id"] in selected])
         selected_lines = [line for line in lines if line["id"] in selected]
+        if language == "cn":
+            _prepare_chinese_units(selected_lines)
+        else:
+            prepare_japanese_kana_units(selected_lines, overwrite_locked=overwrite_locked)
         if not selected_lines:
             raise FAKaraAlignmentError("没有可用于 FA-Kara 对齐的歌词行")
         targets: list[tuple[dict[str, Any], list[dict[str, Any]], str]] = []
@@ -169,7 +225,7 @@ class FAKaraAligner:
         applied = 0
         locked = 0
         low_confidence = 0
-        for target_index, (line, members, _) in enumerate(targets):
+        for target_index, (line, members, reading) in enumerate(targets):
             target_spans = spans[target_index] if target_index < len(spans) else []
             if not target_spans:
                 continue
@@ -198,6 +254,13 @@ class FAKaraAligner:
                     if confidence < 0.55:
                         low_confidence += 1
                 cursor = next_cursor
+            first = members[0]
+            if language == "jp" and first.get("ruby") and (overwrite_locked or not any(member.get("locked") for member in members)):
+                ruby_timing = _ruby_timing(first["ruby"], reading, tokenizer, tokens[target_index], target_spans, frame_duration_ms, time_offset_ms)
+                if ruby_timing:
+                    first["ruby_timing"] = ruby_timing
+                else:
+                    first.pop("ruby_timing", None)
             timed = [unit for unit in line.get("units", []) if unit.get("start_ms") is not None and unit.get("end_ms") is not None]
             if timed:
                 line["start_ms"] = min(int(unit["start_ms"]) for unit in timed)

@@ -56,6 +56,7 @@ def normalize_document(document: dict) -> dict:
                 unit["ruby_2"] = None
                 unit["ruby_source"] = "none"
                 unit.pop("ruby_span", None)
+                unit.pop("ruby_timing", None)
                 unit.pop("ruby_confidence", None)
     return document
 
@@ -407,12 +408,20 @@ def export_project(project_id: str, payload: ExportRequest, request: Request):
             {"revision": payload.revision, "format": "krl", "steps": ["export"]},
         )
     configured = db.settings()
+    rate_control = payload.video_rate_control or ("crf" if payload.video_crf is not None else configured["export_video_rate_control"])
+    target = payload.video_target_bitrate_kbps or configured["export_video_target_bitrate_kbps"]
+    maximum = payload.video_max_bitrate_kbps or configured["export_video_max_bitrate_kbps"]
+    if maximum < target:
+        raise HTTPException(422, "最大视频码率必须大于或等于目标视频码率")
     video_crf = payload.video_crf if payload.video_crf is not None else int(configured.get("export_mp4_crf" if payload.format == "mp4" else "export_webm_crf", 20 if payload.format == "mp4" else 32))
     if payload.format == "mp4" and video_crf > 51:
         raise HTTPException(422, "MP4 CRF 必须是 0 到 51 的整数")
     body = {
         **payload.model_dump(),
         "video_crf": video_crf,
+        "video_rate_control": rate_control,
+        "video_target_bitrate_kbps": target,
+        "video_max_bitrate_kbps": maximum,
         "h264_preset": payload.h264_preset or str(configured.get("export_h264_preset") or "medium"),
         "vp9_cpu_used": payload.vp9_cpu_used if payload.vp9_cpu_used is not None else int(configured.get("export_vp9_cpu_used", 2)),
         "audio_bitrate_kbps": payload.audio_bitrate_kbps if payload.audio_bitrate_kbps is not None else int(configured.get("export_audio_bitrate_kbps", 192)),
@@ -504,12 +513,22 @@ async def export_worker_result(project_id: str, job_id: str, request: Request):
     job = db.get_job(job_id)
     if not job or job["project_id"] != project_id or job["type"] != "EXPORT":
         raise HTTPException(404, "导出任务不存在")
+    if job["status"] not in {"PREPARING", "RUNNING"} or job["cancel_requested"]:
+        raise HTTPException(409, "导出已结束")
     fmt = str(job["request"].get("format", "mp4"))
     path = export_raw_output_path(settings, project_id, job_id, fmt)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".partial")
-    temporary.write_bytes(await request.body())
-    temporary.replace(path)
+    try:
+        with temporary.open("wb") as output:
+            async for chunk in request.stream():
+                output.write(chunk)
+        current = db.get_job(job_id)
+        if not current or current["status"] not in {"PREPARING", "RUNNING"} or current["cancel_requested"]:
+            raise HTTPException(409, "导出已结束")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return {"ok": True, "filename": request.headers.get("x-output-filename") or path.name}
 
 @router.post("/{project_id}/export-worker/{job_id}/error")

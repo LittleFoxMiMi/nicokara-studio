@@ -6,6 +6,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 
+from app.services.fa_kara_text import prepare_japanese_kana_units
 from app.services.alignment import AlignmentQualityError, normalize_reading
 from app.services.transcription import Transcript
 
@@ -169,6 +170,8 @@ class StableTSAligner:
         selected_lines = [line for line in lines if line["id"] in selected]
         if not selected_lines:
             raise StableTSAlignmentError("没有可精修的歌词行")
+        if document.get("project", {}).get("language") != "cn":
+            prepare_japanese_kana_units(selected_lines, overwrite_locked=overwrite_locked)
         model = self._model()
         batches: list[tuple[list[dict[str, Any]], list[tuple[dict, dict]]]] = []
         owners: list[tuple[dict, dict]] = []

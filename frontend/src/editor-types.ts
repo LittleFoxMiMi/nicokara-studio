@@ -11,6 +11,8 @@ export type Project = {
 
 export type ProjectLanguage = "jp" | "cn";
 
+export type RubyTiming = { text: string; start_ms: number; end_ms: number };
+
 export type LyricUnit = {
   id: string;
   surface: string;
@@ -21,6 +23,7 @@ export type LyricUnit = {
   ruby: string | null;
   ruby_2?: string | null;
   ruby_span?: number;
+  ruby_timing?: RubyTiming[];
   ruby_source: string;
   alignment_reading?: string;
   roles: string[];

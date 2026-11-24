@@ -10,8 +10,9 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
-import type { LyricLine, LyricUnit, Waveform } from "./editor-types";
+import type { LyricLine, LyricUnit, RubyTiming, Waveform } from "./editor-types";
 import { api, formatTime } from "./editor-types";
+import { initialRubyTiming, rubyGroupEnd, timedBounds } from "./ruby-timing";
 
 type Hit = {
   unit: LyricUnit;
@@ -22,6 +23,7 @@ type Hit = {
   y1: number;
   y2: number;
   rubyGroup?: RubyGroup;
+  rubyPart?: number;
 };
 type RubyGroup = {
   lineId: string;
@@ -36,6 +38,8 @@ type RubyGroup = {
   y1: number;
   y2: number;
   units: LyricUnit[];
+  timing?: RubyTiming[];
+  expanded: boolean;
 };
 type Drag = {
   hit: Hit;
@@ -54,7 +58,7 @@ type Drag = {
 const MAX_CANVAS_DIMENSION = 32760;
 const CANVAS_TILE_WIDTH = 12000;
 const MIN_ZOOM = 30;
-const MAX_ZOOM = 180;
+const MAX_ZOOM = 360;
 
 type TimelinePersistence = {
   zoom: number;
@@ -97,6 +101,9 @@ export function TimelineCanvas({
   onUpdateUnit,
   onUpdateLine,
   onUpdateRubyGroup,
+  expandedRubyId,
+  onUpdateRubyTiming,
+  onOpenRubyPart,
   rubyEnabled,
   onOpenEditor,
   onDropLine,
@@ -122,6 +129,9 @@ export function TimelineCanvas({
   ) => void;
   onUpdateLine: (lineId: string, startMs: number, endMs: number) => void;
   onUpdateRubyGroup: (lineId: string, unitIds: string[], ruby: string, ruby2: string, rubySpan: number, clearUnitIds: string[]) => void;
+  expandedRubyId: string | null;
+  onUpdateRubyTiming: (lineId: string, unitId: string, start: number, end: number, timing?: RubyTiming[]) => void;
+  onOpenRubyPart: (lineId: string, unitId: string, index: number) => void;
   rubyEnabled: boolean;
   onOpenEditor: (id: string) => void;
   onDropLine: (lineId: string, startMs: number) => void;
@@ -247,54 +257,46 @@ export function TimelineCanvas({
       video.removeEventListener("pause", save);
     };
   }, [mediaRef, projectId]);
-  const timedUnits = useMemo(
-    () =>
-      lines
-        .flatMap((line) => {
-          if (line.timing_precision === "line" && line.start_ms !== null && line.end_ms !== null && line.units.length) {
-            return [{
-              line,
-              lineLevel: true,
-              unit: {
-                ...line.units[0],
-                surface: line.units.map((unit) => unit.surface).join(""),
-                start_ms: line.start_ms,
-                end_ms: line.end_ms,
-                timing_source: line.timing_source,
-                timing_confidence: null,
-              },
-            }];
+  const { timedUnits, lineRubyGroups } = useMemo(() => {
+    const timedUnits: { line: LyricLine; unit: LyricUnit; lineLevel: boolean; groupId?: string; rubyPart?: number }[] = [];
+    const lineRubyGroups: RubyGroup[] = [];
+    for (const line of lines) {
+      if (line.timing_precision === "line" && line.start_ms !== null && line.end_ms !== null && line.units.length) {
+        timedUnits.push({ line, lineLevel: true, unit: {
+          ...line.units[0],
+          surface: line.units.map((unit) => unit.surface).join(""),
+          start_ms: line.start_ms,
+          end_ms: line.end_ms,
+          timing_source: line.timing_source,
+          timing_confidence: null,
+        } });
+        continue;
+      }
+      for (let index = 0; index < line.units.length;) {
+        const first = line.units[index];
+        const endIndex = rubyEnabled && first.ruby ? rubyGroupEnd(line.units, index) : index + 1;
+        const members = line.units.slice(index, endIndex);
+        const bounds = timedBounds(members);
+        if (bounds && rubyEnabled && first.ruby) {
+          const { start_ms: start, end_ms: end } = bounds;
+          const expanded = first.id === expandedRubyId;
+          const timing = expanded ? initialRubyTiming(first, start, end) : undefined;
+          lineRubyGroups.push({ lineId: line.id, ruby: first.ruby, ruby2: first.ruby_2 || "", startIndex: index, endIndex, start, end, x1: 0, x2: 0, y1: 0, y2: 0, units: line.units, timing, expanded });
+          if (timing?.length) {
+            timing.forEach((part, rubyPart) => timedUnits.push({ line, lineLevel: false, groupId: first.id, rubyPart,
+              unit: { ...first, ...part, surface: part.text } }));
+          } else {
+            timedUnits.push({ line, lineLevel: false, groupId: first.id,
+              unit: { ...first, ...bounds, surface: members.map((unit) => unit.surface).join("") } });
           }
-          return line.units.map((unit) => ({ line, unit, lineLevel: false }));
-        })
-        .filter(({ unit }) => unit.start_ms !== null && unit.end_ms !== null),
-    [lines],
-  );
-  const lineRubyGroups = useMemo(() => lines.flatMap((line) => {
-    if (line.timing_precision === "line") return [];
-    const groups: RubyGroup[] = [];
-    for (let index = 0; index < line.units.length;) {
-      const first = line.units[index];
-      const span = Math.max(Array.from(first.surface).length, Number(first.ruby_span || 1));
-      let covered = Array.from(first.surface).length;
-      let endIndex = index + 1;
-      while (covered < span && endIndex < line.units.length) {
-        covered += Array.from(line.units[endIndex].surface).length;
-        endIndex += 1;
+        } else if (bounds) {
+          timedUnits.push({ line, unit: first, lineLevel: false });
+        }
+        index = endIndex;
       }
-      if (!first.ruby_span && first.ruby) {
-        while (endIndex < line.units.length && line.units[endIndex].ruby === first.ruby) endIndex += 1;
-      }
-      if (first.ruby && line.units.slice(index, endIndex).some((unit) => unit.start_ms !== null && unit.end_ms !== null)) {
-        const timed = line.units.slice(index, endIndex).filter((unit) => unit.start_ms !== null && unit.end_ms !== null);
-        const start = Math.min(...timed.map((unit) => unit.start_ms as number));
-        const end = Math.max(...timed.map((unit) => unit.end_ms as number));
-        groups.push({ lineId: line.id, ruby: first.ruby, ruby2: first.ruby_2 || "", startIndex: index, endIndex, start, end, x1: 0, x2: 0, y1: 0, y2: 0, units: line.units });
-      }
-      index = Math.max(index + 1, endIndex);
     }
-    return groups;
-  }), [lines]);
+    return { timedUnits, lineRubyGroups };
+  }, [lines, expandedRubyId, rubyEnabled]);
 
   useEffect(() => {
     let active = true;
@@ -413,6 +415,11 @@ export function TimelineCanvas({
       context.save();
       context.strokeStyle = "#e37400";
       context.lineWidth = 2;
+      if (group.expanded) {
+        context.strokeRect(next.x1, y1, next.x2 - next.x1, y2 - y1);
+        context.restore();
+        return next;
+      }
       context.beginPath();
       context.moveTo(next.x1 + 6, y1); context.lineTo(next.x1, y1); context.lineTo(next.x1, y2); context.lineTo(next.x1 + 6, y2);
       context.moveTo(next.x2 - 6, y1); context.lineTo(next.x2, y1); context.lineTo(next.x2, y2); context.lineTo(next.x2 - 6, y2);
@@ -442,18 +449,19 @@ export function TimelineCanvas({
       context.stroke();
       context.restore();
     }
-    for (const { line, unit, lineLevel } of timedUnits) {
+    for (const { line, unit, lineLevel, groupId, rubyPart } of timedUnits) {
       const start = unit.start_ms as number;
       const end = unit.end_ms as number;
       const x1 = (start / 1000) * zoom;
-      const x2 = Math.max(x1 + 5, (end / 1000) * zoom);
+      const x2 = Math.max(x1 + (rubyPart === undefined ? 5 : 2), (end / 1000) * zoom);
       const lane = line.order % 2;
       const y1 = 40 + lane * 43;
       const y2 = y1 + 35;
-      const selected = unit.id === selectedId;
+      const selected = unit.id === selectedId && rubyPart === undefined;
       const lowConfidence = unit.timing_confidence !== null && unit.timing_confidence < 0.55;
       context.fillStyle = selected
         ? "#0b57d0"
+        : rubyPart !== undefined ? "#ffedd5"
         : lowConfidence
           ? "#ffecb5"
         : unit.timing_source === "estimated"
@@ -461,6 +469,7 @@ export function TimelineCanvas({
           : "#d3e3fd";
       context.strokeStyle = selected
         ? "#0842a0"
+        : rubyPart !== undefined ? "#e37400"
         : lowConfidence
           ? "#c58a00"
         : unit.timing_source === "estimated"
@@ -468,7 +477,7 @@ export function TimelineCanvas({
           : "#7baaf7";
       context.lineWidth = selected ? 2 : 1;
       context.beginPath();
-      context.roundRect(x1 + 1, y1, Math.max(3, x2 - x1 - 2), y2 - y1, 5);
+      context.roundRect(x1 + 1, y1, Math.max(1, x2 - x1 - 2), y2 - y1, rubyPart === undefined ? 5 : 2);
       context.fill();
       context.stroke();
       context.save();
@@ -478,9 +487,10 @@ export function TimelineCanvas({
       context.fillStyle = selected ? "#fff" : "#1f1f1f";
       context.font = "12px Noto Sans JP, sans-serif";
       context.textBaseline = "middle";
-      context.fillText(unit.surface, x1 + 7, y1 + 18);
+      if (rubyPart === undefined) context.fillText(unit.surface, x1 + 7, y1 + 18);
+      else if (x2 - x1 >= 18) context.fillText(unit.surface, x1 + 5, y1 + 18, x2 - x1 - 10);
       context.restore();
-      const hitKey = `${line.id}:${unit.id}`;
+      const hitKey = `${line.id}:${unit.id}:${rubyPart ?? ""}`;
       if (!hitKeys.has(hitKey)) {
         hitKeys.add(hitKey);
         hits.push({
@@ -491,7 +501,8 @@ export function TimelineCanvas({
           x2: lineLevel ? x2 + 7 : x2,
           y1,
           y2,
-          rubyGroup: rubyGroups.find((group) => group.lineId === line.id && group.start <= start && group.end >= end),
+          rubyGroup: groupId ? rubyGroups.find((group) => group.units[group.startIndex].id === groupId) : undefined,
+          rubyPart,
         });
       }
     }
@@ -567,14 +578,23 @@ export function TimelineCanvas({
     return { x: event.clientX - rect.left + offset, y: event.clientY - rect.top };
   }
   function hitAt(x: number, y: number) {
-    return [...hitsRef.current]
-      .reverse()
-      .find((hit) => x >= hit.x1 - 4 && x <= hit.x2 + 4 && y >= hit.y1 - 4 && y <= hit.y2 + 4);
+    let best: Hit | undefined;
+    let distance = Infinity;
+    for (const hit of hitsRef.current) {
+      if (y < hit.y1 - 4 || y > hit.y2 + 4) continue;
+      const nextDistance = Math.max(hit.x1 - x, x - hit.x2, 0);
+      if (nextDistance <= 4 && nextDistance <= distance) {
+        best = hit;
+        distance = nextDistance;
+      }
+    }
+    return best;
   }
+
   function pointerDown(event: React.PointerEvent<HTMLCanvasElement>) {
     if (event.button !== 0) return;
     const { x, y } = point(event);
-    const rubyEdge = rubyAdjustEnabled && rubyGroupsRef.current.find((group) => y >= group.y1 - 8 && y <= group.y2 + 8 && (Math.abs(x - group.x1) <= 8 || Math.abs(x - group.x2) <= 8));
+    const rubyEdge = rubyAdjustEnabled && rubyGroupsRef.current.find((group) => !group.expanded && y >= group.y1 - 8 && y <= group.y2 + 8 && (Math.abs(x - group.x1) <= 8 || Math.abs(x - group.x2) <= 8));
     if (rubyEdge) {
       event.currentTarget.setPointerCapture(event.pointerId);
       dragRef.current = {
@@ -600,13 +620,14 @@ export function TimelineCanvas({
     }
     onSelect(hit.unit.id, hit.lineLevel);
     event.currentTarget.setPointerCapture(event.pointerId);
-    const edge = 7;
+    const edge = hit.rubyPart === undefined ? 7 : Math.min(7, (hit.x2 - hit.x1) / 3);
+    const adjustEdges = unitTimeAdjustEnabled || hit.rubyPart !== undefined;
     dragRef.current = {
       hit,
       mode:
-        unitTimeAdjustEnabled && Math.abs(x - hit.x1) <= edge
+        adjustEdges && Math.abs(x - hit.x1) <= edge
           ? "start"
-          : unitTimeAdjustEnabled && Math.abs(x - hit.x2) <= edge
+          : adjustEdges && Math.abs(x - hit.x2) <= edge
             ? "end"
             : "move",
       clientX: event.clientX,
@@ -634,7 +655,7 @@ export function TimelineCanvas({
     if (!drag) return;
     const delta =
       Math.round(((event.clientX - drag.clientX) / zoom) * 100) * 10;
-    if (!delta) return;
+    if (!delta && !drag.began) return;
     drag.began = true;
     if (drag.mode.startsWith("ruby-") && drag.rubyGroup) {
       const line = lines.find((candidate) => candidate.id === drag.rubyGroup?.lineId);
@@ -661,15 +682,18 @@ export function TimelineCanvas({
     }
     let start = drag.start;
     let end = drag.end;
+    const timing = drag.hit.rubyGroup?.timing;
+    const part = drag.hit.rubyPart;
+    const minimum = timing && part !== undefined ? timing[part - 1]?.end_ms ?? drag.hit.rubyGroup!.start : 0;
+    const maximum = timing && part !== undefined ? timing[part + 1]?.start_ms ?? drag.hit.rubyGroup!.end : durationMs;
+    const minSpan = Math.min(part === undefined ? 20 : 10, end - start);
     if (drag.mode === "move") {
       const span = end - start;
-      start = Math.max(0, Math.min(durationMs - span, start + delta));
+      start = Math.max(minimum, Math.min(maximum - span, start + delta));
       end = start + span;
     }
-    if (drag.mode === "start")
-      start = Math.max(0, Math.min(end - 20, start + delta));
-    if (drag.mode === "end")
-      end = Math.min(durationMs, Math.max(start + 20, end + delta));
+    if (drag.mode === "start") start = Math.max(minimum, Math.min(end - minSpan, start + delta));
+    if (drag.mode === "end") end = Math.min(maximum, Math.max(start + minSpan, end + delta));
     drag.previewStart = start;
     drag.previewEnd = end;
     showDragPreview(drag, start, end);
@@ -698,7 +722,20 @@ export function TimelineCanvas({
       }
       return;
     }
+    if (drag.previewStart === drag.start && drag.previewEnd === drag.end) return;
     onBeginEdit();
+    const group = drag.hit.rubyGroup;
+    if (group) {
+      const unitId = group.units[group.startIndex].id;
+      if (drag.hit.rubyPart !== undefined && group.timing) {
+        const timing = group.timing.map((part, index) => index === drag.hit.rubyPart
+          ? { ...part, start_ms: drag.previewStart, end_ms: drag.previewEnd } : part);
+        onUpdateRubyTiming(group.lineId, unitId, group.start, group.end, timing);
+      } else {
+        onUpdateRubyTiming(group.lineId, unitId, drag.previewStart, drag.previewEnd);
+      }
+      return;
+    }
     if (drag.hit.lineLevel) {
       onUpdateLine(drag.hit.lineId, drag.previewStart, drag.previewEnd);
       return;
@@ -717,17 +754,23 @@ export function TimelineCanvas({
     const hit = hitAt(x, y);
     if (hit && !hit.lineLevel) {
       onSelect(hit.unit.id, false);
-      onOpenEditor(hit.unit.id);
+      if (hit.rubyPart !== undefined) onOpenRubyPart(hit.lineId, hit.unit.id, hit.rubyPart);
+      else onOpenEditor(hit.unit.id);
     }
   }
 
   function contextMenu(event: React.MouseEvent<HTMLCanvasElement>) {
     const { x, y } = point(event as unknown as React.PointerEvent<HTMLCanvasElement>);
     const hit = hitAt(x, y);
-    if (!hit) return;
+    const group = hit?.rubyGroup ?? (hit ? undefined : rubyGroupsRef.current.find((item) =>
+      x >= item.x1 && x <= item.x2 && y >= item.y1 && y <= item.y2));
+    if (!hit && !group) return;
+    const unitId = group ? group.units[group.startIndex].id : hit!.unit.id;
+    const lineId = group?.lineId ?? hit!.lineId;
+    const lineLevel = hit?.lineLevel ?? false;
     event.preventDefault();
-    onSelect(hit.unit.id, hit.lineLevel);
-    onOpenContextMenu(hit.lineId, hit.unit.id, hit.lineLevel, event.clientX, event.clientY);
+    onSelect(unitId, lineLevel);
+    onOpenContextMenu(lineId, unitId, lineLevel, event.clientX, event.clientY);
   }
 
   function dragPosition(clientX: number) {
@@ -755,6 +798,8 @@ export function TimelineCanvas({
     const startMs = Math.round(((x / zoom) * 1000) / 10) * 10;
     onDropLine(lineId, Math.min(durationMs, startMs));
   }
+
+  const expandedGroup = lineRubyGroups.find((group) => group.expanded);
 
   return (
     <section className="timeline-workspace" aria-label="歌词时间轴">
@@ -841,6 +886,12 @@ export function TimelineCanvas({
           </button>
         </div>
       </div>
+      {expandedGroup?.timing && <div className="timeline-ruby-parts" aria-label="Ruby 时间单元">
+        <span>{expandedGroup.units.slice(expandedGroup.startIndex, expandedGroup.endIndex).map((unit) => unit.surface).join("")}</span>
+        {expandedGroup.timing.map((part, index) => <button key={index} className="button tonal timeline-ruby-toggle" type="button"
+          title={`${formatTime(part.start_ms)} – ${formatTime(part.end_ms)}`}
+          onClick={() => onOpenRubyPart(expandedGroup.lineId, expandedGroup.units[expandedGroup.startIndex].id, index)}>{part.text}</button>)}
+      </div>}
       <div
         className="timeline-scroller"
         ref={scrollerRef}

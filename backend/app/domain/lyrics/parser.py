@@ -150,14 +150,39 @@ def _plain_units(text: str, roles: list[str] | None = None) -> list[dict]:
     return [_unit(text, roles=list(roles or []))] if text else []
 
 
-def _tokenize_krl(body: str, initial_ms: int) -> tuple[list[dict], bool]:
+def _inline_ruby_timing(reading: str, initial_ms: int, fallback_end_ms: int) -> list[dict]:
+    marks = list(TIME_RE.finditer(reading))
+    if not marks:
+        return []
+    parts = []
+    cursor, offset = initial_ms, 0
+    for mark in marks:
+        end = parse_time_ms(mark.group())
+        if end < cursor:
+            return []
+        if text := reading[offset:mark.start()].strip():
+            parts.append({"text": text, "start_ms": cursor, "end_ms": end})
+        cursor, offset = end, mark.end()
+    if text := reading[offset:].strip():
+        if fallback_end_ms < cursor:
+            return []
+        parts.append({"text": text, "start_ms": cursor, "end_ms": fallback_end_ms})
+    if "".join(part["text"] for part in parts) != TIME_RE.sub("", reading).strip():
+        return []
+    return parts
+
+
+def _tokenize_krl(body: str, initial_ms: int, fallback_end_ms: int) -> tuple[list[dict], bool]:
     tokens: list[dict] = [{"type": "time", "time_ms": initial_ms}]
     roles: list[str] = []
     ends_with_time = False
-    for match in TOKEN_RE.finditer(body):
+    matches = list(TOKEN_RE.finditer(body))
+    cursor = initial_ms
+    for index, match in enumerate(matches):
         value = match.group(0)
         if TIME_RE.fullmatch(value):
-            tokens.append({"type": "time", "time_ms": parse_time_ms(value)})
+            cursor = parse_time_ms(value)
+            tokens.append({"type": "time", "time_ms": cursor})
             ends_with_time = True
             continue
         ends_with_time = False
@@ -169,6 +194,12 @@ def _tokenize_krl(body: str, initial_ms: int) -> tuple[list[dict], bool]:
         if ruby_match:
             surface, readings = ruby_match.groups()
             ruby, separator, ruby_2 = readings.partition(">")
+            next_time = next((parse_time_ms(item[0]) for item in matches[index + 1:] if TIME_RE.fullmatch(item[0])), fallback_end_ms)
+            ruby_timing = _inline_ruby_timing(ruby, cursor, next_time)
+            if ruby_timing:
+                # Inline absolute times may supply the only start/end tags for the word.
+                cursor = ruby_timing[0]["start_ms"]
+                tokens.append({"type": "time", "time_ms": cursor})
             ruby = TIME_RE.sub("", ruby).strip()
             ruby_2 = TIME_RE.sub("", ruby_2).strip() if separator else ""
             for char_index, char in enumerate(surface):
@@ -180,7 +211,13 @@ def _tokenize_krl(body: str, initial_ms: int) -> tuple[list[dict], bool]:
                         ruby_span=len(surface),
                         ruby_source="imported",
                     )
+                    if ruby_timing:
+                        values["ruby_timing"] = ruby_timing
                 tokens.append({"type": "unit", "unit": _unit(char, **values)})
+            if ruby_timing:
+                cursor = ruby_timing[-1]["end_ms"]
+                tokens.append({"type": "time", "time_ms": cursor})
+                ends_with_time = True
             continue
         tokens.append({"type": "unit", "unit": _unit(value, roles=list(roles))})
     return tokens, ends_with_time
@@ -204,7 +241,8 @@ def _timed_units(tokens: list[dict], fallback_end_ms: int) -> tuple[list[dict], 
 
     result: list[dict] = []
     for start_ms, end_ms, units in segments:
-        safe_end = max(start_ms + len(units) * 20, end_ms or fallback_end_ms)
+        minimum = 0 if end_ms is not None else len(units) * 20
+        safe_end = max(start_ms + minimum, fallback_end_ms if end_ms is None else end_ms)
         span = safe_end - start_ms
         for index, unit in enumerate(units):
             unit["start_ms"] = round(start_ms + span * index / len(units))
@@ -249,7 +287,7 @@ def _parse_lrc(content: str, enhanced: bool, media_duration_ms: int | None) -> l
     for index, (start_ms, body) in enumerate(source):
         fallback_end = _line_end(source, index, media_duration_ms)
         if enhanced:
-            tokens, ends_with_time = _tokenize_krl(body, start_ms)
+            tokens, ends_with_time = _tokenize_krl(body, start_ms, fallback_end)
             units, estimated_tail = _timed_units(tokens, fallback_end)
             precision = "unit" if any(TIME_RE.finditer(body)) else "line"
             if units and (estimated_tail or not ends_with_time):
