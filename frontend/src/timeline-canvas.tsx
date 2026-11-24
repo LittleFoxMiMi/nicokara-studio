@@ -1,3 +1,4 @@
+import { usePreferences } from "./preferences";
 import {
   FastForward,
   Minus,
@@ -137,6 +138,7 @@ export function TimelineCanvas({
   onDropLine: (lineId: string, startMs: number) => void;
   onOpenContextMenu: (lineId: string, unitId: string, lineLevel: boolean, x: number, y: number) => void;
 }) {
+  const { t, theme } = usePreferences();
   const canvasRefs = useRef<(HTMLCanvasElement | null)[]>([]);
   const contentRef = useRef<HTMLDivElement>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
@@ -368,6 +370,8 @@ export function TimelineCanvas({
   useEffect(() => {
     const canvases = canvasRefs.current.slice(0, tileCount).filter((canvas): canvas is HTMLCanvasElement => Boolean(canvas));
     if (!canvases.length) return;
+    const styles = getComputedStyle(document.documentElement);
+    const color = (name: string) => styles.getPropertyValue(`--${name}`).trim();
     const ratio = window.devicePixelRatio || 1;
     const hits: Hit[] = [];
     const hitKeys = new Set<string>();
@@ -385,7 +389,7 @@ export function TimelineCanvas({
       context.setTransform(1, 0, 0, 1, 0, 0);
       context.clearRect(0, 0, canvas.width, canvas.height);
       context.setTransform(tileRatio, 0, 0, tileRatio, -offset * tileRatio, 0);
-      context.fillStyle = "#fff";
+      context.fillStyle = color("surface");
     context.fillRect(0, 0, width, height);
 
     const seconds = durationMs / 1000;
@@ -395,14 +399,14 @@ export function TimelineCanvas({
     for (let second = 0; second <= seconds; second += tickSeconds) {
       const x = second * zoom;
       const major = second % 5 === 0;
-      context.strokeStyle = major ? "#b9c0c7" : "#e3e7eb";
+      context.strokeStyle = major ? color("timeline-ruler-major") : color("timeline-ruler-minor");
       context.lineWidth = major ? 1 : 0.5;
       context.beginPath();
       context.moveTo(x + 0.5, major ? 24 : 30);
       context.lineTo(x + 0.5, height);
       context.stroke();
       if (major || zoom >= 70) {
-        context.fillStyle = "#687078";
+        context.fillStyle = color("ink-muted");
         context.fillText(formatTime(second * 1000).slice(0, 5), x + 5, 7);
       }
     }
@@ -413,7 +417,7 @@ export function TimelineCanvas({
       const y2 = y1 + 43;
       const next = { ...group, x1: (group.start / 1000) * zoom - 3, x2: (group.end / 1000) * zoom + 3, y1, y2 };
       context.save();
-      context.strokeStyle = "#e37400";
+      context.strokeStyle = color("amber");
       context.lineWidth = 2;
       if (group.expanded) {
         context.strokeRect(next.x1, y1, next.x2 - next.x1, y2 - y1);
@@ -441,7 +445,7 @@ export function TimelineCanvas({
       const x1 = (start / 1000) * zoom - 7;
       const x2 = (end / 1000) * zoom + 7;
       context.save();
-      context.strokeStyle = "#1a73e8";
+      context.strokeStyle = color("accent");
       context.lineWidth = 2;
       context.beginPath();
       context.moveTo(x1 + 8, y1); context.lineTo(x1, y1); context.lineTo(x1, y2); context.lineTo(x1 + 8, y2);
@@ -460,21 +464,21 @@ export function TimelineCanvas({
       const selected = unit.id === selectedId && rubyPart === undefined;
       const lowConfidence = unit.timing_confidence !== null && unit.timing_confidence < 0.55;
       context.fillStyle = selected
-        ? "#0b57d0"
-        : rubyPart !== undefined ? "#ffedd5"
+        ? color("accent-fill")
+        : rubyPart !== undefined ? color("timeline-ruby-fill")
         : lowConfidence
-          ? "#ffecb5"
+          ? color("timeline-confidence-fill")
         : unit.timing_source === "estimated"
-          ? "#fef3c7"
-          : "#d3e3fd";
+          ? color("warning-wash")
+          : color("accent-tonal");
       context.strokeStyle = selected
-        ? "#0842a0"
-        : rubyPart !== undefined ? "#e37400"
+        ? color("accent-line")
+        : rubyPart !== undefined ? color("amber")
         : lowConfidence
-          ? "#c58a00"
+          ? color("timeline-confidence-line")
         : unit.timing_source === "estimated"
-          ? "#f9ab00"
-          : "#7baaf7";
+          ? color("timeline-estimated-line")
+          : color("accent-line");
       context.lineWidth = selected ? 2 : 1;
       context.beginPath();
       context.roundRect(x1 + 1, y1, Math.max(1, x2 - x1 - 2), y2 - y1, rubyPart === undefined ? 5 : 2);
@@ -484,7 +488,7 @@ export function TimelineCanvas({
       context.beginPath();
       context.rect(x1 + 5, y1 + 3, Math.max(0, x2 - x1 - 10), y2 - y1 - 6);
       context.clip();
-      context.fillStyle = selected ? "#fff" : "#1f1f1f";
+      context.fillStyle = selected ? color("on-accent") : color("ink");
       context.font = "12px Noto Sans JP, sans-serif";
       context.textBaseline = "middle";
       if (rubyPart === undefined) context.fillText(unit.surface, x1 + 7, y1 + 18);
@@ -510,9 +514,9 @@ export function TimelineCanvas({
     const waveTop = 132;
     const waveHeight = 108;
     const center = waveTop + waveHeight / 2;
-    context.fillStyle = "#f2f7f5";
+    context.fillStyle = color("timeline-wave-fill");
     context.fillRect(0, waveTop, width, waveHeight);
-    context.strokeStyle = "#d5e4df";
+    context.strokeStyle = color("timeline-wave-center");
     context.beginPath();
     context.moveTo(0, center + 0.5);
     context.lineTo(width, center + 0.5);
@@ -526,7 +530,7 @@ export function TimelineCanvas({
         0.01,
       );
       const gain = Math.min(6, 0.92 / maxAmplitude);
-      context.strokeStyle = "#087f5b";
+      context.strokeStyle = color("timeline-wave-line");
       context.lineWidth = Math.max(
         1,
         Math.min(2, width / waveform.peaks.length),
@@ -542,15 +546,15 @@ export function TimelineCanvas({
       });
       context.stroke();
     } else {
-      context.fillStyle = waveformError ? "#b3261e" : "#7b838c";
+      context.fillStyle = waveformError ? color("danger") : color("ink-muted");
       context.font = "12px Google Sans, sans-serif";
       context.textAlign = "center";
       context.fillText(
         waveformError
-          ? "波形生成失败"
+          ? t("波形生成失败")
           : hasVideo
-            ? "正在生成波形"
-            : "添加视频后显示波形",
+            ? t("正在生成波形")
+            : t("添加视频后显示波形"),
         Math.min(width / 2, 450),
         center - 6,
       );
@@ -802,34 +806,34 @@ export function TimelineCanvas({
   const expandedGroup = lineRubyGroups.find((group) => group.expanded);
 
   return (
-    <section className="timeline-workspace" aria-label="歌词时间轴">
+    <section className="timeline-workspace" aria-label={t("歌词时间轴")}>
       <div className="timeline-toolbar">
         <div className="timeline-title">
-          <strong>时间轴</strong>
-          <span>{timedUnits.length} 个时间单元</span>
+          <strong>{t("时间轴")}</strong>
+          <span>{t("{0} 个时间单元", timedUnits.length)}</span>
           {rubyEnabled && <button
             type="button"
             className={`button timeline-ruby-toggle ${rubyAdjustEnabled ? "filled" : "tonal"}`}
             aria-pressed={rubyAdjustEnabled}
-            title={rubyAdjustEnabled ? "关闭 Ruby 范围调整，恢复 unit 时间拖动" : "启用后拖动橙色括号调整 Ruby 范围"}
+            title={rubyAdjustEnabled ? t("关闭 Ruby 范围调整，恢复 unit 时间拖动") : t("启用后拖动橙色括号调整 Ruby 范围")}
             onClick={() => setRubyAdjustEnabled((value) => !value)}
           >
-            Ruby调整
+            {t("Ruby调整")}
           </button>}
           <button
             type="button"
             className={`button timeline-ruby-toggle ${unitTimeAdjustEnabled ? "filled" : "tonal"}`}
             aria-pressed={unitTimeAdjustEnabled}
-            title={unitTimeAdjustEnabled ? "关闭起止时间调整；拖动任意位置都会移动整个 unit" : "启用后可拖动 unit 两侧调整起止时间"}
+            title={unitTimeAdjustEnabled ? t("关闭起止时间调整；拖动任意位置都会移动整个 unit") : t("启用后可拖动 unit 两侧调整起止时间")}
             onClick={() => setUnitTimeAdjustEnabled((value) => !value)}
           >
-            <MoveHorizontal size={14} />Unit时间
+            <MoveHorizontal size={14} />{t("Unit时间")}
           </button>
         </div>
         <div className="transport-controls">
           <button
             className="icon-button compact"
-            title="后退 5 秒"
+            title={t("后退 5 秒")}
             disabled={!hasVideo}
             onClick={() => onSeekBy(-5000)}
           >
@@ -837,7 +841,7 @@ export function TimelineCanvas({
           </button>
           <button
             className="icon-button transport-primary"
-            title={isPlaying ? "暂停" : "播放"}
+            title={isPlaying ? t("暂停") : t("播放")}
             disabled={!hasVideo}
             onClick={onTogglePlayback}
           >
@@ -849,7 +853,7 @@ export function TimelineCanvas({
           </button>
           <button
             className="icon-button compact"
-            title="前进 5 秒"
+            title={t("前进 5 秒")}
             disabled={!hasVideo}
             onClick={() => onSeekBy(5000)}
           >
@@ -862,14 +866,14 @@ export function TimelineCanvas({
         <div className="zoom-control">
           <button
             className="icon-button compact"
-            title="缩小"
+            title={t("缩小")}
             onClick={() => changeZoom(zoom - 10)}
           >
             <Minus size={16} />
           </button>
           <ZoomIn size={16} />
           <input
-            aria-label="时间轴缩放"
+            aria-label={t("时间轴缩放")}
             type="range"
             min="30"
             max="180"
@@ -879,14 +883,14 @@ export function TimelineCanvas({
           />
           <button
             className="icon-button compact"
-            title="放大"
+            title={t("放大")}
             onClick={() => changeZoom(zoom + 10)}
           >
             <Plus size={16} />
           </button>
         </div>
       </div>
-      {expandedGroup?.timing && <div className="timeline-ruby-parts" aria-label="Ruby 时间单元">
+      {expandedGroup?.timing && <div className="timeline-ruby-parts" aria-label={t("Ruby 时间单元")}>
         <span>{expandedGroup.units.slice(expandedGroup.startIndex, expandedGroup.endIndex).map((unit) => unit.surface).join("")}</span>
         {expandedGroup.timing.map((part, index) => <button key={index} className="button tonal timeline-ruby-toggle" type="button"
           title={`${formatTime(part.start_ms)} – ${formatTime(part.end_ms)}`}

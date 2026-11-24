@@ -1,3 +1,4 @@
+import { usePreferences } from "./preferences";
 import { Check, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { LyricLine } from "./editor-types";
@@ -23,6 +24,7 @@ export function RubyRangeEditor({
   status: string;
   onApply: (start: number, end: number, ruby: string, ruby2: string, replacedRange: Selection | null) => void;
 }) {
+  const { t } = usePreferences();
   const allCharacters = useMemo(() => Array.from(line.units.map((unit) => unit.surface).join("")), [line.units]);
   const start = Math.max(0, Math.min(allCharacters.length, rangeStart));
   const end = Math.max(start, Math.min(allCharacters.length, rangeEnd));
@@ -72,7 +74,7 @@ export function RubyRangeEditor({
     ? groups.map((group) => group === dragPreview.group ? { ...group, start: dragPreview.start, end: dragPreview.end } : group)
     : groups;
 
-  return <section className="ruby-range-editor" aria-label="Ruby 范围编辑">
+  return <section className="ruby-range-editor" aria-label={t("Ruby 范围编辑")}>
     <div className="section-title">
       <h3>{title}</h3>
       <span>{status}</span>
@@ -113,8 +115,8 @@ export function RubyRangeEditor({
                 key={edge}
                 className={`ruby-bracket-handle ${edge}`}
                 type="button"
-                title={edge === "start" ? "拖动 Ruby 左边界" : "拖动 Ruby 右边界"}
-                aria-label={edge === "start" ? "拖动 Ruby 左边界" : "拖动 Ruby 右边界"}
+                title={edge === "start" ? t("拖动 Ruby 左边界") : t("拖动 Ruby 右边界")}
+                aria-label={edge === "start" ? t("拖动 Ruby 左边界") : t("拖动 Ruby 右边界")}
                 onPointerDown={(event) => {
                   event.stopPropagation();
                   event.currentTarget.setPointerCapture(event.pointerId);
@@ -153,7 +155,7 @@ export function RubyRangeEditor({
         </div>
       </div>
     </div>
-    <div className="ruby-range-selection-state">{selection ? `已选 ${selection.end - selection.start} 字` : `共 ${characters.length} 字`}</div>
+    <div className="ruby-range-selection-state">{selection ? t("已选 {0} 字", selection.end - selection.start) : t("共 {0} 字", characters.length)}</div>
     <div className="ruby-range-actions">
       <label className="field-label">
         Ruby
@@ -170,14 +172,14 @@ export function RubyRangeEditor({
       <button
         className="icon-button ruby-range-confirm"
         type="button"
-        title={selectedGroup ? "更新 Ruby" : "添加 Ruby"}
+        title={selectedGroup ? t("更新 Ruby") : t("添加 Ruby")}
         disabled={!selection || !reading.trim()}
         onClick={() => selection && onApply(selection.start, selection.end, reading, selectedGroup?.ruby2 || "", selectedGroup)}
       ><Check size={18} /></button>
       <button
         className="icon-button"
         type="button"
-        title="删除所选 Ruby"
+        title={t("删除所选 Ruby")}
         disabled={!selectedGroup}
         onClick={() => {
           if (!selectedGroup) return;

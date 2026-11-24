@@ -1,3 +1,4 @@
+import { usePreferences } from "../preferences";
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type RefObject } from "react";
 import type { LyricLine } from "../editor-types";
 import { rubyProgress, unitProgress } from "./progress";
@@ -9,6 +10,7 @@ import { normalizeSubtitleStyle, type SubtitleStyle } from "./style-schema";
 import "./subtitle.css";
 
 export function SubtitleDomRenderer({ lines, currentMs, style: rawStyle, className = "", mediaRef, isPlaying = false }: { lines: LyricLine[]; currentMs: number; style?: Partial<SubtitleStyle>; className?: string; mediaRef?: RefObject<HTMLVideoElement | null>; isPlaying?: boolean }) {
+  const { t } = usePreferences();
   const style = useMemo(() => normalizeSubtitleStyle(rawStyle as Record<string, unknown>), [rawStyle]);
   const layerRef = useRef<HTMLDivElement>(null);
   const [viewport, setViewport] = useState({ width: 1000, height: 600 });
@@ -55,7 +57,7 @@ export function SubtitleDomRenderer({ lines, currentMs, style: rawStyle, classNa
       }}>{text}</span>
     </span>;
   }
-  return <div ref={layerRef} className={`subtitle-layer ${className}`} style={{ fontFamily: style.fontFamily, color: style.textColor, "--subtitle-outline": `${style.outlineWidth}px ${style.outlineColor}`, "--subtitle-shadow": `0 2px ${style.shadowBlur}px ${style.shadowColor}`, "--subtitle-letter-spacing": String(style.letterSpacing) } as CSSProperties} aria-label="字幕预览">
+  return <div ref={layerRef} className={`subtitle-layer ${className}`} style={{ fontFamily: style.fontFamily, color: style.textColor, "--subtitle-outline": `${style.outlineWidth}px ${style.outlineColor}`, "--subtitle-shadow": `0 2px ${style.shadowBlur}px ${style.shadowColor}`, "--subtitle-letter-spacing": String(style.letterSpacing) } as CSSProperties} aria-label={t("字幕预览")}>
     {visible.map((line) => {
       const layout = layoutSubtitleLine(line, style, viewport, renderMs);
       if (!layout) return null;

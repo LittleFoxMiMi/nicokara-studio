@@ -1,3 +1,4 @@
+import { usePreferences } from "./preferences";
 import { FileText, Upload, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api } from "./editor-types";
@@ -5,7 +6,7 @@ import { api } from "./editor-types";
 type ImportFormat = "auto" | "text" | "lrc" | "krl";
 type Detection = { format: Exclude<ImportFormat, "auto">; confidence: number; reasons: string[] };
 
-const labels = { text: "纯文本", lrc: "普通 LRC", krl: "逐字 LRC / KRL" };
+const labels = { text: "纯文本", lrc: "普通 LRC", krl: "逐字 LRC / KRL" } as const;
 
 export function LyricsImportDialog({
   projectId,
@@ -16,6 +17,7 @@ export function LyricsImportDialog({
   onClose: () => void;
   onImport: (content: string, filename: string | null, format: ImportFormat) => Promise<void>;
 }) {
+  const { t, detail } = usePreferences();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const detectionTimerRef = useRef<number | null>(null);
   const detectionVersionRef = useRef(0);
@@ -77,12 +79,12 @@ export function LyricsImportDialog({
 
   return <div className="scrim" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
     <section className="dialog import-dialog" role="dialog" aria-modal="true" aria-labelledby="lyrics-import-title">
-      <div className="dialog-head"><div><h2 id="lyrics-import-title">添加歌词</h2>{detection && <span className="detection-chip">已识别：{labels[detection.format]}</span>}</div><button className="icon-button" title="关闭" aria-label="关闭" onClick={onClose}><X size={20} /></button></div>
-      <label className="file-picker"><Upload size={18} /><span>{filename || "选择 TXT、LRC 或 KRL"}</span><input type="file" accept=".txt,.lrc,.krl,text/plain" hidden onChange={(event) => void readFile(event.target.files?.[0])} /></label>
-      <label className="field-label">歌词内容<textarea ref={textareaRef} autoFocus spellCheck={false} onInput={(event) => { const value = event.currentTarget.value; setFilename(null); scheduleDetection(value, null); }} placeholder="在这里粘贴歌词" /></label>
-      <label className="field-label">导入格式<select value={format} onChange={(event) => setFormat(event.target.value as ImportFormat)}><option value="auto">自动检测{detection ? `（${labels[detection.format]}）` : ""}</option><option value="text">纯文本</option><option value="lrc">普通 LRC</option><option value="krl">逐字 LRC / KRL</option></select></label>
-      {error && <div className="inline-error" role="alert">{error}</div>}
-      <div className="dialog-actions"><button className="button text" onClick={onClose}>取消</button><button className="button filled" disabled={!hasContent || busy} onClick={() => void submit()}><FileText size={17} />{busy ? "正在导入" : "导入歌词"}</button></div>
+      <div className="dialog-head"><div><h2 id="lyrics-import-title">{t("添加歌词")}</h2>{detection && <span className="detection-chip">{t("已识别：")}{t(labels[detection.format])}</span>}</div><button className="icon-button" title={t("关闭")} aria-label={t("关闭")} onClick={onClose}><X size={20} /></button></div>
+      <label className="file-picker"><Upload size={18} /><span>{filename || t("选择 TXT、LRC 或 KRL")}</span><input type="file" accept=".txt,.lrc,.krl,text/plain" hidden onChange={(event) => void readFile(event.target.files?.[0])} /></label>
+      <label className="field-label">{t("歌词内容")}<textarea ref={textareaRef} autoFocus spellCheck={false} onInput={(event) => { const value = event.currentTarget.value; setFilename(null); scheduleDetection(value, null); }} placeholder={t("在这里粘贴歌词")} /></label>
+      <label className="field-label">{t("导入格式")}<select value={format} onChange={(event) => setFormat(event.target.value as ImportFormat)}><option value="auto">{t("自动检测")}{detection ? `（${t(labels[detection.format])}）` : ""}</option><option value="text">{t("纯文本")}</option><option value="lrc">{t("普通 LRC")}</option><option value="krl">{t("逐字 LRC / KRL")}</option></select></label>
+      {error && <div className="inline-error" role="alert">{detail(error)}</div>}
+      <div className="dialog-actions"><button className="button text" onClick={onClose}>{t("取消")}</button><button className="button filled" disabled={!hasContent || busy} onClick={() => void submit()}><FileText size={17} />{busy ? t("正在导入") : t("导入歌词")}</button></div>
     </section>
   </div>;
 }

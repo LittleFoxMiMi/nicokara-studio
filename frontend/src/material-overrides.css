@@ -1,6 +1,6 @@
 :root {
-  color: #1f1f1f;
-  background: #f8fafd;
+  color: var(--ink);
+  background: var(--canvas);
   min-width: 1180px;
 }
 body,
@@ -21,7 +21,7 @@ textarea {
 }
 .brand-mark {
   border-radius: 8px;
-  background: #0b57d0;
+  background: var(--accent-fill);
 }
 .eyebrow,
 .page h1 {
@@ -29,18 +29,18 @@ textarea {
 }
 .button.filled,
 .fab {
-  background: #0b57d0;
+  background: var(--accent-fill);
 }
 .button.filled:hover {
-  background: #0842a0;
+  background: var(--accent-fill-hover);
 }
 .button.tonal {
-  background: #d3e3fd;
-  color: #0842a0;
+  background: var(--accent-tonal);
+  color: var(--accent-ink);
 }
 .button.text,
 .text-button {
-  color: #0b57d0;
+  color: var(--accent);
 }
 .project-card,
 .empty-state,
@@ -54,6 +54,6 @@ textarea {
 }
 .nav-item:hover,
 .nav-item.active {
-  background: #d3e3fd;
-  color: #0842a0;
+  background: var(--accent-tonal);
+  color: var(--accent-ink);
 }
